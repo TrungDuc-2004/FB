@@ -7,21 +7,28 @@ import UploadFileModal from "../../components/UploadFileModal";
 import InsertMetadataModal from "../../components/InsertMetadataModal";
 import FilterModal from "../../components/FilterModal";
 
-function nowStr() {
-  return new Date().toISOString().slice(0, 16).replace("T", " ");
-}
-
 function getExt(name = "") {
   const i = name.lastIndexOf(".");
   return i >= 0 ? name.slice(i + 1).toLowerCase() : "";
 }
 
-function getFileType(name = "") {
+function stripExt(name = "") {
+  // bỏ đuôi cuối: a.b.c.pdf -> a.b.c
+  return name.replace(/\.[^/.]+$/, "");
+}
+
+// LOẠI: document/image/video
+function getLoai(name = "") {
   const ext = getExt(name);
-  if (ext === "pdf") return "pdf";
   if (["mp4", "mov", "mkv", "avi", "webm"].includes(ext)) return "video";
   if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) return "image";
-  return "other";
+  return "document";
+}
+
+// TYPE: pdf/docx/png/mp4...
+function getTypeExt(name = "") {
+  const ext = getExt(name);
+  return ext || "unknown";
 }
 
 function formatBytes(bytes) {
@@ -50,15 +57,6 @@ function lastName(path) {
   return parts[parts.length - 1] || "";
 }
 
-function makeDefaultCats() {
-  const t = Date.now();
-  return [
-    { id: `cat-${t}-topic`, name: "topic" },
-    { id: `cat-${t}-lesson`, name: "lesson" },
-    { id: `cat-${t}-chunk`, name: "chunk" },
-  ];
-}
-
 export default function MinIO() {
   const [currentPath, setCurrentPath] = useState(""); // "" = root
   const [q, setQ] = useState("");
@@ -67,7 +65,10 @@ export default function MinIO() {
   const [openUpload, setOpenUpload] = useState(false);
   const [openInsert, setOpenInsert] = useState(false);
   const [openFilter, setOpenFilter] = useState(false);
-  const [filters, setFilters] = useState({ type: "all" });
+
+  // filters: loai + type
+  const [filters, setFilters] = useState({ loai: "all", type: "all" });
+
   const [remote, setRemote] = useState({ folders: [], files: [] });
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
@@ -77,32 +78,22 @@ export default function MinIO() {
   const section = parts[0] || "";
 
   const isRoot = currentPath === "";
-
-// 3 bucket đều có cấu trúc giống nhau
   const isStorage = ["documents", "images", "video"].includes(section);
 
-  const isDocuments = section === "documents";
-  const isImages = section === "images";
-  const isVideo = section === "video";
+  // thiết kế tree giống nhau cho documents/images/video:
+  // <bucket>/<class>/<subject> (level 3)
+  // <bucket>/<class>/<subject>/<category> (level 4) => file view
+  const isSubjectLevel = isStorage && parts.length === 2;
+  const isCategoryLevel = isStorage && parts.length === 3;
 
-  const isImagesRoot = currentPath === "images";
-  const isVideoRoot = currentPath === "video";
-
-// giống documents:
-// <bucket>/<class>/<subject> = subject level
-// <bucket>/<class>/<subject>/<category> = file level
-const isSubjectLevel = isStorage && parts.length === 2;
-const isCategoryLevel = isStorage && parts.length === 3;
-
-const isFileView = isCategoryLevel;
-const isFolderView = isRoot || (isStorage && !isCategoryLevel);
-
+  const isFileView = isCategoryLevel;
+  const isFolderView = isRoot || (isStorage && !isCategoryLevel);
 
   useEffect(() => {
     let alive = true;
 
     async function load() {
-      // root không cần gọi API vì UI bạn cố định 3 mục
+      // root: UI cố định 3 mục
       if (currentPath === "") {
         setRemote({ folders: [], files: [] });
         setErr("");
@@ -146,48 +137,64 @@ const isFolderView = isRoot || (isStorage && !isCategoryLevel);
     return !s ? items : items.filter((x) => x.name.toLowerCase().includes(s));
   }, [q]);
 
-  // ====== Child folders for documents ======
-const childFolders = useMemo(() => {
-  // chỉ hiển thị folders khi đang ở chế độ folder-view (trừ root)
-  if (!isStorage || isRoot || isCategoryLevel) return [];
+  // ====== Child folders (cho cả documents/images/video) ======
+  const childFolders = useMemo(() => {
+    if (!isStorage || isRoot || isCategoryLevel) return [];
 
-  const s = q.trim().toLowerCase();
+    const s = q.trim().toLowerCase();
 
-  const rows = (remote.folders || []).map((f) => ({
-    id: `f-${f.fullPath}`,
-    name: f.name,
-    fullPath: f.fullPath,
-    // đang ở subject level thì folder con là category
-    isCategory: isSubjectLevel,
-    subjectPath: isSubjectLevel ? currentPath : undefined,
-  }));
+    const rows = (remote.folders || []).map((f) => ({
+      id: `f-${f.fullPath}`,
+      name: f.name,
+      fullPath: f.fullPath,
+      isCategory: isSubjectLevel, // folder con của subject => category
+    }));
 
-  const filtered = !s ? rows : rows.filter((x) => x.name.toLowerCase().includes(s));
-  return filtered.sort((a, b) => a.name.localeCompare(b.name));
-}, [remote.folders, q, isStorage, isRoot, isCategoryLevel, isSubjectLevel, currentPath]);
+    const filtered = !s ? rows : rows.filter((x) => x.name.toLowerCase().includes(s));
+    return filtered.sort((a, b) => a.name.localeCompare(b.name));
+  }, [remote.folders, q, isStorage, isRoot, isCategoryLevel, isSubjectLevel]);
 
   // ====== Files in currentPath ======
   const fileRows = useMemo(() => {
     if (!isFileView) return [];
 
-    const list = (remote.files || []).map((x) => ({
-      id: x.object_key,
-      name: x.name,
-      size: x.size || 0,
-      updatedAt: x.last_modified ? x.last_modified.slice(0, 16).replace("T", " ") : "",
-      meta: { object_key: x.object_key, url: x.url },
-      object_key: x.object_key,
-      url: x.url,
-    }));
+    const list = (remote.files || []).map((x) => {
+      const fullName = x.name || "";
+      const baseName = stripExt(fullName);
+      const loai = getLoai(fullName); // document/image/video
+      const type = getTypeExt(fullName); // pdf/docx/...
 
-    const byType =
-      filters.type === "all" ? list : list.filter((r) => getFileType(r.name) === filters.type);
+      return {
+        id: x.object_key,
+        name: baseName, // hiển thị không đuôi
+        fullName, // giữ để tooltip
+        loai,
+        type,
+        size: x.size || 0,
+        updatedAt: x.last_modified ? x.last_modified.slice(0, 16).replace("T", " ") : "",
+        object_key: x.object_key,
+        url: x.url,
+      };
+    });
 
+    // filter theo LOẠI
+    const byLoai = filters.loai === "all" ? list : list.filter((r) => r.loai === filters.loai);
+
+    // filter theo TYPE (đuôi)
+    const byType = filters.type === "all" ? byLoai : byLoai.filter((r) => r.type === filters.type);
+
+    // search theo tên không đuôi
     const s = q.trim().toLowerCase();
     const searched = !s ? byType : byType.filter((r) => r.name.toLowerCase().includes(s));
 
     return searched.sort((a, b) => a.name.localeCompare(b.name));
-  }, [remote.files, currentPath, q, filters, isFileView]);
+  }, [remote.files, q, filters, isFileView]);
+
+  // danh sách type hiện có để đưa vào dropdown
+  const availableTypes = useMemo(() => {
+    const set = new Set((remote.files || []).map((f) => getTypeExt(f.name || "")));
+    return Array.from(set).filter(Boolean).sort((a, b) => a.localeCompare(b));
+  }, [remote.files]);
 
   // ====== Columns ======
   const folderColumns = [
@@ -213,19 +220,16 @@ const childFolders = useMemo(() => {
   const fileColumns = [
     {
       key: "name",
-      label: "TÊN FILE",
+      label: "TÊN",
       render: (r) => {
-        const type = getFileType(r.name);
-
-        const icon =
-          type === "pdf" ? "📄" : type === "video" ? "🎬" : type === "image" ? "🖼️" : "📦";
+        const icon = r.loai === "video" ? "🎬" : r.loai === "image" ? "🖼️" : "📄";
 
         return (
           <div className="file-cell">
             <div className="file-left">
-              <div className={`file-icon file-${type}`}>{icon}</div>
+              <div className={`file-icon file-${r.loai}`}>{icon}</div>
               <div className="file-divider" />
-              <div className="file-name" title={r.name}>
+              <div className="file-name" title={r.fullName}>
                 {r.name}
               </div>
             </div>
@@ -235,13 +239,25 @@ const childFolders = useMemo(() => {
     },
 
     {
-      key: "type",
+      key: "loai",
       label: "LOẠI",
       render: (r) => {
-        const type = getFileType(r.name);
-        return <span className={`file-type-badge ${type}`}>{type}</span>;
+        // để đỡ “vỡ CSS” nếu bạn chưa có class .document
+        const cls = r.loai === "document" ? "other" : r.loai; // image/video dùng class cũ
+        return <span className={`file-type-badge ${cls}`}>{r.loai}</span>;
       },
     },
+
+    {
+      key: "type",
+      label: "TYPE",
+      render: (r) => {
+        // giữ style pdf nếu bạn đã có class pdf
+        const cls = r.type === "pdf" ? "pdf" : r.loai === "image" ? "image" : r.loai === "video" ? "video" : "other";
+        return <span className={`file-type-badge ${cls}`}>{r.type}</span>;
+      },
+    },
+
     { key: "size", label: "KÍCH THƯỚC", render: (r) => formatBytes(r.size) },
     { key: "updatedAt", label: "CẬP NHẬT" },
   ];
@@ -251,23 +267,22 @@ const childFolders = useMemo(() => {
     if (isRoot) return;
     setCurrentPath(parentPath(currentPath));
     setQ("");
-    setFilters({ type: "all" });
+    setFilters({ loai: "all", type: "all" });
   }
 
   function openFolder(fullPath) {
     setCurrentPath(fullPath);
     setQ("");
-    setFilters({ type: "all" });
+    setFilters({ loai: "all", type: "all" });
   }
 
   // ====== Create folder rules ======
   function canCreateFolderHere() {
     if (!isStorage) return false;
     if (isCategoryLevel) return false;
-    // cho tạo ở: <bucket> (1), <bucket>/<class> (2), <bucket>/<class>/<subject> (3)
+    // tạo được ở: <bucket>(1), <bucket>/<class>(2), <bucket>/<class>/<subject>(3)
     return parts.length === 1 || parts.length === 2 || parts.length === 3;
   }
-
 
   async function createFolder(name) {
     const n = name.trim();
@@ -287,21 +302,20 @@ const childFolders = useMemo(() => {
     try {
       await minioApi.createFolder(fullPath);
 
-      // nếu vừa tạo SUBJECT (level 3) => auto tạo topic/lesson/chunk giống UI cũ
+      // vừa tạo SUBJECT (level 3) => auto tạo topic/lesson/chunk
       if (splitPath(fullPath).length === 3) {
         const defaults = ["topic", "lesson", "chunk"];
         for (const d of defaults) {
           try {
             await minioApi.createFolder(`${fullPath}/${d}`);
           } catch {
-            // ignore nếu đã tồn tại
+            // ignore
           }
         }
       }
 
       setOpenCreateFolder(false);
 
-      // reload lại danh sách folder hiện tại
       const data = await minioApi.minioList(currentPath);
       setRemote({ folders: data.folders || [], files: data.files || [] });
     } catch (e) {
@@ -309,132 +323,14 @@ const childFolders = useMemo(() => {
     }
   }
 
-  // ====== Edit/Delete folder ======
   function canEditDeleteFolder(row) {
     if (row?.isFixed) return false;
-    if (row?.isCategory) return true;
 
     const len = splitPath(row.fullPath).length;
-    // cho sửa/xoá class (2) và subject (3) trong bucket hiện tại
-    return row.fullPath.startsWith(section + "/") && (len === 2 || len === 3);
-  }
+    const inThisBucket = row.fullPath.startsWith(section + "/");
 
-
-  function renameFolderPath(oldPath, newPath) {
-    // update folders
-    setFolders((prev) =>
-      prev.map((f) => {
-        if (f.path === oldPath || f.path.startsWith(oldPath + "/")) {
-          return { ...f, path: newPath + f.path.slice(oldPath.length) };
-        }
-        return f;
-      })
-    );
-
-    // update filesByFolder keys
-    setFilesByFolder((prev) => {
-      const next = {};
-      for (const [k, v] of Object.entries(prev)) {
-        if (k === oldPath || k.startsWith(oldPath + "/")) {
-          const nk = newPath + k.slice(oldPath.length);
-          next[nk] = v;
-        } else {
-          next[k] = v;
-        }
-      }
-      return next;
-    });
-
-    // update subjectCats keys
-    setSubjectCats((prev) => {
-      const next = {};
-      for (const [k, v] of Object.entries(prev)) {
-        if (k === oldPath || k.startsWith(oldPath + "/")) {
-          const nk = newPath + k.slice(oldPath.length);
-          next[nk] = v;
-        } else {
-          next[k] = v;
-        }
-      }
-      return next;
-    });
-
-    // update currentPath if inside
-    setCurrentPath((cp) => {
-      if (cp === oldPath || cp.startsWith(oldPath + "/")) {
-        return newPath + cp.slice(oldPath.length);
-      }
-      return cp;
-    });
-
-    setQ("");
-    setFilters({ type: "all" });
-  }
-
-  function editCategory(row) {
-    const subjectPath = row.subjectPath;
-    const oldName = row.name;
-    const oldFull = row.fullPath;
-
-    const n = window.prompt("Tên mới:", oldName);
-    if (n == null) return;
-    const name = n.trim();
-    if (!name) return;
-
-    if (name.includes("/")) {
-      alert("Tên folder không được chứa dấu '/'.");
-      return;
-    }
-
-    const cats = subjectCats[subjectPath] || [];
-    if (cats.some((c) => c.name === name)) {
-      alert("Tên folder bị trùng trong subject này!");
-      return;
-    }
-
-    const newFull = `${subjectPath}/${name}`;
-
-    setSubjectCats((prev) => ({
-      ...prev,
-      [subjectPath]: (prev[subjectPath] || []).map((c) => (c.id === row.id ? { ...c, name } : c)),
-    }));
-
-    setFilesByFolder((prev) => {
-      const next = { ...prev };
-      if (oldFull in next) {
-        next[newFull] = next[oldFull];
-        delete next[oldFull];
-      } else {
-        next[newFull] = next[newFull] || [];
-      }
-      return next;
-    });
-
-    setCurrentPath((cp) => (cp === oldFull ? newFull : cp));
-    setQ("");
-    setFilters({ type: "all" });
-  }
-
-  function deleteCategory(row) {
-    const subjectPath = row.subjectPath;
-    const full = row.fullPath;
-
-    if (!confirm(`Xoá folder "${row.name}" và toàn bộ file bên trong? (demo)`)) return;
-
-    setSubjectCats((prev) => ({
-      ...prev,
-      [subjectPath]: (prev[subjectPath] || []).filter((c) => c.id !== row.id),
-    }));
-
-    setFilesByFolder((prev) => {
-      const next = { ...prev };
-      delete next[full];
-      return next;
-    });
-
-    setCurrentPath((cp) => (cp === full ? subjectPath : cp));
-    setQ("");
-    setFilters({ type: "all" });
+    // cho sửa/xoá: class (2), subject (3), category (4 nếu đang hiển thị trong folder view)
+    return inThisBucket && (row?.isCategory || len === 2 || len === 3 || len === 4);
   }
 
   async function editFolder(row) {
@@ -457,15 +353,14 @@ const childFolders = useMemo(() => {
     try {
       await minioApi.renameFolder(oldPath, newPath);
 
-      // nếu đang đứng trong folder bị rename => cập nhật currentPath
       setCurrentPath((cp) => {
         if (cp === oldPath) return newPath;
         if (cp.startsWith(oldPath + "/")) return newPath + cp.slice(oldPath.length);
         return cp;
       });
 
-      // reload (theo currentPath mới)
-      const data = await minioApi.minioList(parentPath(newPath) || newPath);
+      const parent = parentPath(newPath) || newPath;
+      const data = await minioApi.minioList(parent);
       setRemote({ folders: data.folders || [], files: data.files || [] });
     } catch (e) {
       alert(String(e?.message || e));
@@ -479,12 +374,8 @@ const childFolders = useMemo(() => {
     try {
       await minioApi.deleteFolder(target);
 
-      // nếu currentPath đang nằm trong folder bị xoá => bật lên cha
-      setCurrentPath((cp) =>
-        cp === target || cp.startsWith(target + "/") ? parentPath(target) : cp
-      );
+      setCurrentPath((cp) => (cp === target || cp.startsWith(target + "/") ? parentPath(target) : cp));
 
-      // reload folder cha
       const parent = parentPath(target);
       if (parent) {
         const data = await minioApi.minioList(parent);
@@ -531,28 +422,26 @@ const childFolders = useMemo(() => {
   }
 
   async function editFile(row) {
-    const oldName = row.name || "";
-    const input = window.prompt("Đổi tên file:", oldName);
-    if (input == null) return; // bấm Cancel
+    // prompt chỉ hiện tên không đuôi
+    const oldBase = row.name || "";
+    const ext = row.type; // giữ đuôi cũ
 
-    let newName = input.trim();
-    if (!newName) return;
+    const input = window.prompt("Đổi tên file:", oldBase);
+    if (input == null) return;
 
-    // chặn ký tự path
-    if (newName.includes("/") || newName.includes("\\")) {
+    let newBase = input.trim();
+    if (!newBase) return;
+
+    if (newBase.includes("/") || newBase.includes("\\")) {
       alert("Tên file không được chứa '/' hoặc '\\'.");
       return;
     }
 
-    // (Tuỳ chọn) nếu user nhập không có đuôi, tự giữ đuôi cũ
-    const oldExt = oldName.includes(".") ? oldName.split(".").pop() : "";
-    const hasExt = newName.includes(".");
-    if (oldExt && !hasExt) newName = `${newName}.${oldExt}`;
+    const newFullName = ext && ext !== "unknown" ? `${newBase}.${ext}` : newBase;
 
     try {
-      await minioApi.renameObject(row.object_key, newName);
+      await minioApi.renameObject(row.object_key, newFullName);
 
-      // reload lại list để UI cập nhật
       const data = await minioApi.minioList(currentPath);
       setRemote({ folders: data.folders || [], files: data.files || [] });
     } catch (e) {
@@ -561,7 +450,7 @@ const childFolders = useMemo(() => {
   }
 
   async function deleteFile(row) {
-    if (!confirm(`Xoá "${row.name}"?`)) return;
+    if (!confirm(`Xoá "${row.fullName || row.name}"?`)) return;
 
     try {
       await minioApi.deleteObject(row.object_key);
@@ -575,19 +464,16 @@ const childFolders = useMemo(() => {
   const headerTitle = useMemo(() => {
     if (isRoot) return "MinIO";
     if (currentPath === "documents") return "Documents";
-    if (isImagesRoot) return "Images";
-    if (isVideoRoot) return "Video";
+    if (currentPath === "images") return "Images";
+    if (currentPath === "video") return "Video";
     return lastName(currentPath);
-  }, [isRoot, currentPath, isImagesRoot, isVideoRoot]);
-
+  }, [isRoot, currentPath]);
 
   const hasFolderData = isRoot ? rootRows.length > 0 : childFolders.length > 0;
-
   const hasFileData = fileRows.length > 0;
 
   return (
     <div>
-      {/* HEADER (gọn) */}
       <div className="page-header">
         <div className="page-header-top">
           <div className="title-row">
@@ -645,9 +531,16 @@ const childFolders = useMemo(() => {
         </div>
       </div>
 
-      {/* CONTENT */}
       <div className="table-wrapper">
-        {isFolderView ? (
+        {loading ? (
+          <div className="empty-state">
+            <p>Đang tải...</p>
+          </div>
+        ) : err ? (
+          <div className="empty-state">
+            <p style={{ color: "crimson" }}>{err}</p>
+          </div>
+        ) : isFolderView ? (
           hasFolderData ? (
             <DataTable
               columns={folderColumns}
@@ -715,7 +608,6 @@ const childFolders = useMemo(() => {
         )}
       </div>
 
-      {/* MODALS */}
       <CreateFolderModal
         open={openCreateFolder}
         onClose={() => setOpenCreateFolder(false)}
@@ -740,6 +632,7 @@ const childFolders = useMemo(() => {
         open={openFilter}
         onClose={() => setOpenFilter(false)}
         initialValue={filters}
+        availableTypes={availableTypes}
         onApply={(v) => setFilters(v)}
       />
     </div>
