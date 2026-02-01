@@ -1,0 +1,273 @@
+/* admin/modal.css */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  z-index: 1000;
+  backdrop-filter: blur(2px);
+}
+
+.modal {
+  width: 100%;
+  max-width: 480px;
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+  border: 1px solid #e2e8f0;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-header {
+  padding: 24px 24px 16px;
+  border-bottom: 1px solid #f1f5f9;
+  flex-shrink: 0;
+}
+
+.modal-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: #0f172a;
+  margin: 0 0 4px 0;
+}
+
+.modal-subtitle {
+  color: #64748b;
+  font-size: 14px;
+  line-height: 1.4;
+  margin: 0;
+}
+
+.modal-close {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  border: 1px solid #e2e8f0;
+  background: white;
+  color: #64748b;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  transition: all 0.15s ease;
+  font-size: 18px;
+}
+
+.modal-close:hover {
+  background: #f1f5f9;
+  border-color: #cbd5e1;
+}
+
+.modal-body {
+  padding: 24px;
+  flex: 1;
+  overflow-y: auto;
+}
+
+.field {
+  margin-bottom: 20px;
+}
+
+.field label {
+  display: block;
+  font-size: 14px;
+  font-weight: 500;
+  color: #475569;
+  margin-bottom: 8px;
+}
+
+.field input,
+.field select {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  font-size: 14px;
+  background: white;
+  transition: all 0.15s ease;
+  outline: none;
+}
+
+.field input:focus,
+.field select:focus {
+  border-color: #0066cc;
+  box-shadow: 0 0 0 3px rgba(0, 102, 204, 0.1);
+}
+
+.field input::placeholder {
+  color: #94a3b8;
+}
+
+.file-info {
+  margin-top: 12px;
+  padding: 12px;
+  background: #f8fafc;
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.file-info strong {
+  color: #0f172a;
+}
+
+.modal-footer {
+  padding: 20px 24px;
+  border-top: 1px solid #f1f5f9;
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.modal-note {
+  font-size: 13px;
+  color: #64748b;
+  line-height: 1.5;
+  padding: 12px;
+  background: #f8fafc;
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+  margin-top: 24px;
+}
+
+/* Form grid */
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 16px;
+}
+
+.form-grid .field {
+  margin-bottom: 0;
+}
+
+@media (max-width: 640px) {
+  .modal {
+    max-width: calc(100vw - 40px);
+    max-height: 80vh;
+  }
+
+  .modal-header,
+  .modal-body,
+  .modal-footer {
+    padding: 20px;
+  }
+
+  .form-grid {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+}
+
+.kv-input {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  font-size: 14px;
+  background: white;
+  outline: none;
+  transition: all 0.15s ease;
+}
+
+.kv-input:focus {
+  border-color: #0066cc;
+  box-shadow: 0 0 0 2px rgba(0, 102, 204, 0.12);
+}
+
+.kv-input:disabled {
+  background: #f8fafc;
+  color: #64748b;
+}
+
+/* Làm select giống input (kv-input) */
+select.kv-input {
+  width: 100%;
+  height: 38px;
+  padding: 8px 10px;
+  border: 1px solid #2a2a2a;
+  border-radius: 10px;
+  background: #0f0f0f;
+  color: #eaeaea;
+  outline: none;
+
+  /* bỏ style mặc định */
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+
+  /* chừa chỗ cho mũi tên */
+  padding-right: 34px;
+
+  /* mũi tên dropdown */
+  background-image:
+    linear-gradient(45deg, transparent 50%, #bdbdbd 50%),
+    linear-gradient(135deg, #bdbdbd 50%, transparent 50%);
+  background-position:
+    calc(100% - 18px) 16px,
+    calc(100% - 13px) 16px;
+  background-size:
+    6px 6px,
+    6px 6px;
+  background-repeat: no-repeat;
+}
+
+/* Select đồng bộ màu với input kv-input (theme trắng) */
+select.kv-input {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  font-size: 14px;
+  background: white;
+  color: #0f172a;
+  outline: none;
+  transition: all 0.15s ease;
+
+  /* bỏ style mặc định */
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+
+  /* chừa chỗ cho mũi tên */
+  padding-right: 36px;
+
+  /* mũi tên dropdown màu xám nhạt */
+  background-image:
+    linear-gradient(45deg, transparent 50%, #64748b 50%),
+    linear-gradient(135deg, #64748b 50%, transparent 50%);
+  background-position:
+    calc(100% - 18px) 18px,
+    calc(100% - 13px) 18px;
+  background-size:
+    6px 6px,
+    6px 6px;
+  background-repeat: no-repeat;
+}
+
+/* focus đồng bộ */
+select.kv-input:focus {
+  border-color: #0066cc;
+  box-shadow: 0 0 0 2px rgba(0, 102, 204, 0.12);
+}
+
+/* disabled đồng bộ */
+select.kv-input:disabled {
+  background: #f8fafc;
+  color: #64748b;
+  cursor: not-allowed;
+}
+
+/* option (nhiều browser sẽ dùng) */
+select.kv-input option {
+  background: white;
+  color: #0f172a;
+}

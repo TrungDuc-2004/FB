@@ -1,0 +1,52 @@
+# ========== Secrets / Environment ==========
+.env
+.env.*
+config.env
+**/config.env
+*.env
+
+# Nếu bạn muốn giữ file mẫu để người khác copy:
+# (không ignore các file dạng *.example)
+!*.example
+!.env.example
+!config.env.example
+
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# ========== Virtual environments ==========
+.venv/
+venv/
+env/
+.conda/
+
+# ========== FastAPI / Uvicorn logs ==========
+*.log
+
+# ========== Tests / Linters / Type checkers ==========
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ========== Jupyter ==========
+.ipynb_checkpoints/
+
+# ========== OS / IDE ==========
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ========== Local data directories (nếu có đặt trong repo) ==========
+minio-data/
+data/
+tmp/

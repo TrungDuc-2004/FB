@@ -1,0 +1,332 @@
+/* admin/page.css - Gọn, dễ nhìn */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* Header gọn */
+.page-header {
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 16px 18px;
+  margin-bottom: 16px;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
+}
+
+/* bỏ gradient fancy */
+.page-header::before,
+.header-background {
+  display: none !important;
+}
+
+.page-header-top {
+  margin-bottom: 12px;
+}
+
+.title-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.page-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.page-title::after {
+  display: none;
+}
+
+/* không dùng subtitle nữa */
+.page-subtitle {
+  display: none;
+}
+
+/* breadcrumb gọn */
+.breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.crumb {
+  font-size: 12px;
+  color: #475569;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  padding: 4px 8px;
+  border-radius: 999px;
+}
+
+.sep {
+  margin-left: 6px;
+  opacity: 0.6;
+}
+
+.page-header-bottom {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #f1f5f9;
+  flex-wrap: wrap;
+}
+
+.search-box {
+  flex: 1;
+  min-width: 260px;
+  position: relative;
+}
+
+.search-box input {
+  width: 100%;
+  padding: 10px 12px 10px 40px;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  font-size: 14px;
+  background: #fff;
+  outline: none;
+}
+
+.search-box input:focus {
+  border-color: #94a3b8;
+}
+
+.search-box::before {
+  content: "🔍";
+  position: absolute;
+  left: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 14px;
+  opacity: 0.6;
+}
+
+.header-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.back-btn {
+  padding: 8px 10px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  color: #475569;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.back-btn:hover {
+  background: #f1f5f9;
+}
+
+/* back nằm bên phải */
+.title-row {
+  justify-content: space-between;
+}
+
+/* back style khác */
+.back-btn-right {
+  background: #0ea5e9;
+  border-color: #0ea5e9;
+  color: #fff;
+}
+
+.back-btn-right:hover {
+  background: #0284c7;
+  border-color: #0284c7;
+}
+
+.btn {
+  padding: 8px 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  background: #fff;
+  color: #475569;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 13px;
+  height: 38px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.btn:hover:not(:disabled) {
+  background: #f8fafc;
+}
+
+.btn-primary {
+  background: #0ea5e9;
+  color: #fff;
+  border-color: #0ea5e9;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #0284c7;
+  border-color: #0284c7;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.table-wrapper {
+  background: white;
+  border-radius: 12px;
+  border: 1px solid #e2e8f0;
+  overflow: hidden;
+  min-height: 240px;
+}
+
+/* empty state (nếu bạn dùng) */
+.empty-state {
+  padding: 28px 16px;
+  text-align: center;
+  color: #64748b;
+}
+.empty-state-icon {
+  font-size: 36px;
+  margin-bottom: 8px;
+}
+
+.detail-footer {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 16px 20px;
+  border-top: 1px solid #f1f5f9;
+}
+
+.detail-footer .spacer {
+  flex: 1;
+}
+
+/* ===== Actions trong bảng: không cho chữ rớt dòng + nhỏ gọn ===== */
+.table-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+
+  flex-wrap: nowrap; /* ✅ không cho xuống hàng */
+  white-space: nowrap; /* ✅ chữ không xuống dòng */
+}
+
+/* Nút khi nằm trong table-actions thì nhỏ lại cho đồng bộ */
+.table-actions .btn {
+  height: 38px;
+  padding: 8px 12px;
+  font-size: 13px;
+  border-radius: 10px;
+  line-height: 1;
+  white-space: nowrap; /* ✅ chữ không xuống dòng */
+}
+
+/* ===== Button variants (Users) ===== */
+.btn-success {
+  background: linear-gradient(135deg, #16a34a, #22c55e);
+  color: #fff;
+  border: none;
+  font-weight: 700;
+  box-shadow: 0 6px 18px rgba(34, 197, 94, 0.22);
+}
+
+.btn-success:hover:not(:disabled) {
+  background: linear-gradient(135deg, #15803d, #16a34a);
+  box-shadow: 0 10px 26px rgba(34, 197, 94, 0.28);
+}
+
+.btn-danger {
+  background: linear-gradient(135deg, #dc2626, #ef4444);
+  color: #fff;
+  border: none;
+  font-weight: 700;
+  box-shadow: 0 6px 18px rgba(239, 68, 68, 0.22);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: linear-gradient(135deg, #b91c1c, #dc2626);
+  box-shadow: 0 10px 26px rgba(239, 68, 68, 0.28);
+}
+
+/* Nút trong bảng: đồng đều hơn */
+.table-actions .btn {
+  height: 40px;
+  padding: 10px 14px;
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* Nếu bạn muốn nút đỏ chữ nhỏ hơn chút nữa */
+.table-actions .btn-danger {
+  font-size: 13px;
+}
+
+/* (Nếu bạn muốn cả 2 nút đều nhỏ y chang nhau thì bỏ đoạn trên,
+   và chỉ dùng .table-actions .btn font-size: 13px;) */
+
+/* Status badge riêng cho Users */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 12px; /* nhỏ lại */
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  border: 1px solid transparent;
+}
+
+/* active: xanh lá nhẹ */
+.status-badge.is-active {
+  background: #ecfdf5;
+  color: #047857;
+  border-color: #a7f3d0;
+}
+
+/* disabled: đỏ */
+.status-badge.is-disabled {
+  background: #fef2f2;
+  color: #b91c1c;
+  border-color: #fecaca;
+}
+
+/* Role badge riêng cho Users */
+.role-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  border: 1px solid transparent;
+}
+
+/* admin: tím/xanh đậm (KHÔNG đỏ) */
+.role-badge.is-admin {
+  background: #eef2ff;
+  color: #4338ca;
+  border-color: #c7d2fe;
+}
+
+/* user: xám/ xanh nhạt */
+.role-badge.is-user {
+  background: #f1f5f9;
+  color: #334155;
+  border-color: #e2e8f0;
+}

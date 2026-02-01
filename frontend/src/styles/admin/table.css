@@ -1,0 +1,411 @@
+/* admin/table.css */
+.table-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0; /* ✅ QUAN TRỌNG */
+  overflow: hidden;
+
+  background: white;
+  border-radius: 12px;
+}
+
+.table-scroll {
+  flex: 1;
+  min-height: 0; /* ✅ QUAN TRỌNG */
+  overflow: auto; /* ✅ cho phép cuộn */
+}
+
+.table-pagination {
+  flex: 0 0 auto; /* ✅ footer luôn có chỗ */
+}
+
+.table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  min-width: 800px;
+}
+
+.table thead {
+  background: linear-gradient(135deg, #f8fafc, #f1f5f9);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.table th {
+  padding: 20px 24px;
+  text-align: left;
+  font-size: 13px;
+  font-weight: 700;
+  color: #475569;
+  border-bottom: 2px solid #e2e8f0;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  white-space: nowrap;
+  font-family: inherit;
+}
+
+.table td {
+  padding: 20px 24px;
+  border-bottom: 1px solid #f1f5f9;
+  color: #334155;
+  font-size: 15px;
+  vertical-align: middle;
+  font-weight: 500;
+}
+
+.table th {
+  padding: 10px 18px;
+  font-size: 12px;
+}
+
+.table td {
+  padding: 10px 18px;
+  font-size: 13px;
+}
+
+.table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.table tbody tr {
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+}
+
+.table tbody tr:hover {
+  background: #f8fafc;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+}
+
+.row-click {
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.row-click:hover {
+  background: #e0f2fe !important;
+  border-left: 4px solid #3b82f6;
+}
+
+.table-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.table-actions .btn {
+  padding: 8px 16px;
+  font-size: 12px;
+  height: 36px;
+  min-width: auto;
+  font-weight: 600;
+  border-radius: 10px;
+}
+
+/* Empty state */
+.empty-state {
+  padding: 100px 20px;
+  text-align: center;
+  color: #94a3b8;
+  border-radius: 16px;
+  background: linear-gradient(135deg, #f8fafc, #f1f5f9);
+  margin: 20px;
+  border: 2px dashed #e2e8f0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.empty-state p {
+  margin: 20px 0 0 0;
+  font-size: 16px;
+  line-height: 1.6;
+  max-width: 400px;
+  font-weight: 500;
+  color: #64748b;
+}
+
+.empty-state-icon {
+  font-size: 56px;
+  margin-bottom: 20px;
+  opacity: 0.6;
+}
+
+/* File type badges */
+.file-type-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-family: inherit;
+  border: 1px solid;
+}
+
+.file-type-badge.pdf {
+  background: rgba(220, 38, 38, 0.08);
+  color: #b91c1c;
+  border-color: rgba(220, 38, 38, 0.2);
+}
+
+.file-type-badge.video {
+  background: rgba(29, 78, 216, 0.08);
+  color: #1d4ed8;
+  border-color: rgba(29, 78, 216, 0.2);
+}
+
+.file-type-badge.image {
+  background: rgba(22, 163, 74, 0.08);
+  color: #16a34a;
+  border-color: rgba(22, 163, 74, 0.2);
+}
+
+.file-type-badge.other {
+  background: rgba(100, 116, 139, 0.08);
+  color: #475569;
+  border-color: rgba(100, 116, 139, 0.2);
+}
+
+/* Folder icon styles */
+.folder-item-name {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.folder-item-name::before {
+  content: "📁";
+  font-size: 18px;
+  opacity: 0.8;
+}
+
+.folder-item-name.folder-category::before {
+  content: "📂";
+  color: #3b82f6;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .table-container {
+    overflow-x: auto;
+  }
+
+  .empty-state {
+    padding: 60px 20px;
+  }
+
+  .empty-state-icon {
+    font-size: 48px;
+  }
+}
+
+.folder-category-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  background: rgba(0, 102, 204, 0.1);
+  color: #0066cc;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  margin-left: 8px;
+  border: 1px solid rgba(0, 102, 204, 0.2);
+}
+
+/* ===== Folder row style (đỡ trống, đẹp hơn) ===== */
+.folder-cell {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.folder-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+
+  padding: 6px 10px;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  border-radius: 12px;
+
+  min-width: 0; /* để ellipsis hoạt động */
+}
+
+.folder-icon {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+
+  border-radius: 10px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  flex: 0 0 auto;
+}
+
+.folder-left {
+  padding: 4px 8px; /* giảm từ 6px 10px */
+  border-radius: 10px; /* giảm từ 12px */
+}
+
+.folder-icon {
+  width: 28px; /* giảm từ 32px */
+  height: 28px;
+  border-radius: 9px;
+}
+
+.folder-divider {
+  width: 1px;
+  height: 18px;
+  background: #e2e8f0;
+  flex: 0 0 auto;
+}
+
+.folder-name {
+  font-weight: 600;
+  color: #0f172a;
+
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.folder-right {
+  color: #94a3b8;
+  font-size: 18px;
+  padding-right: 4px;
+}
+
+.folder-right {
+  font-size: 16px; /* giảm từ 18px */
+}
+
+/* hover “đã mắt” hơn */
+.row-click:hover .folder-left {
+  border-color: #bae6fd;
+  background: #f0f9ff;
+}
+
+.row-click:hover .folder-right {
+  color: #0ea5e9;
+}
+
+/* ===== File row style (icon + pill + divider) ===== */
+.file-cell {
+  display: flex;
+  align-items: center;
+}
+
+.file-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+
+  padding: 4px 8px;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  border-radius: 10px;
+
+  min-width: 0; /* ellipsis */
+}
+
+.file-icon {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+
+  border-radius: 9px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  flex: 0 0 auto;
+}
+
+/* divider giữa icon và tên */
+.file-divider {
+  width: 1px;
+  height: 18px;
+  background: #e2e8f0;
+  flex: 0 0 auto;
+}
+
+.file-name {
+  font-weight: 600;
+  color: #0f172a;
+
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* hover đẹp hơn */
+.table tbody tr:hover .file-left {
+  border-color: #bae6fd;
+  background: #f0f9ff;
+}
+
+.file-pdf {
+  border-color: #fecaca;
+  background: #fff1f2;
+}
+.file-video {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+}
+.file-image {
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+}
+.file-other {
+  border-color: #e5e7eb;
+  background: #f9fafb;
+}
+
+/* ===== Pagination ===== */
+.table-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+
+  padding: 10px 14px;
+  border-top: 1px solid #f1f5f9;
+  background: linear-gradient(135deg, #f8fafc, #f1f5f9);
+
+  border-bottom-left-radius: 12px;
+  border-bottom-right-radius: 12px;
+}
+
+.table-pagination__info {
+  font-size: 12px;
+  font-weight: 600;
+  color: #64748b;
+  white-space: nowrap;
+}
+
+.table-pagination__controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.table-pagination__page {
+  font-size: 12px;
+  font-weight: 700;
+  color: #475569;
+  white-space: nowrap;
+}

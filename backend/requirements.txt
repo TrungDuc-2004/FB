@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+minio
+pymongo
+neo4j
+sqlalchemy
+psycopg2-binary
+python-multipart
