@@ -77,15 +77,26 @@ export default function MinIO() {
   const section = parts[0] || "";
 
   const isRoot = currentPath === "";
-  const isImages = currentPath === "images";
-  const isVideo = currentPath === "video";
+
+// 3 bucket đều có cấu trúc giống nhau
+  const isStorage = ["documents", "images", "video"].includes(section);
+
   const isDocuments = section === "documents";
+  const isImages = section === "images";
+  const isVideo = section === "video";
 
-  const isDocsSubject = isDocuments && parts.length === 3; // documents/class-10/tin-hoc
-  const isDocsCategory = isDocuments && parts.length === 4; // bất kỳ folder level 4 => file view
+  const isImagesRoot = currentPath === "images";
+  const isVideoRoot = currentPath === "video";
 
-  const isFileView = isImages || isVideo || isDocsCategory;
-  const isFolderView = isRoot || (isDocuments && !isDocsCategory);
+// giống documents:
+// <bucket>/<class>/<subject> = subject level
+// <bucket>/<class>/<subject>/<category> = file level
+const isSubjectLevel = isStorage && parts.length === 2;
+const isCategoryLevel = isStorage && parts.length === 3;
+
+const isFileView = isCategoryLevel;
+const isFolderView = isRoot || (isStorage && !isCategoryLevel);
+
 
   useEffect(() => {
     let alive = true;
@@ -136,23 +147,24 @@ export default function MinIO() {
   }, [q]);
 
   // ====== Child folders for documents ======
-  const docChildFolders = useMemo(() => {
-    if (!isDocuments) return [];
+const childFolders = useMemo(() => {
+  // chỉ hiển thị folders khi đang ở chế độ folder-view (trừ root)
+  if (!isStorage || isRoot || isCategoryLevel) return [];
 
-    const s = q.trim().toLowerCase();
+  const s = q.trim().toLowerCase();
 
-    const rows = (remote.folders || []).map((f) => ({
-      id: `f-${f.fullPath}`,
-      name: f.name,
-      fullPath: f.fullPath,
-      // nếu đang ở subject (level 3) thì folder con là category
-      isCategory: isDocsSubject,
-      subjectPath: isDocsSubject ? currentPath : undefined,
-    }));
+  const rows = (remote.folders || []).map((f) => ({
+    id: `f-${f.fullPath}`,
+    name: f.name,
+    fullPath: f.fullPath,
+    // đang ở subject level thì folder con là category
+    isCategory: isSubjectLevel,
+    subjectPath: isSubjectLevel ? currentPath : undefined,
+  }));
 
-    const filtered = !s ? rows : rows.filter((x) => x.name.toLowerCase().includes(s));
-    return filtered.sort((a, b) => a.name.localeCompare(b.name));
-  }, [remote.folders, q, isDocuments, isDocsSubject, currentPath]);
+  const filtered = !s ? rows : rows.filter((x) => x.name.toLowerCase().includes(s));
+  return filtered.sort((a, b) => a.name.localeCompare(b.name));
+}, [remote.folders, q, isStorage, isRoot, isCategoryLevel, isSubjectLevel, currentPath]);
 
   // ====== Files in currentPath ======
   const fileRows = useMemo(() => {
@@ -250,11 +262,12 @@ export default function MinIO() {
 
   // ====== Create folder rules ======
   function canCreateFolderHere() {
-    if (!isDocuments) return false;
-    if (isDocsCategory) return false;
-    // cho tạo ở: documents (1), class (2), subject (3)
+    if (!isStorage) return false;
+    if (isCategoryLevel) return false;
+    // cho tạo ở: <bucket> (1), <bucket>/<class> (2), <bucket>/<class>/<subject> (3)
     return parts.length === 1 || parts.length === 2 || parts.length === 3;
   }
+
 
   async function createFolder(name) {
     const n = name.trim();
@@ -299,10 +312,13 @@ export default function MinIO() {
   // ====== Edit/Delete folder ======
   function canEditDeleteFolder(row) {
     if (row?.isFixed) return false;
-    if (row?.isCategory) return true; // subject cats
+    if (row?.isCategory) return true;
+
     const len = splitPath(row.fullPath).length;
-    return row.fullPath.startsWith("documents/") && (len === 2 || len === 3);
+    // cho sửa/xoá class (2) và subject (3) trong bucket hiện tại
+    return row.fullPath.startsWith(section + "/") && (len === 2 || len === 3);
   }
+
 
   function renameFolderPath(oldPath, newPath) {
     // update folders
@@ -558,12 +574,15 @@ export default function MinIO() {
 
   const headerTitle = useMemo(() => {
     if (isRoot) return "MinIO";
-    if (isImages) return "Images";
-    if (isVideo) return "Video";
+    if (currentPath === "documents") return "Documents";
+    if (isImagesRoot) return "Images";
+    if (isVideoRoot) return "Video";
     return lastName(currentPath);
-  }, [isRoot, isImages, isVideo, currentPath]);
+  }, [isRoot, currentPath, isImagesRoot, isVideoRoot]);
 
-  const hasFolderData = isRoot ? rootRows.length > 0 : docChildFolders.length > 0;
+
+  const hasFolderData = isRoot ? rootRows.length > 0 : childFolders.length > 0;
+
   const hasFileData = fileRows.length > 0;
 
   return (
@@ -632,7 +651,7 @@ export default function MinIO() {
           hasFolderData ? (
             <DataTable
               columns={folderColumns}
-              rows={isRoot ? rootRows : docChildFolders}
+              rows={isRoot ? rootRows : childFolders}
               getRowClassName={() => "row-click"}
               onRowDoubleClick={(row) => openFolder(row.fullPath)}
               renderActions={

@@ -115,9 +115,7 @@ export default function Login() {
             </form>
 
             {/* Footer */}
-            <div className="footer">
-              <p>48.01.104.023 - Lê Tuấn Đạt</p>
-            </div>
+          
           </div>
         </div>
       </div>

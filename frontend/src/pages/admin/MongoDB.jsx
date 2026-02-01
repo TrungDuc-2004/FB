@@ -280,7 +280,7 @@ function DocumentModal({ open, onClose, title, initialDoc, onSave, collectionNam
                     ) : (
                       <input
                         className="kv-input"
-                        placeholder='value (vd: "abc" hoặc [] hoặc {"bucket":"data-edu"...})'
+                        placeholder='value'
                         value={p.v}
                         onChange={(e) => change(i, "v", e.target.value)}
                       />

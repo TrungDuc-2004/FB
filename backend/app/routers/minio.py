@@ -2,13 +2,15 @@ import os
 import io
 import time
 from urllib.parse import quote
-from typing import Literal, List
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Path,  Query
+from typing import List, Optional, Tuple, Set
+
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query
 from minio.error import S3Error
-from ..services.minio_client import get_minio_client
 from pydantic import BaseModel, Field
 from minio.commonconfig import CopySource
 from minio.deleteobjects import DeleteObject
+
+from ..services.minio_client import get_minio_client
 
 
 router = APIRouter(
@@ -16,10 +18,7 @@ router = APIRouter(
     tags=["Minio"]
 )
 
-client = get_minio_client()
-BUCKET = os.getenv("MINIO_BUCKET")  
-MINIO_PUBLIC_BASE_URL = (os.getenv("MINIO_PUBLIC_BASE_URL") or "http://127.0.0.1:9000").rstrip("/")
-
+# =================== Helpers =================== #
 
 def clean_path(path: str) -> str:
     p = (path or "").strip()
@@ -27,119 +26,207 @@ def clean_path(path: str) -> str:
         p = p[1:]
     if "\\" in p:
         raise HTTPException(status_code=400, detail="Invalid path (contains backslash)")
-    if ".." in p.split("/"):
+    parts = [x for x in p.split("/") if x != ""]
+    if ".." in parts:
         raise HTTPException(status_code=400, detail="Invalid path (contains ..)")
-    return p.strip("/")
+    return "/".join(parts)
 
 
-def folder_marker(path: str) -> str:
-    p = clean_path(path)
+def folder_marker(rel_path: str) -> str:
+    p = clean_path(rel_path)
     return f"{p}/" if p else ""
 
 
-def public_url(object_key: str) -> str:
+def _runtime():
+    """
+    Lấy client + chế độ bucket từ ENV (ENV đã được load trong get_minio_client()).
+    """
+    client = get_minio_client()
+
+    default_bucket = (os.getenv("MINIO_BUCKET") or "").strip() or None
+
+    endpoint = (os.getenv("MINIO_ENDPOINT") or "127.0.0.1:9000").strip()
+    secure = (os.getenv("MINIO_SECURE", "false").strip().lower() == "true")
+    scheme = "https" if secure else "http"
+
+    public_base = (os.getenv("MINIO_PUBLIC_BASE_URL") or f"{scheme}://{endpoint}").rstrip("/")
+
+    return client, default_bucket, public_base
+
+
+def _split_virtual(virtual: str, default_bucket: Optional[str], *, allow_empty_key: bool) -> Tuple[str, str]:
+    """
+    Virtual path từ UI -> (bucket, key)
+
+    - Nếu có MINIO_BUCKET: bucket=MINIO_BUCKET, key=virtual (có thể rỗng nếu allow_empty_key=True)
+    - Nếu không có MINIO_BUCKET: virtual phải có dạng: "<bucket>" hoặc "<bucket>/<key>"
+    """
+    p = clean_path(virtual)
+
+    if default_bucket:
+        if not allow_empty_key and not p:
+            raise HTTPException(status_code=400, detail="Path is required")
+        return default_bucket, p
+
+    # multi-bucket mode
+    if not p:
+        # dùng cho /list root: sẽ xử lý riêng (list buckets)
+        if allow_empty_key:
+            return "", ""
+        raise HTTPException(
+            status_code=400,
+            detail="Thiếu bucket. VD: ?path=documents hoặc documents/folderA (hoặc cấu hình MINIO_BUCKET)",
+        )
+
+    parts = p.split("/", 1)
+    bucket = parts[0].strip()
+    key = parts[1].strip() if len(parts) > 1 else ""
+
+    if not bucket:
+        raise HTTPException(status_code=400, detail="Bucket name rỗng/không hợp lệ")
+    if not allow_empty_key and not key:
+        raise HTTPException(status_code=400, detail="Thiếu key sau bucket. VD: documents/class-10")
+
+    return bucket, key
+
+
+def _to_virtual(default_bucket: Optional[str], bucket: str, key: str) -> str:
+    """
+    Format đường dẫn trả về cho UI.
+    - single-bucket: trả key
+    - multi-bucket: trả "bucket/key"
+    """
+    k = clean_path(key)
+    if default_bucket:
+        return k
+    return f"{bucket}/{k}" if k else bucket
+
+
+def _public_url(public_base: str, bucket: str, object_key: str) -> str:
     encoded = quote(object_key, safe="/")
-    return f"{MINIO_PUBLIC_BASE_URL}/{BUCKET}/{encoded}"
+    return f"{public_base}/{bucket}/{encoded}"
 
 
-def prefix_has_anything(client, prefix: str) -> bool:
-    # chỉ cần thấy 1 object là coi như "folder tồn tại"
-    it = client.list_objects(BUCKET, prefix=prefix, recursive=True)
+def prefix_has_anything(client, bucket: str, prefix: str) -> bool:
+    it = client.list_objects(bucket, prefix=prefix, recursive=True)
     for _ in it:
         return True
     return False
 
-# =================== START MODEL =================== #
-# =================== Model Create Folder =================== #
+
+# =================== Models =================== #
+
 class CreateFolderBody(BaseModel):
     full_path: str = Field(..., min_length=1)
 
-# =================== Model Rename Folder =================== #
+
 class RenameFolderBody(BaseModel):
     old_path: str = Field(..., min_length=1)
     new_path: str = Field(..., min_length=1)
 
-# =================== Model Rename File =================== #
+
 class RenameObjectBody(BaseModel):
-    object_key: str = Field(..., min_length=1)      
-    new_name: str = Field(..., min_length=1)        
-
-# =================== END MODEL =================== #
+    object_key: str = Field(..., min_length=1)
+    new_name: str = Field(..., min_length=1)
 
 
+# =================== GET =================== #
 
-# =================== START GET =================== #
-# =================== List cấu trúc MinIO =================== #
 @router.get("/list", summary="Lấy ra cấu trúc list trong MinIO")
 def list_structure(path: str = Query("", description="Mẫu: documents, documents/class-10, ...")):
-    client = get_minio_client()
+    client, default_bucket, public_base = _runtime()
 
-    p = (path or "").strip()
-    if p.startswith("/"):
-        p = p[1:]
-    if "\\" in p:
-        raise HTTPException(status_code=400, detail="Invalid path (contains backslash)")
-    if ".." in p.split("/"):
-        raise HTTPException(status_code=400, detail="Invalid path (contains ..)")
+    # Nếu multi-bucket và path rỗng -> trả danh sách buckets (giúp UI vào root vẫn thấy)
+    if not default_bucket and not clean_path(path):
+        try:
+            buckets = client.list_buckets()
+            folders = [{"name": b.name, "fullPath": b.name} for b in buckets]
+            folders.sort(key=lambda x: x["name"].lower())
+            return {
+                "bucket": "",
+                "path": "",
+                "prefix": "",
+                "folders": folders,
+                "files": [],
+                "mode": "bucket_per_section_root",
+            }
+        except S3Error as e:
+            raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
 
-    p = p.strip("/")
-    prefix = f"{p}/" if p else ""
+    bucket, key = _split_virtual(path, default_bucket, allow_empty_key=True)
+    prefix = folder_marker(key)  # key/ hoặc ""
 
     try:
-        # recursive=False => chỉ lấy con trực tiếp trong folder này
-        objects = client.list_objects(BUCKET, prefix=prefix, recursive=False)
+        # recursive=False => chỉ lấy con trực tiếp
+        objects = client.list_objects(bucket, prefix=prefix, recursive=False)
 
+        folder_names: Set[str] = set()
         folders = []
         files = []
 
         for obj in objects:
-            if prefix and obj.object_name == prefix:
+            name = obj.object_name
+
+            if prefix and name == prefix:
                 continue
 
-            # folder sẽ có is_dir=True hoặc object_name kết thúc bằng "/"
-            if getattr(obj, "is_dir", False) or obj.object_name.endswith("/"):
-                full = obj.object_name.rstrip("/")
-                name = full.split("/")[-1] if full else ""
-                if name:
-                    folders.append({"name": name, "fullPath": full})
-            else:
-                object_key = obj.object_name
-                name = object_key.split("/")[-1]
-                encoded_key = quote(object_key, safe="/")
+            rest = name[len(prefix):] if prefix else name
+            if not rest:
+                continue
 
-                files.append({
-                    "object_key": object_key,
-                    "name": name,
-                    "size": obj.size,
-                    "etag": obj.etag,
-                    "last_modified": obj.last_modified.isoformat() if obj.last_modified else None,
-                    "url": f"{MINIO_PUBLIC_BASE_URL}/{BUCKET}/{encoded_key}",
-                })
+            # thư mục (marker) hoặc có "/" => folder con
+            if getattr(obj, "is_dir", False) or rest.endswith("/") or "/" in rest:
+                folder = rest.strip("/").split("/", 1)[0]
+                if folder:
+                    folder_names.add(folder)
+                continue
 
-        folders.sort(key=lambda x: x["name"].lower())
+            # file
+            object_key = name
+            file_name = rest.split("/")[-1]
+            files.append({
+                "object_key": _to_virtual(default_bucket, bucket, object_key),
+                "name": file_name,
+                "size": obj.size,
+                "etag": obj.etag,
+                "last_modified": obj.last_modified.isoformat() if obj.last_modified else None,
+                "url": _public_url(public_base, bucket, object_key),
+            })
+
+        for folder in sorted(folder_names, key=lambda x: x.lower()):
+            inner_full = f"{clean_path(key)}/{folder}" if clean_path(key) else folder
+            folders.append({"name": folder, "fullPath": _to_virtual(default_bucket, bucket, inner_full)})
+
         files.sort(key=lambda x: x["name"].lower())
 
         return {
-            "bucket": BUCKET,
-            "path": p,
+            "bucket": bucket,
+            "path": clean_path(path),
             "prefix": prefix,
             "folders": folders,
             "files": files,
+            "mode": "single_bucket" if default_bucket else "bucket_per_section",
         }
 
     except S3Error as e:
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
-    
-# =================== END GET =================== #
 
-# =================== START PUT =================== #
-# =================== Sửa tên Folder =================== #
+
+# =================== PUT =================== #
+
 @router.put("/folders/", summary="Đổi tên folder")
 def rename_folder(body: RenameFolderBody):
-    client = get_minio_client()
+    client, default_bucket, _ = _runtime()
 
-    old_path = clean_path(body.old_path)
-    new_path = clean_path(body.new_path)
+    b1, old_rel = _split_virtual(body.old_path, default_bucket, allow_empty_key=False)
+    b2, new_rel = _split_virtual(body.new_path, default_bucket, allow_empty_key=False)
+
+    if b1 != b2:
+        raise HTTPException(status_code=400, detail="Không hỗ trợ rename folder giữa 2 bucket khác nhau")
+
+    bucket = b1
+    old_path = clean_path(old_rel)
+    new_path = clean_path(new_rel)
 
     if old_path == new_path:
         raise HTTPException(status_code=400, detail="new_path is the same as old_path")
@@ -147,63 +234,52 @@ def rename_folder(body: RenameFolderBody):
     old_prefix = folder_marker(old_path)
     new_prefix = folder_marker(new_path)
 
-    # chặn rename folder vào bên trong chính nó
     if new_prefix.startswith(old_prefix):
         raise HTTPException(status_code=400, detail="new_path must not be inside old_path")
 
     try:
-        if not prefix_has_anything(client, old_prefix):
+        if not prefix_has_anything(client, bucket, old_prefix):
             raise HTTPException(status_code=404, detail="Folder not found")
 
-        if prefix_has_anything(client, new_prefix):
+        if prefix_has_anything(client, bucket, new_prefix):
             raise HTTPException(status_code=409, detail="Target folder already exists")
 
-        # list toàn bộ objects trong old_prefix
-        objects = list(client.list_objects(BUCKET, prefix=old_prefix, recursive=True))
-        if not objects:
-            # nếu folder rỗng nhưng có marker, vẫn rename marker
-            objects = []
+        objects = list(client.list_objects(bucket, prefix=old_prefix, recursive=True))
 
-        # copy từng object sang prefix mới
         copied = 0
-        to_delete = []
+        to_delete: List[DeleteObject] = []
 
         for obj in objects:
             old_key = obj.object_name
-            suffix = old_key[len(old_prefix):]  # phần phía sau old_prefix
+            suffix = old_key[len(old_prefix):]
             new_key = new_prefix + suffix
 
             client.copy_object(
-                bucket_name=BUCKET,
+                bucket_name=bucket,
                 object_name=new_key,
-                source=CopySource(BUCKET, old_key),
+                source=CopySource(bucket, old_key),
             )
             to_delete.append(DeleteObject(old_key))
             copied += 1
+
+        # copy marker nếu có
         try:
-            client.stat_object(BUCKET, old_prefix)
-            client.copy_object(
-                BUCKET,
-                new_prefix,
-                CopySource(BUCKET, old_prefix),
-            )
+            client.stat_object(bucket, old_prefix)
+            client.copy_object(bucket, new_prefix, CopySource(bucket, old_prefix))
             to_delete.append(DeleteObject(old_prefix))
         except S3Error:
-            # không có marker cũng không sao
             pass
 
-        # xoá toàn bộ object cũ
         if to_delete:
-            errors = list(client.remove_objects(BUCKET, to_delete))
+            errors = list(client.remove_objects(bucket, to_delete))
             if errors:
-                # có lỗi khi xoá
                 raise HTTPException(status_code=500, detail=f"Delete errors: {[str(e) for e in errors]}")
 
         return {
             "status": "renamed",
-            "bucket": BUCKET,
-            "old_path": old_path,
-            "new_path": new_path,
+            "bucket": bucket,
+            "old_path": _to_virtual(default_bucket, bucket, old_path),
+            "new_path": _to_virtual(default_bucket, bucket, new_path),
             "copied_objects": copied,
         }
 
@@ -213,17 +289,16 @@ def rename_folder(body: RenameFolderBody):
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
 
 
-# =================== Sửa tên File =================== #
 @router.put("/objects/", summary="Đổi tên file")
 def rename_object(body: RenameObjectBody):
-    client = get_minio_client()
+    client, default_bucket, public_base = _runtime()
 
-    old_key = clean_path(body.object_key)
+    bucket, old_key = _split_virtual(body.object_key, default_bucket, allow_empty_key=False)
+    old_key = clean_path(old_key)
+
     new_name = os.path.basename(body.new_name.strip())
-
     if "/" in body.new_name or "\\" in body.new_name:
         raise HTTPException(status_code=400, detail="new_name must not contain '/' or '\\'")
-
     if not old_key:
         raise HTTPException(status_code=400, detail="object_key is required")
 
@@ -234,57 +309,51 @@ def rename_object(body: RenameObjectBody):
         raise HTTPException(status_code=400, detail="New name is the same as current")
 
     try:
-        # old exists
         try:
-            client.stat_object(BUCKET, old_key)
+            client.stat_object(bucket, old_key)
         except S3Error:
             raise HTTPException(status_code=404, detail="Object not found")
 
-        # new not exists
         try:
-            client.stat_object(BUCKET, new_key)
+            client.stat_object(bucket, new_key)
             raise HTTPException(status_code=409, detail="Target already exists")
         except S3Error:
             pass
 
-        client.copy_object(BUCKET, new_key, CopySource(BUCKET, old_key))
-        client.remove_object(BUCKET, old_key)
+        client.copy_object(bucket, new_key, CopySource(bucket, old_key))
+        client.remove_object(bucket, old_key)
 
         return {
             "status": "renamed",
-            "bucket": BUCKET,
-            "old_object_key": old_key,
-            "new_object_key": new_key,
-            "url": public_url(new_key),
+            "bucket": bucket,
+            "old_object_key": _to_virtual(default_bucket, bucket, old_key),
+            "new_object_key": _to_virtual(default_bucket, bucket, new_key),
+            "url": _public_url(public_base, bucket, new_key),
         }
 
     except HTTPException:
         raise
     except S3Error as e:
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
-    
-# =================== END PUT =================== #
 
-# =================== START POST =================== 
-# =================== Tạo Folder mới =================== #
+
+# =================== POST =================== #
+
 @router.post("/folders", summary="Tạo folder")
 def create_folder(body: CreateFolderBody):
-    client = get_minio_client()
-    full_path = clean_path(body.full_path)
+    client, default_bucket, _ = _runtime()
 
-    if not full_path:
-        raise HTTPException(status_code=400, detail="full_path is required")
+    bucket, rel = _split_virtual(body.full_path, default_bucket, allow_empty_key=False)
+    full_path = clean_path(rel)
 
     marker = folder_marker(full_path)
 
     try:
-        # nếu đã có object/prefix rồi => coi như đã tồn tại
-        if prefix_has_anything(client, marker):
+        if prefix_has_anything(client, bucket, marker):
             raise HTTPException(status_code=409, detail="Folder already exists")
 
-        # tạo folder marker (object rỗng)
         client.put_object(
-            BUCKET,
+            bucket,
             marker,
             data=io.BytesIO(b""),
             length=0,
@@ -293,24 +362,29 @@ def create_folder(body: CreateFolderBody):
 
         return {
             "status": "created",
-            "bucket": BUCKET,
-            "folder": {"fullPath": full_path, "marker": marker},
+            "bucket": bucket,
+            "folder": {
+                "fullPath": _to_virtual(default_bucket, bucket, full_path),
+                "marker": marker
+            },
         }
 
     except HTTPException:
         raise
     except S3Error as e:
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
-    
-# =================== Upload File vào Folder =================== #
+
+
 @router.post("/files/", summary="Upload nhiều file vào folder path")
 async def upload_files_to_path(
     path: str = Form(..., description="Ví dụ: images hoặc documents/class-10/tin-hoc/chunk"),
     files: List[UploadFile] = File(...),
 ):
-    client = get_minio_client()
-    p = clean_path(path)
-    prefix = folder_marker(p)  # p/ nếu p có
+    client, default_bucket, public_base = _runtime()
+
+    bucket, rel = _split_virtual(path, default_bucket, allow_empty_key=True)
+    p = clean_path(rel)
+    prefix = folder_marker(p)
 
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
@@ -333,10 +407,9 @@ async def upload_files_to_path(
                 continue
             seen.add(object_key)
 
-            # check exists
             try:
-                client.stat_object(BUCKET, object_key)
-                failed.append({"filename": filename, "object_key": object_key, "error": "Already exists"})
+                client.stat_object(bucket, object_key)
+                failed.append({"filename": filename, "object_key": _to_virtual(default_bucket, bucket, object_key), "error": "Already exists"})
                 await f.close()
                 continue
             except S3Error:
@@ -344,7 +417,7 @@ async def upload_files_to_path(
 
             try:
                 result = client.put_object(
-                    bucket_name=BUCKET,
+                    bucket_name=bucket,
                     object_name=object_key,
                     data=f.file,
                     length=-1,
@@ -353,18 +426,18 @@ async def upload_files_to_path(
                 )
                 uploaded.append({
                     "filename": filename,
-                    "object_key": object_key,
+                    "object_key": _to_virtual(default_bucket, bucket, object_key),
                     "etag": getattr(result, "etag", None),
-                    "url": public_url(object_key),
+                    "url": _public_url(public_base, bucket, object_key),
                 })
             except S3Error as e:
-                failed.append({"filename": filename, "object_key": object_key, "error": str(e)})
+                failed.append({"filename": filename, "object_key": _to_virtual(default_bucket, bucket, object_key), "error": str(e)})
             finally:
                 await f.close()
 
         return {
-            "bucket": BUCKET,
-            "path": p,
+            "bucket": bucket,
+            "path": _to_virtual(default_bucket, bucket, p) if p else (bucket if not default_bucket else ""),
             "uploaded_count": len(uploaded),
             "failed_count": len(failed),
             "uploaded": uploaded,
@@ -373,9 +446,8 @@ async def upload_files_to_path(
 
     except S3Error as e:
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
-    
 
-# =================== Insert  =================== #
+
 @router.post("/objects/", summary="Insert 1 item (có thể có file hoặc không)")
 async def insert_item(
     path: str = Form(...),
@@ -383,34 +455,31 @@ async def insert_item(
     meta_json: str = Form("", description="JSON string metadata (tuỳ chọn)"),
     file: UploadFile | None = File(None),
 ):
-    client = get_minio_client()
-    p = clean_path(path)
+    client, default_bucket, public_base = _runtime()
+
+    bucket, rel = _split_virtual(path, default_bucket, allow_empty_key=True)
+    p = clean_path(rel)
     prefix = folder_marker(p)
 
-    filename = ""
     if file and file.filename:
         filename = os.path.basename(file.filename)
     else:
-        filename = (name or "").strip()
-        if not filename:
-            filename = f"item-{int(time.time())}.txt"
+        filename = (name or "").strip() or f"item-{int(time.time())}.txt"
         if "/" in filename or "\\" in filename:
             raise HTTPException(status_code=400, detail="name must not contain '/' or '\\'")
 
     object_key = prefix + filename
 
-    # nếu tồn tại => 409
     try:
-        client.stat_object(BUCKET, object_key)
+        client.stat_object(bucket, object_key)
         raise HTTPException(status_code=409, detail="Object already exists")
     except S3Error:
         pass
 
     try:
         if file:
-            # upload content thật
             client.put_object(
-                BUCKET,
+                bucket,
                 object_key,
                 data=file.file,
                 length=-1,
@@ -419,9 +488,8 @@ async def insert_item(
             )
             await file.close()
         else:
-            # tạo object rỗng
             client.put_object(
-                BUCKET,
+                bucket,
                 object_key,
                 data=io.BytesIO(b""),
                 length=0,
@@ -430,10 +498,10 @@ async def insert_item(
 
         return {
             "status": "inserted",
-            "bucket": BUCKET,
-            "path": p,
-            "object_key": object_key,
-            "url": public_url(object_key),
+            "bucket": bucket,
+            "path": _to_virtual(default_bucket, bucket, p) if p else (bucket if not default_bucket else ""),
+            "object_key": _to_virtual(default_bucket, bucket, object_key),
+            "url": _public_url(public_base, bucket, object_key),
             "meta_json": meta_json or "",
         }
 
@@ -441,36 +509,34 @@ async def insert_item(
         raise
     except S3Error as e:
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
-    
-# =================== END PUT =================== #
 
-# =================== START DELETE =================== #
-# =================== Xoá Folder =================== #
+
+# =================== DELETE =================== #
+
 @router.delete("/folders", summary="Xoá folder (cascade)")
 def delete_folder(path: str = Query(..., min_length=1, description="full path folder, ví dụ documents/class-10")):
-    client = get_minio_client()
-    p = clean_path(path)
+    client, default_bucket, _ = _runtime()
+
+    bucket, rel = _split_virtual(path, default_bucket, allow_empty_key=False)
+    p = clean_path(rel)
     prefix = folder_marker(p)
 
     try:
-        if not prefix_has_anything(client, prefix):
+        if not prefix_has_anything(client, bucket, prefix):
             raise HTTPException(status_code=404, detail="Folder not found")
 
-        # lấy tất cả object dưới prefix
-        objects = client.list_objects(BUCKET, prefix=prefix, recursive=True)
+        objects = client.list_objects(bucket, prefix=prefix, recursive=True)
         to_delete = [DeleteObject(obj.object_name) for obj in objects]
+        to_delete.append(DeleteObject(prefix))  # marker
 
-        # xoá marker nếu có
-        to_delete.append(DeleteObject(prefix))
-
-        errors = list(client.remove_objects(BUCKET, to_delete))
+        errors = list(client.remove_objects(bucket, to_delete))
         if errors:
             raise HTTPException(status_code=500, detail=f"Delete errors: {[str(e) for e in errors]}")
 
         return {
             "status": "deleted",
-            "bucket": BUCKET,
-            "path": p,
+            "bucket": bucket,
+            "path": _to_virtual(default_bucket, bucket, p),
         }
 
     except HTTPException:
@@ -478,29 +544,29 @@ def delete_folder(path: str = Query(..., min_length=1, description="full path fo
     except S3Error as e:
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
 
-# =================== Xoá File =================== #
+
 @router.delete("/files", summary="Xoá 1 file")
 def delete_object(object_key: str = Query(..., min_length=1)):
-    client = get_minio_client()
-    key = clean_path(object_key)
+    client, default_bucket, _ = _runtime()
+
+    bucket, key = _split_virtual(object_key, default_bucket, allow_empty_key=False)
+    key = clean_path(key)
 
     try:
         try:
-            client.stat_object(BUCKET, key)
+            client.stat_object(bucket, key)
         except S3Error:
             raise HTTPException(status_code=404, detail="Object not found")
 
-        client.remove_object(BUCKET, key)
+        client.remove_object(bucket, key)
 
         return {
             "status": "deleted",
-            "bucket": BUCKET,
-            "object_key": key,
+            "bucket": bucket,
+            "object_key": _to_virtual(default_bucket, bucket, key),
         }
 
     except HTTPException:
         raise
     except S3Error as e:
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
-    
-# =================== END DELETE =================== #
