@@ -8,20 +8,21 @@ import * as mongoApi from "../../services/mongoAdminApi";
 /** ===== Helpers ===== */
 function docTitle(doc = {}) {
   return (
-    doc.class_name ||
-    doc.subject_name ||
-    doc.topic_name ||
-    doc.lesson_name ||
-    doc.chunk_name ||
-    doc.keyword_name ||
-    doc.image_name ||
-    doc.video_name ||
-    doc.table_name ||
+    doc.className || doc.class_name ||
+    doc.subjectName || doc.subject_name ||
+    doc.topicName || doc.topic_name ||
+    doc.lessonName || doc.lesson_name ||
+    doc.chunkName || doc.chunk_name ||
+    doc.keywordName || doc.keyword_name ||
+    doc.imageName || doc.image_name ||
+    doc.videoName || doc.video_name ||
+    doc.tableName || doc.table_name ||
     doc.username ||
     doc.name ||
     ""
   );
 }
+
 
 // parse value để bạn nhập [] / {} là thành array/object thật
 function parseValue(v) {
@@ -464,12 +465,17 @@ export default function MongoDB() {
       const title = docTitle(d);
 
       const displayMinio =
+        d.chunkUrl ||
+        d.lessonUrl ||
+        d.topicUrl ||
+        d.subjectUrl ||
         minio.url ||
         (minio.bucket && minio.object_key ? `${minio.bucket}/${minio.object_key}` : "") ||
         (minio.bucket && minio.prefix ? `${minio.bucket}/${minio.prefix}` : "") ||
         minio.object_key ||
         minio.prefix ||
         "";
+
 
       return {
         ...d,

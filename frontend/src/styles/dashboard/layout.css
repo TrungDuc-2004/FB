@@ -277,8 +277,12 @@
 }
 
 .dash-content {
-  padding: calc(var(--topbar-h) + 18px) 18px 18px;
+  margin-top: var(--topbar-h);
+  height: calc(100vh - var(--topbar-h));
+  overflow: auto;
+  padding: 18px;
 }
+
 
 @media (max-width: 900px) {
   :root {

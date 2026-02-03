@@ -1,16 +1,22 @@
 import os
 import io
 import time
-from urllib.parse import quote
-from typing import List, Optional, Tuple, Set
+import json
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query
+from urllib.parse import quote
+from typing import List, Optional, Tuple, Set, Dict, Any
+from datetime import timedelta
+from fastapi.responses import StreamingResponse
+from urllib.parse import quote_plus
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, Request
+from flask import request
 from minio.error import S3Error
 from pydantic import BaseModel, Field
 from minio.commonconfig import CopySource
 from minio.deleteobjects import DeleteObject
 
 from ..services.minio_client import get_minio_client
+from ..services.mongo_sync import sync_minio_object_to_mongo
 
 
 router = APIRouter(
@@ -35,7 +41,31 @@ def clean_path(path: str) -> str:
 def folder_marker(rel_path: str) -> str:
     p = clean_path(rel_path)
     return f"{p}/" if p else ""
+def _api_base(request: Request) -> str:
+    return str(request.base_url).rstrip("/")
 
+
+def _backend_open_url(request: Request, object_key_virtual: str) -> str:
+    # object_key_virtual là đường dẫn kiểu UI dùng (single-bucket: key, multi-bucket: bucket/key)
+    return f"{_api_base(request)}/admin/minio/open?object_key={quote_plus(object_key_virtual)}"
+
+
+def _stream_minio_object(resp, chunk_size: int = 1024 * 1024):
+    try:
+        while True:
+            data = resp.read(chunk_size)
+            if not data:
+                break
+            yield data
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+        try:
+            resp.release_conn()
+        except Exception:
+            pass
 
 def _runtime():
     """
@@ -102,9 +132,14 @@ def _to_virtual(default_bucket: Optional[str], bucket: str, key: str) -> str:
     return f"{bucket}/{k}" if k else bucket
 
 
-def _public_url(public_base: str, bucket: str, object_key: str) -> str:
-    encoded = quote(object_key, safe="/")
-    return f"{public_base}/{bucket}/{encoded}"
+def _public_url(client, public_base: str, bucket: str, object_key: str) -> str:
+    # Prefer presigned URL để bấm là mở được, không phụ thuộc public_base
+    try:
+        return client.presigned_get_object(bucket, object_key, expires=timedelta(hours=24))
+    except Exception:
+        encoded = quote(object_key, safe="/")
+        return f"{public_base}/{bucket}/{encoded}"
+
 
 
 def prefix_has_anything(client, bucket: str, prefix: str) -> bool:
@@ -112,6 +147,27 @@ def prefix_has_anything(client, bucket: str, prefix: str) -> bool:
     for _ in it:
         return True
     return False
+
+
+def _get_actor(request: Request | None) -> str:
+    """Lấy người thao tác từ header (frontend sẽ gửi x-user)."""
+    if request is None:
+        return "system"
+    return request.headers.get("x-user") or request.headers.get("x-actor") or "system"
+
+
+def _parse_meta_json(meta_json: str) -> Dict[str, Any]:
+    if not meta_json:
+        return {}
+    try:
+        obj = json.loads(meta_json)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid meta_json (must be JSON): {e}") from e
+    if obj is None:
+        return {}
+    if not isinstance(obj, dict):
+        raise HTTPException(status_code=422, detail="meta_json must be a JSON object")
+    return obj
 
 
 # =================== Models =================== #
@@ -132,11 +188,14 @@ class RenameObjectBody(BaseModel):
 
 # =================== GET =================== #
 
-@router.get("/list", summary="Lấy ra cấu trúc list trong MinIO")
-def list_structure(path: str = Query("", description="Mẫu: documents, documents/class-10, ...")):
-    client, default_bucket, public_base = _runtime()
+@router.get("/list", summary="Lấy ra cấu trúc list trong MinIO (url mở được ngay qua backend)")
+def list_structure(
+    request: Request,
+    path: str = Query("", description="VD: documents | documents/lop-10 | (multi-bucket) bucketA/folder ..."),
+):
+    client, default_bucket, _public_base = _runtime()
 
-    # Nếu multi-bucket và path rỗng -> trả danh sách buckets (giúp UI vào root vẫn thấy)
+    # MULTI-BUCKET MODE: path rỗng -> list buckets
     if not default_bucket and not clean_path(path):
         try:
             buckets = client.list_buckets()
@@ -153,11 +212,13 @@ def list_structure(path: str = Query("", description="Mẫu: documents, document
         except S3Error as e:
             raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
 
+    # Resolve virtual path -> (bucket, key)
     bucket, key = _split_virtual(path, default_bucket, allow_empty_key=True)
-    prefix = folder_marker(key)  # key/ hoặc ""
+    key = clean_path(key)
+    prefix = folder_marker(key)  # "" hoặc "a/b/"
 
     try:
-        # recursive=False => chỉ lấy con trực tiếp
+        # recursive=False: chỉ lấy cấp con trực tiếp
         objects = client.list_objects(bucket, prefix=prefix, recursive=False)
 
         folder_names: Set[str] = set()
@@ -167,6 +228,7 @@ def list_structure(path: str = Query("", description="Mẫu: documents, document
         for obj in objects:
             name = obj.object_name
 
+            # bỏ marker của chính folder hiện tại
             if prefix and name == prefix:
                 continue
 
@@ -174,28 +236,36 @@ def list_structure(path: str = Query("", description="Mẫu: documents, document
             if not rest:
                 continue
 
-            # thư mục (marker) hoặc có "/" => folder con
+            # Nếu là folder (dir marker) hoặc có '/' => folder con
             if getattr(obj, "is_dir", False) or rest.endswith("/") or "/" in rest:
                 folder = rest.strip("/").split("/", 1)[0]
                 if folder:
                     folder_names.add(folder)
                 continue
 
-            # file
+            # File
             object_key = name
             file_name = rest.split("/")[-1]
+
+            virtual_key = _to_virtual(default_bucket, bucket, object_key)
+
             files.append({
-                "object_key": _to_virtual(default_bucket, bucket, object_key),
+                "object_key": virtual_key,
                 "name": file_name,
-                "size": obj.size,
-                "etag": obj.etag,
-                "last_modified": obj.last_modified.isoformat() if obj.last_modified else None,
-                "url": _public_url(public_base, bucket, object_key),
+                "size": getattr(obj, "size", None),
+                "etag": getattr(obj, "etag", None),
+                "last_modified": obj.last_modified.isoformat() if getattr(obj, "last_modified", None) else None,
+                # URL mở được ngay: backend proxy
+                "url": _backend_open_url(request, virtual_key),
             })
 
+        # folders
         for folder in sorted(folder_names, key=lambda x: x.lower()):
-            inner_full = f"{clean_path(key)}/{folder}" if clean_path(key) else folder
-            folders.append({"name": folder, "fullPath": _to_virtual(default_bucket, bucket, inner_full)})
+            inner_full = f"{key}/{folder}" if key else folder
+            folders.append({
+                "name": folder,
+                "fullPath": _to_virtual(default_bucket, bucket, inner_full),
+            })
 
         files.sort(key=lambda x: x["name"].lower())
 
@@ -210,7 +280,6 @@ def list_structure(path: str = Query("", description="Mẫu: documents, document
 
     except S3Error as e:
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
-
 
 # =================== PUT =================== #
 
@@ -328,7 +397,7 @@ def rename_object(body: RenameObjectBody):
             "bucket": bucket,
             "old_object_key": _to_virtual(default_bucket, bucket, old_key),
             "new_object_key": _to_virtual(default_bucket, bucket, new_key),
-            "url": _public_url(public_base, bucket, new_key),
+            "url": _backend_open_url(request, _to_virtual(default_bucket, bucket, new_key)),
         }
 
     except HTTPException:
@@ -375,12 +444,14 @@ def create_folder(body: CreateFolderBody):
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
 
 
-@router.post("/files/", summary="Upload nhiều file vào folder path")
+@router.post("/files/", summary="Upload nhiều file vào folder path (upload xong -> sync Mongo)")
 async def upload_files_to_path(
+    request: Request,
     path: str = Form(..., description="Ví dụ: images hoặc documents/class-10/tin-hoc/chunk"),
     files: List[UploadFile] = File(...),
 ):
     client, default_bucket, public_base = _runtime()
+    actor = _get_actor(request)
 
     bucket, rel = _split_virtual(path, default_bucket, allow_empty_key=True)
     p = clean_path(rel)
@@ -407,6 +478,7 @@ async def upload_files_to_path(
                 continue
             seen.add(object_key)
 
+            # check exists
             try:
                 client.stat_object(bucket, object_key)
                 failed.append({"filename": filename, "object_key": _to_virtual(default_bucket, bucket, object_key), "error": "Already exists"})
@@ -416,6 +488,7 @@ async def upload_files_to_path(
                 pass
 
             try:
+                # upload minio
                 result = client.put_object(
                     bucket_name=bucket,
                     object_name=object_key,
@@ -424,14 +497,38 @@ async def upload_files_to_path(
                     part_size=10 * 1024 * 1024,
                     content_type=f.content_type or "application/octet-stream",
                 )
+
+                # ====== SYNC MongoDB (fallback theo path + filename) ======
+                try:
+                    sync_minio_object_to_mongo(
+                        bucket=bucket,
+                        object_key=object_key,
+                        meta={},
+                        actor=actor,
+                    )
+                except Exception as e:
+                    # rollback minio object để tránh lệch
+                    try:
+                        client.remove_object(bucket, object_key)
+                    except Exception:
+                        pass
+                    failed.append({
+                        "filename": filename,
+                        "object_key": _to_virtual(default_bucket, bucket, object_key),
+                        "error": f"Mongo sync failed: {e}",
+                    })
+                    continue
+
                 uploaded.append({
                     "filename": filename,
                     "object_key": _to_virtual(default_bucket, bucket, object_key),
                     "etag": getattr(result, "etag", None),
-                    "url": _public_url(public_base, bucket, object_key),
+                    "url": _backend_open_url(request, _to_virtual(default_bucket, bucket, object_key)),
                 })
+
             except S3Error as e:
                 failed.append({"filename": filename, "object_key": _to_virtual(default_bucket, bucket, object_key), "error": str(e)})
+
             finally:
                 await f.close()
 
@@ -448,14 +545,17 @@ async def upload_files_to_path(
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
 
 
-@router.post("/objects/", summary="Insert 1 item (có thể có file hoặc không)")
+@router.post("/objects/", summary="Insert 1 item (có thể có file hoặc không) - insert xong -> sync Mongo")
 async def insert_item(
+    request: Request,
     path: str = Form(...),
     name: str = Form("", description="Tên file nếu không upload file"),
     meta_json: str = Form("", description="JSON string metadata (tuỳ chọn)"),
     file: UploadFile | None = File(None),
 ):
     client, default_bucket, public_base = _runtime()
+    actor = _get_actor(request)
+    meta = _parse_meta_json(meta_json)
 
     bucket, rel = _split_virtual(path, default_bucket, allow_empty_key=True)
     p = clean_path(rel)
@@ -470,6 +570,7 @@ async def insert_item(
 
     object_key = prefix + filename
 
+    # check exists
     try:
         client.stat_object(bucket, object_key)
         raise HTTPException(status_code=409, detail="Object already exists")
@@ -477,6 +578,7 @@ async def insert_item(
         pass
 
     try:
+        # upload minio
         if file:
             client.put_object(
                 bucket,
@@ -496,13 +598,36 @@ async def insert_item(
                 content_type="text/plain",
             )
 
+        # sync mongo
+        try:
+            sync_res = sync_minio_object_to_mongo(
+                bucket=bucket,
+                object_key=object_key,
+                meta=meta,
+                actor=actor,
+            )
+        except Exception as e:
+            # rollback minio object để tránh lệch
+            try:
+                client.remove_object(bucket, object_key)
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail=f"Mongo sync failed: {e}") from e
+
         return {
             "status": "inserted",
             "bucket": bucket,
             "path": _to_virtual(default_bucket, bucket, p) if p else (bucket if not default_bucket else ""),
             "object_key": _to_virtual(default_bucket, bucket, object_key),
-            "url": _public_url(public_base, bucket, object_key),
+            "url": _backend_open_url(request, _to_virtual(default_bucket, bucket, object_key)),
             "meta_json": meta_json or "",
+            "mongo": {
+                "classId": str(sync_res.class_id),
+                "subjectId": str(sync_res.subject_id),
+                "topicId": str(sync_res.topic_id),
+                "lessonId": str(sync_res.lesson_id),
+                "chunkId": str(sync_res.chunk_id),
+            }
         }
 
     except HTTPException:
@@ -570,3 +695,4 @@ def delete_object(object_key: str = Query(..., min_length=1)):
         raise
     except S3Error as e:
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
+

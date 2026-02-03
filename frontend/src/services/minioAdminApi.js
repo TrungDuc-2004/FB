@@ -1,13 +1,25 @@
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 
+function getActor() {
+  // tuỳ project bạn lưu username ở đâu thì lấy ở đó
+  // fallback để khỏi undefined
+  return (
+    localStorage.getItem("username") ||
+    localStorage.getItem("userName") ||
+    "admin"
+  );
+}
+
 async function httpJson(url, options = {}) {
   const res = await fetch(url, {
     ...options,
     headers: {
       ...(options.headers || {}),
       "Content-Type": "application/json",
+      "x-user": getActor(),
     },
   });
+
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -47,7 +59,12 @@ export async function uploadFiles(path, files) {
   const res = await fetch(`${API_BASE}/admin/minio/files/`, {
     method: "POST",
     body: fd,
+    headers: {
+      // KHÔNG set Content-Type khi dùng FormData
+      "x-user": getActor(),
+    },
   });
+
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -62,7 +79,11 @@ export async function insertItem(path, meta, file) {
   const res = await fetch(`${API_BASE}/admin/minio/objects/`, {
     method: "POST",
     body: fd,
+    headers: {
+      "x-user": getActor(),
+    },
   });
+
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
