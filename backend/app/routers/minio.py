@@ -3,20 +3,22 @@ import io
 import time
 import json
 
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus
 from typing import List, Optional, Tuple, Set, Dict, Any
 from datetime import timedelta
-from fastapi.responses import StreamingResponse
-from urllib.parse import quote_plus
+
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, Request
-from flask import request
+from fastapi.responses import StreamingResponse
+
 from minio.error import S3Error
 from pydantic import BaseModel, Field
 from minio.commonconfig import CopySource
 from minio.deleteobjects import DeleteObject
 
 from ..services.minio_client import get_minio_client
+from ..services.mongo_client import get_mongo_client
 from ..services.mongo_sync import sync_minio_object_to_mongo
+from ..services.postgre_sync_from_mongo import sync_postgre_from_mongo_ids
 
 
 router = APIRouter(
@@ -41,6 +43,8 @@ def clean_path(path: str) -> str:
 def folder_marker(rel_path: str) -> str:
     p = clean_path(rel_path)
     return f"{p}/" if p else ""
+
+
 def _api_base(request: Request) -> str:
     return str(request.base_url).rstrip("/")
 
@@ -66,6 +70,7 @@ def _stream_minio_object(resp, chunk_size: int = 1024 * 1024):
             resp.release_conn()
         except Exception:
             pass
+
 
 def _runtime():
     """
@@ -100,7 +105,6 @@ def _split_virtual(virtual: str, default_bucket: Optional[str], *, allow_empty_k
 
     # multi-bucket mode
     if not p:
-        # dùng cho /list root: sẽ xử lý riêng (list buckets)
         if allow_empty_key:
             return "", ""
         raise HTTPException(
@@ -141,7 +145,6 @@ def _public_url(client, public_base: str, bucket: str, object_key: str) -> str:
         return f"{public_base}/{bucket}/{encoded}"
 
 
-
 def prefix_has_anything(client, bucket: str, prefix: str) -> bool:
     it = client.list_objects(bucket, prefix=prefix, recursive=True)
     for _ in it:
@@ -170,6 +173,20 @@ def _parse_meta_json(meta_json: str) -> Dict[str, Any]:
     return obj
 
 
+def _hide_mongo_chunk(chunk_id: str, actor: str = "system") -> None:
+    """Nếu Postgres sync fail sau khi Mongo đã upsert, ẩn chunk để tránh hiển thị rác."""
+    try:
+        mg = get_mongo_client()
+        db = mg["db"]
+        from bson import ObjectId
+        db["chunks"].update_one(
+            {"_id": ObjectId(chunk_id)},
+            {"$set": {"status": "hidden", "updatedAt": time.time(), "updatedBy": actor}},
+        )
+    except Exception:
+        pass
+
+
 # =================== Models =================== #
 
 class CreateFolderBody(BaseModel):
@@ -187,6 +204,36 @@ class RenameObjectBody(BaseModel):
 
 
 # =================== GET =================== #
+
+@router.get("/open", summary="Mở/Download file (proxy qua backend - copy URL mở được ngay)")
+def open_file(
+    request: Request,
+    object_key: str = Query(..., min_length=1, description="virtual object_key (single-bucket: key; multi-bucket: bucket/key)"),
+    download: bool = Query(False, description="true = download, false = open inline"),
+):
+    client, default_bucket, _public_base = _runtime()
+
+    bucket, key = _split_virtual(object_key, default_bucket, allow_empty_key=False)
+    key = clean_path(key)
+
+    try:
+        stat = client.stat_object(bucket, key)
+    except S3Error:
+        raise HTTPException(status_code=404, detail="Object not found")
+
+    filename = os.path.basename(key) or "file"
+
+    try:
+        resp = client.get_object(bucket, key)
+    except S3Error as e:
+        raise HTTPException(status_code=500, detail=f"MinIO get_object error: {e}") from e
+
+    dispo = "attachment" if download else "inline"
+    headers = {"Content-Disposition": f'{dispo}; filename="{filename}"'}
+
+    media_type = getattr(stat, "content_type", None) or "application/octet-stream"
+    return StreamingResponse(_stream_minio_object(resp), media_type=media_type, headers=headers)
+
 
 @router.get("/list", summary="Lấy ra cấu trúc list trong MinIO (url mở được ngay qua backend)")
 def list_structure(
@@ -212,13 +259,11 @@ def list_structure(
         except S3Error as e:
             raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
 
-    # Resolve virtual path -> (bucket, key)
     bucket, key = _split_virtual(path, default_bucket, allow_empty_key=True)
     key = clean_path(key)
-    prefix = folder_marker(key)  # "" hoặc "a/b/"
+    prefix = folder_marker(key)
 
     try:
-        # recursive=False: chỉ lấy cấp con trực tiếp
         objects = client.list_objects(bucket, prefix=prefix, recursive=False)
 
         folder_names: Set[str] = set()
@@ -228,7 +273,6 @@ def list_structure(
         for obj in objects:
             name = obj.object_name
 
-            # bỏ marker của chính folder hiện tại
             if prefix and name == prefix:
                 continue
 
@@ -236,14 +280,12 @@ def list_structure(
             if not rest:
                 continue
 
-            # Nếu là folder (dir marker) hoặc có '/' => folder con
             if getattr(obj, "is_dir", False) or rest.endswith("/") or "/" in rest:
                 folder = rest.strip("/").split("/", 1)[0]
                 if folder:
                     folder_names.add(folder)
                 continue
 
-            # File
             object_key = name
             file_name = rest.split("/")[-1]
 
@@ -255,11 +297,9 @@ def list_structure(
                 "size": getattr(obj, "size", None),
                 "etag": getattr(obj, "etag", None),
                 "last_modified": obj.last_modified.isoformat() if getattr(obj, "last_modified", None) else None,
-                # URL mở được ngay: backend proxy
                 "url": _backend_open_url(request, virtual_key),
             })
 
-        # folders
         for folder in sorted(folder_names, key=lambda x: x.lower()):
             inner_full = f"{key}/{folder}" if key else folder
             folders.append({
@@ -280,6 +320,7 @@ def list_structure(
 
     except S3Error as e:
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
+
 
 # =================== PUT =================== #
 
@@ -331,7 +372,6 @@ def rename_folder(body: RenameFolderBody):
             to_delete.append(DeleteObject(old_key))
             copied += 1
 
-        # copy marker nếu có
         try:
             client.stat_object(bucket, old_prefix)
             client.copy_object(bucket, new_prefix, CopySource(bucket, old_prefix))
@@ -359,7 +399,7 @@ def rename_folder(body: RenameFolderBody):
 
 
 @router.put("/objects/", summary="Đổi tên file")
-def rename_object(body: RenameObjectBody):
+def rename_object(request: Request, body: RenameObjectBody):
     client, default_bucket, public_base = _runtime()
 
     bucket, old_key = _split_virtual(body.object_key, default_bucket, allow_empty_key=False)
@@ -444,7 +484,7 @@ def create_folder(body: CreateFolderBody):
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
 
 
-@router.post("/files/", summary="Upload nhiều file vào folder path (upload xong -> sync Mongo)")
+@router.post("/files/", summary="Upload nhiều file vào folder path (upload xong -> sync Mongo -> sync Postgre)")
 async def upload_files_to_path(
     request: Request,
     path: str = Form(..., description="Ví dụ: images hoặc documents/class-10/tin-hoc/chunk"),
@@ -481,7 +521,11 @@ async def upload_files_to_path(
             # check exists
             try:
                 client.stat_object(bucket, object_key)
-                failed.append({"filename": filename, "object_key": _to_virtual(default_bucket, bucket, object_key), "error": "Already exists"})
+                failed.append({
+                    "filename": filename,
+                    "object_key": _to_virtual(default_bucket, bucket, object_key),
+                    "error": "Already exists"
+                })
                 await f.close()
                 continue
             except S3Error:
@@ -498,16 +542,15 @@ async def upload_files_to_path(
                     content_type=f.content_type or "application/octet-stream",
                 )
 
-                # ====== SYNC MongoDB (fallback theo path + filename) ======
+                # ====== SYNC MongoDB ======
                 try:
-                    sync_minio_object_to_mongo(
+                    sync_res = sync_minio_object_to_mongo(
                         bucket=bucket,
                         object_key=object_key,
                         meta={},
                         actor=actor,
                     )
                 except Exception as e:
-                    # rollback minio object để tránh lệch
                     try:
                         client.remove_object(bucket, object_key)
                     except Exception:
@@ -519,6 +562,30 @@ async def upload_files_to_path(
                     })
                     continue
 
+                # ====== SYNC Postgre FROM Mongo ======
+                try:
+                    sync_postgre_from_mongo_ids(
+                        mongo_class_id=str(sync_res.class_id),
+                        mongo_subject_id=str(sync_res.subject_id),
+                        mongo_topic_id=str(sync_res.topic_id),
+                        mongo_lesson_id=str(sync_res.lesson_id),
+                        mongo_chunk_id=str(sync_res.chunk_id),
+                    )
+                except Exception as e:
+                    # rollback file + ẩn chunk mongo
+                    try:
+                        client.remove_object(bucket, object_key)
+                    except Exception:
+                        pass
+                    _hide_mongo_chunk(str(sync_res.chunk_id), actor=actor)
+
+                    failed.append({
+                        "filename": filename,
+                        "object_key": _to_virtual(default_bucket, bucket, object_key),
+                        "error": f"Postgre sync failed: {e}",
+                    })
+                    continue
+
                 uploaded.append({
                     "filename": filename,
                     "object_key": _to_virtual(default_bucket, bucket, object_key),
@@ -527,7 +594,11 @@ async def upload_files_to_path(
                 })
 
             except S3Error as e:
-                failed.append({"filename": filename, "object_key": _to_virtual(default_bucket, bucket, object_key), "error": str(e)})
+                failed.append({
+                    "filename": filename,
+                    "object_key": _to_virtual(default_bucket, bucket, object_key),
+                    "error": str(e)
+                })
 
             finally:
                 await f.close()
@@ -545,7 +616,7 @@ async def upload_files_to_path(
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
 
 
-@router.post("/objects/", summary="Insert 1 item (có thể có file hoặc không) - insert xong -> sync Mongo")
+@router.post("/objects/", summary="Insert 1 item (có thể có file hoặc không) - insert xong -> sync Mongo -> sync Postgre")
 async def insert_item(
     request: Request,
     path: str = Form(...),
@@ -570,7 +641,6 @@ async def insert_item(
 
     object_key = prefix + filename
 
-    # check exists
     try:
         client.stat_object(bucket, object_key)
         raise HTTPException(status_code=409, detail="Object already exists")
@@ -607,12 +677,28 @@ async def insert_item(
                 actor=actor,
             )
         except Exception as e:
-            # rollback minio object để tránh lệch
             try:
                 client.remove_object(bucket, object_key)
             except Exception:
                 pass
             raise HTTPException(status_code=500, detail=f"Mongo sync failed: {e}") from e
+
+        # sync postgre from mongo
+        try:
+            pg_ids = sync_postgre_from_mongo_ids(
+                mongo_class_id=str(sync_res.class_id),
+                mongo_subject_id=str(sync_res.subject_id),
+                mongo_topic_id=str(sync_res.topic_id),
+                mongo_lesson_id=str(sync_res.lesson_id),
+                mongo_chunk_id=str(sync_res.chunk_id),
+            )
+        except Exception as e:
+            try:
+                client.remove_object(bucket, object_key)
+            except Exception:
+                pass
+            _hide_mongo_chunk(str(sync_res.chunk_id), actor=actor)
+            raise HTTPException(status_code=500, detail=f"Postgre sync failed: {e}") from e
 
         return {
             "status": "inserted",
@@ -627,6 +713,14 @@ async def insert_item(
                 "topicId": str(sync_res.topic_id),
                 "lessonId": str(sync_res.lesson_id),
                 "chunkId": str(sync_res.chunk_id),
+            },
+            "postgre": {
+                "classId": pg_ids.class_id,
+                "subjectId": pg_ids.subject_id,
+                "topicId": pg_ids.topic_id,
+                "lessonId": pg_ids.lesson_id,
+                "chunkId": pg_ids.chunk_id,
+                "keywordIds": pg_ids.keyword_ids,
             }
         }
 
@@ -652,7 +746,7 @@ def delete_folder(path: str = Query(..., min_length=1, description="full path fo
 
         objects = client.list_objects(bucket, prefix=prefix, recursive=True)
         to_delete = [DeleteObject(obj.object_name) for obj in objects]
-        to_delete.append(DeleteObject(prefix))  # marker
+        to_delete.append(DeleteObject(prefix))
 
         errors = list(client.remove_objects(bucket, to_delete))
         if errors:
@@ -695,4 +789,3 @@ def delete_object(object_key: str = Query(..., min_length=1)):
         raise
     except S3Error as e:
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
-

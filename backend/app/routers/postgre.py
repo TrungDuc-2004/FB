@@ -1,18 +1,32 @@
-# app/routers/admin_postgre.py
+"""PostgreSQL admin (read-only) + login.
+
+Các endpoints chính:
+- POST /admin/postgre/login
+- GET  /admin/postgre/tables
+- GET  /admin/postgre/tables/{table}/columns
+- GET  /admin/postgre/tables/{table}/rows
+- GET  /admin/postgre/tables/{table}/rows/{pk}
+
+Theo DB hiện tại của bạn:
+- Bảng đăng nhập là **user** (singular)
+- Columns: user_id, username, password, user_role, is_active, mongo_id
+"""
+
 from __future__ import annotations
+
+from typing import Any, Dict, List, Tuple, Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel
 from sqlalchemy import inspect
 from sqlalchemy.orm import Session
-from typing import Any, Dict, List, Tuple, Annotated
-from pydantic import BaseModel
 
-from ..services.postgre_client import get_db
 from ..models import model_postgre as models
+from ..services.postgre_client import get_db
+
 
 router = APIRouter(prefix="/admin/postgre", tags=["PostgreSQL"])
-
 
 db_dependency = Annotated[Session, Depends(get_db)]
 
@@ -23,7 +37,7 @@ class LoginIn(BaseModel):
     password: str
 
 
-@router.post("/login", summary="Login by PostgreSQL user table")
+@router.post("/login", summary="Login by PostgreSQL table 'user'")
 def login(payload: LoginIn, db: db_dependency):
     u = (payload.username or "").strip()
     pw = (payload.password or "").strip()
@@ -32,17 +46,18 @@ def login(payload: LoginIn, db: db_dependency):
         raise HTTPException(status_code=422, detail="username/password is required")
 
     user = db.query(models.User).filter(models.User.username == u).first()
-    if not user or (user.password or "") != pw:
+    if not user or (getattr(user, "password", "") or "") != pw:
         raise HTTPException(status_code=401, detail="Tên đăng nhập hoặc mật khẩu không đúng")
 
-    # nếu DB có cột is_active thì chặn user disabled
+    # chặn user bị disable
     if hasattr(user, "is_active") and user.is_active is False:
         raise HTTPException(status_code=403, detail="Tài khoản đang bị vô hiệu hoá")
 
     return {
         "user_id": str(user.user_id),
         "username": str(user.username),
-        "role": str(user.user_role),
+        "role": str(getattr(user, "user_role", "user")),
+        "mongo_id": getattr(user, "mongo_id", None),
     }
 
 
@@ -53,7 +68,7 @@ TABLE_MODEL_MAP = {
     "topic": models.Topic,
     "lesson": models.Lesson,
     "chunk": models.Chunk,
-    "keyword": models.Keyword,  # PK ghép (chunk_id, keyword_name)
+    "keyword": models.Keyword,
     "user": models.User,
 }
 
@@ -85,6 +100,7 @@ def _parse_pk(model, pk: str) -> Tuple[str, ...]:
     pks = _pk_cols(model)
     if len(pks) == 1:
         return (pk,)
+
     parts = pk.split("::")
     if len(parts) != len(pks):
         raise HTTPException(
@@ -150,7 +166,7 @@ def list_rows(
 @router.get("/tables/{table_name}/rows/{pk}", summary="Get one row by PK (read-only)")
 def get_row(
     table_name: str = Path(...),
-    pk: str = Path(..., description="PK string. For keyword use chunk_id::keyword_name"),
+    pk: str = Path(..., description="PK string"),
     db: db_dependency = None,
 ):
     model = _get_model(table_name)

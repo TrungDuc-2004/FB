@@ -1,83 +1,91 @@
-# app/models/model_postgre.py
-from sqlalchemy import Column, ForeignKey, String, Integer, Boolean
-from sqlalchemy.schema import FetchedValue
+"""SQLAlchemy models for PostgreSQL.
+
+Chỉ map đúng các cột bạn đang dùng trong PostgreSQL.
+
+Ghi chú quan trọng:
+- Table đăng nhập là **user** (singular)
+- Columns (theo ảnh bạn gửi):
+  user_id, username, password, user_role, is_active, mongo_id
+"""
+
+from sqlalchemy import Boolean, Column, ForeignKey, String, Text
+from sqlalchemy.dialects.postgresql import UUID
+
 from ..services.postgre_client import Base
 
-# NOTE:
-# - Các id (class_id/subject_id/...) bạn sinh bằng trigger -> dùng server_default=FetchedValue()
-# - Keyword: PK ghép (chunk_id, keyword_name) -> KHÔNG có keyword_id
 
+# ===== 1) CLASS =====
 class Class(Base):
     __tablename__ = "class"
-    class_id = Column(String, primary_key=True, index=True, server_default=FetchedValue())
-    class_name = Column(String, nullable=False)
-    mongo_id = Column(String, unique=True, nullable=True)
-    __mapper_args__ = {"eager_defaults": True}
+    class_id = Column(String, primary_key=True)
+    class_name = Column(Text, nullable=False)
+    mongo_id = Column(String(24), unique=True, nullable=True)
 
 
+# ===== 2) SUBJECT =====
 class Subject(Base):
     __tablename__ = "subject"
-    subject_id = Column(String, primary_key=True, index=True, server_default=FetchedValue())
+    subject_id = Column(String, primary_key=True)
+    subject_name = Column(Text, nullable=False)
+    mongo_id = Column(String(24), unique=True, nullable=True)
+
     class_id = Column(String, ForeignKey("class.class_id", ondelete="CASCADE"), nullable=False)
 
-    subject_name = Column(String, nullable=False)
-    subject_type = Column(String, nullable=False)
-    mongo_id = Column(String, unique=True, nullable=True)
-    __mapper_args__ = {"eager_defaults": True}
 
-
+# ===== 3) TOPIC =====
 class Topic(Base):
     __tablename__ = "topic"
-    topic_id = Column(String, primary_key=True, index=True, server_default=FetchedValue())
+    topic_id = Column(String, primary_key=True)
+    topic_name = Column(Text, nullable=False)
+    mongo_id = Column(String(24), unique=True, nullable=True)
+
     subject_id = Column(String, ForeignKey("subject.subject_id", ondelete="CASCADE"), nullable=False)
 
-    topic_num = Column(Integer, nullable=False)  # DB là int
-    topic_name = Column(String, nullable=False)
-    mongo_id = Column(String, unique=True, nullable=True)
-    minio_url = Column(String, nullable=True)
-    __mapper_args__ = {"eager_defaults": True}
 
-
+# ===== 4) LESSON =====
 class Lesson(Base):
     __tablename__ = "lesson"
-    lesson_id = Column(String, primary_key=True, index=True, server_default=FetchedValue())
+    lesson_id = Column(String, primary_key=True)
+    lesson_name = Column(Text, nullable=False)
+    mongo_id = Column(String(24), unique=True, nullable=True)
+
     topic_id = Column(String, ForeignKey("topic.topic_id", ondelete="CASCADE"), nullable=False)
 
-    lesson_num = Column(Integer, nullable=False)  # DB là int
-    lesson_name = Column(String, nullable=False)
-    lesson_type = Column(String, nullable=True)
-    mongo_id = Column(String, unique=True, nullable=True)
-    minio_url = Column(String, nullable=True)
-    __mapper_args__ = {"eager_defaults": True}
 
-
+# ===== 5) CHUNK =====
 class Chunk(Base):
     __tablename__ = "chunk"
-    chunk_id = Column(String, primary_key=True, index=True, server_default=FetchedValue())
+    chunk_id = Column(String, primary_key=True)
+    chunk_name = Column(Text, nullable=False)
+    chunk_type = Column(String(32), nullable=True)
+    mongo_id = Column(String(24), unique=True, nullable=True)
+
     lesson_id = Column(String, ForeignKey("lesson.lesson_id", ondelete="CASCADE"), nullable=False)
 
-    chunk_label = Column(Integer, nullable=False)  # DB là int
-    chunk_name = Column(String, nullable=False)
-    mongo_id = Column(String, unique=True, nullable=True)
-    minio_url = Column(String, nullable=True)
-    __mapper_args__ = {"eager_defaults": True}
 
-
+# ===== 6) KEYWORD =====
 class Keyword(Base):
     __tablename__ = "keyword"
-    # PRIMARY KEY (chunk_id, keyword_name)
-    chunk_id = Column(String, ForeignKey("chunk.chunk_id", ondelete="CASCADE"), primary_key=True)
-    keyword_name = Column(String, primary_key=True)
-    mongo_id = Column(String, unique=True, nullable=True)
+    keyword_id = Column(String, primary_key=True)  # VARCHAR(96)
+    keyword_name = Column(Text, nullable=False)
+    mongo_id = Column(String(24), unique=True, nullable=True)
+
+    chunk_id = Column(String, ForeignKey("chunk.chunk_id", ondelete="CASCADE"), nullable=False)
 
 
+# ===== USER (login) =====
 class User(Base):
     __tablename__ = "user"
-    # user_id sinh bằng trigger/sequence -> server_default
-    user_id = Column(String, primary_key=True, index=True, server_default=FetchedValue())
-    username = Column(String, unique=True, nullable=False)
-    password = Column(String, nullable=False)
-    user_role = Column(String, nullable=False)   # DB bạn có CHECK admin/user
-    is_active = Column(Boolean, nullable=False, default=True)
-    mongo_id = Column(String, unique=True, nullable=True)
-    __mapper_args__ = {"eager_defaults": True}
+
+    # Nếu DB của bạn không phải UUID, đổi UUID -> String ở đây.
+    user_id = Column(String, primary_key=True)
+
+
+    username = Column(String(50), unique=True, nullable=False)
+    password = Column(Text, nullable=False)
+
+    # enum user_role trong DB: đọc ra string OK
+    user_role = Column(String, nullable=False)
+
+    is_active = Column(Boolean, nullable=False)
+    mongo_id = Column(String(24), nullable=True)
