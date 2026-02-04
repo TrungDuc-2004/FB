@@ -5,7 +5,7 @@ import json
 
 from urllib.parse import quote, quote_plus
 from typing import List, Optional, Tuple, Set, Dict, Any
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -18,9 +18,7 @@ from minio.deleteobjects import DeleteObject
 from ..services.minio_client import get_minio_client
 from ..services.mongo_client import get_mongo_client
 from ..services.mongo_sync import sync_minio_object_to_mongo
-from ..services.postgre_sync_from_mongo import sync_postgre_from_mongo_ids
-
-
+from ..services.postgre_sync_from_mongo import sync_postgre_from_mongo_ids, sync_postgre_from_mongo_maps
 router = APIRouter(
     prefix="/admin/minio",
     tags=["Minio"]
@@ -182,6 +180,20 @@ def _hide_mongo_chunk(chunk_id: str, actor: str = "system") -> None:
         db["chunks"].update_one(
             {"_id": ObjectId(chunk_id)},
             {"$set": {"status": "hidden", "updatedAt": time.time(), "updatedBy": actor}},
+        )
+    except Exception:
+        pass
+
+
+
+def _hide_mongo_chunk_by_map(chunk_map: str, actor: str = "system") -> None:
+    """Ẩn chunk theo chunk_map (chunkID) khi Postgre sync fail."""
+    try:
+        mg = get_mongo_client()
+        db = mg["db"]
+        db["chunks"].update_one(
+            {"chunkID": chunk_map},
+            {"$set": {"status": "hidden", "updatedAt": datetime.now(timezone.utc), "updatedBy": actor}},
         )
     except Exception:
         pass
@@ -682,22 +694,24 @@ async def insert_item(
             except Exception:
                 pass
             raise HTTPException(status_code=500, detail=f"Mongo sync failed: {e}") from e
-
-        # sync postgre from mongo
+        # sync postgre (MAP IDs)
         try:
-            pg_ids = sync_postgre_from_mongo_ids(
-                mongo_class_id=str(sync_res.class_id),
-                mongo_subject_id=str(sync_res.subject_id),
-                mongo_topic_id=str(sync_res.topic_id),
-                mongo_lesson_id=str(sync_res.lesson_id),
-                mongo_chunk_id=str(sync_res.chunk_id),
+            pg_ids = sync_postgre_from_mongo_maps(
+                class_map=sync_res.class_map,
+                subject_map=sync_res.subject_map,
+                topic_map=sync_res.topic_map,
+                lesson_map=sync_res.lesson_map,
+                chunk_map=sync_res.chunk_map,
             )
         except Exception as e:
             try:
                 client.remove_object(bucket, object_key)
             except Exception:
                 pass
-            _hide_mongo_chunk(str(sync_res.chunk_id), actor=actor)
+
+            # nếu là chunk thì ẩn chunk (tránh hiển thị rác)
+            if sync_res.chunk_map:
+                _hide_mongo_chunk_by_map(sync_res.chunk_map, actor=actor)
             raise HTTPException(status_code=500, detail=f"Postgre sync failed: {e}") from e
 
         return {
@@ -708,11 +722,17 @@ async def insert_item(
             "url": _backend_open_url(request, _to_virtual(default_bucket, bucket, object_key)),
             "meta_json": meta_json or "",
             "mongo": {
+                "folderType": sync_res.folder_type,
+                "classMap": sync_res.class_map,
+                "subjectMap": sync_res.subject_map,
+                "topicMap": sync_res.topic_map,
+                "lessonMap": sync_res.lesson_map,
+                "chunkMap": sync_res.chunk_map,
                 "classId": str(sync_res.class_id),
                 "subjectId": str(sync_res.subject_id),
-                "topicId": str(sync_res.topic_id),
-                "lessonId": str(sync_res.lesson_id),
-                "chunkId": str(sync_res.chunk_id),
+                "topicId": str(sync_res.topic_id) if sync_res.topic_id else None,
+                "lessonId": str(sync_res.lesson_id) if sync_res.lesson_id else None,
+                "chunkId": str(sync_res.chunk_id) if sync_res.chunk_id else None,
             },
             "postgre": {
                 "classId": pg_ids.class_id,

@@ -57,6 +57,16 @@ function lastName(path) {
   return parts[parts.length - 1] || "";
 }
 
+function normalizeFolderType(x = "") {
+  const s = String(x || "").trim().toLowerCase();
+  if (s === "topics") return "topic";
+  if (s === "lessons") return "lesson";
+  if (s === "chunks") return "chunk";
+  if (s === "subjects") return "subject";
+  return s;
+}
+
+
 export default function MinIO() {
   const [currentPath, setCurrentPath] = useState(""); // "" = root
   const [q, setQ] = useState("");
@@ -80,11 +90,17 @@ export default function MinIO() {
   const isRoot = currentPath === "";
   const isStorage = ["documents", "images", "video"].includes(section);
 
-  // thiết kế tree giống nhau cho documents/images/video:
-  // <bucket>/<class>/<subject> (level 3)
-  // <bucket>/<class>/<subject>/<category> (level 4) => file view
-  const isSubjectLevel = isStorage && parts.length === 2;
-  const isCategoryLevel = isStorage && parts.length === 3;
+  const lastSeg = normalizeFolderType(parts[parts.length - 1] || "");
+  const isTypeFolder = ["subject", "topic", "lesson", "chunk"].includes(lastSeg);
+
+  // Hỗ trợ 2 kiểu cấu trúc:
+  // A) <bucket>/<class>/<subject>/<category>  (len 4, category = topics/lessons/chunks)
+  // B) <bucket>/<class>/<category>            (len 3, category = topics/lessons/chunks)
+  const isClassLevel = isStorage && parts.length === 2;
+  const isSubjectLevel = isStorage && parts.length === 3 && !isTypeFolder; // <bucket>/<class>/<subject>
+  const isCategoryLevel =
+    isStorage &&
+    ((parts.length === 3 && isTypeFolder) || (parts.length === 4 && isTypeFolder));
 
   const isFileView = isCategoryLevel;
   const isFolderView = isRoot || (isStorage && !isCategoryLevel);
@@ -143,16 +159,19 @@ export default function MinIO() {
 
     const s = q.trim().toLowerCase();
 
+    const fixedCats = ["topic", "lesson", "chunk"];
+
     const rows = (remote.folders || []).map((f) => ({
       id: `f-${f.fullPath}`,
       name: f.name,
       fullPath: f.fullPath,
-      isCategory: isSubjectLevel, // folder con của subject => category
+      isCategory: isSubjectLevel || isClassLevel, // folder con của subject => category
+      isFixed: (isSubjectLevel || isClassLevel) && fixedCats.includes(normalizeFolderType(f.name || "")),
     }));
 
     const filtered = !s ? rows : rows.filter((x) => x.name.toLowerCase().includes(s));
     return filtered.sort((a, b) => a.name.localeCompare(b.name));
-  }, [remote.folders, q, isStorage, isRoot, isCategoryLevel, isSubjectLevel]);
+  }, [remote.folders, q, isStorage, isRoot, isCategoryLevel, isSubjectLevel, isClassLevel]);
 
   // ====== Files in currentPath ======
   const fileRows = useMemo(() => {
@@ -324,14 +343,14 @@ export default function MinIO() {
   }
 
   function canEditDeleteFolder(row) {
-    if (row?.isFixed) return false;
+  // OPTION 1: cho phép sửa/xoá tất cả folder (kể cả subjects/topics/lessons/chunks)
+  if (!row?.fullPath) return false;
+  if (!section) return false;
 
-    const len = splitPath(row.fullPath).length;
-    const inThisBucket = row.fullPath.startsWith(section + "/");
-
-    // cho sửa/xoá: class (2), subject (3), category (4 nếu đang hiển thị trong folder view)
-    return inThisBucket && (row?.isCategory || len === 2 || len === 3 || len === 4);
-  }
+  // chỉ cần đảm bảo folder nằm trong bucket hiện tại
+  const inThisBucket = row.fullPath === section || row.fullPath.startsWith(section + "/");
+  return inThisBucket;
+}
 
   async function editFolder(row) {
     const oldPath = row.fullPath;
@@ -390,7 +409,8 @@ export default function MinIO() {
 
   // ====== File actions ======
   function canFileActionsHere() {
-    return isFileView;
+    // Cho phép Upload/Insert ở subject (level 3) và category (level 4)
+    return isStorage && (parts.length === 3 || parts.length === 4);
   }
 
   async function uploadFile(file) {
