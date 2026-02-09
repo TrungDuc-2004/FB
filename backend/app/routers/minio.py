@@ -18,7 +18,7 @@ from minio.deleteobjects import DeleteObject
 from ..services.minio_client import get_minio_client
 from ..services.mongo_client import get_mongo_client
 from ..services.mongo_sync import sync_minio_object_to_mongo
-from ..services.postgre_sync_from_mongo import sync_postgre_from_mongo_ids, sync_postgre_from_mongo_maps
+from ..services.postgre_sync_from_mongo import sync_postgre_from_mongo_auto_ids
 router = APIRouter(
     prefix="/admin/minio",
     tags=["Minio"]
@@ -576,12 +576,12 @@ async def upload_files_to_path(
 
                 # ====== SYNC Postgre FROM Mongo ======
                 try:
-                    sync_postgre_from_mongo_ids(
-                        mongo_class_id=str(sync_res.class_id),
-                        mongo_subject_id=str(sync_res.subject_id),
-                        mongo_topic_id=str(sync_res.topic_id),
-                        mongo_lesson_id=str(sync_res.lesson_id),
-                        mongo_chunk_id=str(sync_res.chunk_id),
+                    sync_postgre_from_mongo_auto_ids(
+                        class_map=sync_res.class_map,
+                        subject_map=sync_res.subject_map,
+                        topic_map=sync_res.topic_map or "",
+                        lesson_map=sync_res.lesson_map or "",
+                        chunk_map=sync_res.chunk_map or "",
                     )
                 except Exception as e:
                     # rollback file + ẩn chunk mongo
@@ -696,12 +696,12 @@ async def insert_item(
             raise HTTPException(status_code=500, detail=f"Mongo sync failed: {e}") from e
         # sync postgre (MAP IDs)
         try:
-            pg_ids = sync_postgre_from_mongo_maps(
+            pg_ids = sync_postgre_from_mongo_auto_ids(
                 class_map=sync_res.class_map,
                 subject_map=sync_res.subject_map,
-                topic_map=sync_res.topic_map,
-                lesson_map=sync_res.lesson_map,
-                chunk_map=sync_res.chunk_map,
+                topic_map=sync_res.topic_map or "",
+                lesson_map=sync_res.lesson_map or "",
+                chunk_map=sync_res.chunk_map or "",
             )
         except Exception as e:
             try:
