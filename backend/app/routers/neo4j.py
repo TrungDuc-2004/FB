@@ -1,107 +1,210 @@
-# app/routers/admin_neo.py
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Path
+from typing import Annotated, Any, Dict, List
+
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from neo4j import Session as NeoSession
-from typing import Any, Dict, List, Optional, Annotated
+from pydantic import BaseModel, Field
 
 from ..services.neo_client import get_neo4j_session
+from ..services.neo_sync import sync_neo4j_from_maps_and_pg_ids
+from ..services.postgre_sync_from_mongo import sync_postgre_from_mongo_auto_ids
 
 router = APIRouter(prefix="/admin/neo", tags=["Neo4j (view-only)"])
 
-ALLOWED_LABELS = ["Thing", "Class", "Subject", "Topic", "Lesson", "Chunk", "Keyword"]
 
-LABEL_PRIORITY = ["Keyword", "Chunk", "Lesson", "Topic", "Subject", "Class", "Thing"]
+class NeoSyncBody(BaseModel):
+    classMap: str = Field("", description="VD: L10")
+    subjectMap: str = Field("", description="VD: TH10")
+    topicMap: str = Field("", description="VD: TH10_CD1")
+    lessonMap: str = Field("", description="VD: TH10_CD1_B1")
+    chunkMap: str = Field("", description="VD: TH10_CD1_B1_C1")
+
+
+def _get_actor(request: Request | None) -> str:
+    if request is None:
+        return "system"
+    return request.headers.get("x-user") or request.headers.get("x-actor") or "system"
+
+
+@router.post("/sync", summary="Sync chain Mongo -> Postgre(auto ids) -> Neo4j (light nodes)")
+def sync_chain_to_neo(body: NeoSyncBody, request: Request):
+    """Dùng khi Neo4j bị lệch dữ liệu và bạn muốn re-sync theo map ID.
+
+    - Postgre sync là idempotent (upsert).
+    - Neo4j sync cũng idempotent.
+    - Neo4j theo schema light node: neo_id + pg_id + name.
+    """
+    actor = _get_actor(request)
+
+    pg_ids = sync_postgre_from_mongo_auto_ids(
+        class_map=body.classMap,
+        subject_map=body.subjectMap,
+        topic_map=body.topicMap,
+        lesson_map=body.lessonMap,
+        chunk_map=body.chunkMap,
+    )
+
+    neo_res = sync_neo4j_from_maps_and_pg_ids(
+        class_map=body.classMap,
+        subject_map=body.subjectMap,
+        topic_map=body.topicMap,
+        lesson_map=body.lessonMap,
+        chunk_map=body.chunkMap,
+        pg_ids=pg_ids,
+        actor=actor,
+    )
+
+    return {
+        "postgre": {
+            "classId": pg_ids.class_id,
+            "subjectId": pg_ids.subject_id,
+            "topicId": pg_ids.topic_id,
+            "lessonId": pg_ids.lesson_id,
+            "chunkId": pg_ids.chunk_id,
+            "keywordIds": pg_ids.keyword_ids,
+        },
+        "neo4j": {
+            "synced": bool(getattr(neo_res, "ok", True)),
+            "createdOrUpdated": getattr(neo_res, "created_or_updated", {}),
+            "keywordCount": getattr(neo_res, "keyword_count", 0),
+        },
+    }
+
+
+# ===== VIEW-ONLY API for FE =====
+
+ALLOWED_LABELS = ["Class", "Subject", "Topic", "Lesson", "Chunk", "Keyword"]
 
 
 def _pick_label(labels: List[str]) -> str:
-    for lb in LABEL_PRIORITY:
+    for lb in ALLOWED_LABELS:
         if lb in labels:
             return lb
     return labels[0] if labels else ""
 
 
-def _coalesce(props: Dict[str, Any], keys: List[str], default: str = "") -> str:
-    for k in keys:
-        v = props.get(k)
-        if v is not None and str(v).strip() != "":
-            return str(v)
-    return default
-
-
-def _postgre_id(label: str, props: Dict[str, Any]) -> str:
-    # ưu tiên id đúng theo từng label, fallback postgre_id
+def _relation_for_node(session: NeoSession, label: str, node_id: str) -> str:
     if label == "Class":
-        return _coalesce(props, ["class_id", "postgre_id"])
-    if label == "Subject":
-        return _coalesce(props, ["subject_id", "postgre_id"])
-    if label == "Topic":
-        return _coalesce(props, ["topic_id", "postgre_id"])
-    if label == "Lesson":
-        return _coalesce(props, ["lesson_id", "postgre_id"])
-    if label == "Chunk":
-        return _coalesce(props, ["chunk_id", "postgre_id"])
-    if label == "Keyword":
-        # keyword composite key: chunk_id::keyword_name => keyword_key
-        return _coalesce(props, ["keyword_key", "postgre_id"])
-    return _coalesce(props, ["postgre_id"], "thing")
+        cypher = """
+        MATCH (c:Class)
+        WHERE elementId(c) = $id
+        OPTIONAL MATCH (c)-[:HAS_SUBJECT]->(s:Subject)
+        RETURN c.name AS class_name, c.pg_id AS class_pg_id, count(s) AS child_count
+        """
+        r = session.run(cypher, id=node_id).single()
+        if not r:
+            return "PATH: (Class not found)"
+        return f"PATH: Class: {r.get('class_name') or ''} [pg_id={r.get('class_pg_id') or ''}] | children Subjects: {int(r.get('child_count') or 0)}"
 
-
-def _display_name(label: str, props: Dict[str, Any]) -> str:
-    if label == "Class":
-        return str(props.get("class_name") or "")
     if label == "Subject":
-        return str(props.get("subject_name") or "")
+        cypher = """
+        MATCH (c:Class)-[:HAS_SUBJECT]->(s:Subject)
+        WHERE elementId(s) = $id
+        OPTIONAL MATCH (s)-[:HAS_TOPIC]->(t:Topic)
+        RETURN c.name AS class_name, c.pg_id AS class_pg_id,
+               s.name AS subject_name, s.pg_id AS subject_pg_id,
+               count(t) AS child_count
+        """
+        r = session.run(cypher, id=node_id).single()
+        if not r:
+            return "PATH: (missing Class -> Subject link)"
+        return (
+            f"PATH: Class: {r.get('class_name') or ''} [pg_id={r.get('class_pg_id') or ''}]"
+            f" > Subject: {r.get('subject_name') or ''} [pg_id={r.get('subject_pg_id') or ''}]"
+            f" | children Topics: {int(r.get('child_count') or 0)}"
+        )
+
     if label == "Topic":
-        return str(props.get("topic_name") or "")
+        cypher = """
+        MATCH (c:Class)-[:HAS_SUBJECT]->(s:Subject)-[:HAS_TOPIC]->(t:Topic)
+        WHERE elementId(t) = $id
+        OPTIONAL MATCH (t)-[:HAS_LESSON]->(l:Lesson)
+        RETURN c.name AS class_name, c.pg_id AS class_pg_id,
+               s.name AS subject_name, s.pg_id AS subject_pg_id,
+               t.name AS topic_name, t.pg_id AS topic_pg_id,
+               count(l) AS child_count
+        """
+        r = session.run(cypher, id=node_id).single()
+        if not r:
+            return "PATH: (missing Subject -> Topic link)"
+        return (
+            f"PATH: Class: {r.get('class_name') or ''} [pg_id={r.get('class_pg_id') or ''}]"
+            f" > Subject: {r.get('subject_name') or ''} [pg_id={r.get('subject_pg_id') or ''}]"
+            f" > Topic: {r.get('topic_name') or ''} [pg_id={r.get('topic_pg_id') or ''}]"
+            f" | children Lessons: {int(r.get('child_count') or 0)}"
+        )
+
     if label == "Lesson":
-        return str(props.get("lesson_name") or "")
+        cypher = """
+        MATCH (c:Class)-[:HAS_SUBJECT]->(s:Subject)-[:HAS_TOPIC]->(t:Topic)-[:HAS_LESSON]->(l:Lesson)
+        WHERE elementId(l) = $id
+        OPTIONAL MATCH (l)-[:HAS_CHUNK]->(ch:Chunk)
+        RETURN c.name AS class_name, c.pg_id AS class_pg_id,
+               s.name AS subject_name, s.pg_id AS subject_pg_id,
+               t.name AS topic_name, t.pg_id AS topic_pg_id,
+               l.name AS lesson_name, l.pg_id AS lesson_pg_id,
+               count(ch) AS child_count
+        """
+        r = session.run(cypher, id=node_id).single()
+        if not r:
+            return "PATH: (missing Topic -> Lesson link)"
+        return (
+            f"PATH: Class: {r.get('class_name') or ''} [pg_id={r.get('class_pg_id') or ''}]"
+            f" > Subject: {r.get('subject_name') or ''} [pg_id={r.get('subject_pg_id') or ''}]"
+            f" > Topic: {r.get('topic_name') or ''} [pg_id={r.get('topic_pg_id') or ''}]"
+            f" > Lesson: {r.get('lesson_name') or ''} [pg_id={r.get('lesson_pg_id') or ''}]"
+            f" | children Chunks: {int(r.get('child_count') or 0)}"
+        )
+
     if label == "Chunk":
-        return str(props.get("chunk_name") or "")
+        cypher = """
+        MATCH (c:Class)-[:HAS_SUBJECT]->(s:Subject)-[:HAS_TOPIC]->(t:Topic)-[:HAS_LESSON]->(l:Lesson)-[:HAS_CHUNK]->(ch:Chunk)
+        WHERE elementId(ch) = $id
+        OPTIONAL MATCH (ch)-[:HAS_KEYWORD]->(k:Keyword)
+        RETURN c.name AS class_name, c.pg_id AS class_pg_id,
+               s.name AS subject_name, s.pg_id AS subject_pg_id,
+               t.name AS topic_name, t.pg_id AS topic_pg_id,
+               l.name AS lesson_name, l.pg_id AS lesson_pg_id,
+               ch.name AS chunk_name, ch.pg_id AS chunk_pg_id,
+               count(DISTINCT k) AS kw_count
+        """
+        r = session.run(cypher, id=node_id).single()
+        if not r:
+            return "PATH: (missing Lesson -> Chunk link)"
+        return (
+            f"PATH: Class: {r.get('class_name') or ''} [pg_id={r.get('class_pg_id') or ''}]"
+            f" > Subject: {r.get('subject_name') or ''} [pg_id={r.get('subject_pg_id') or ''}]"
+            f" > Topic: {r.get('topic_name') or ''} [pg_id={r.get('topic_pg_id') or ''}]"
+            f" > Lesson: {r.get('lesson_name') or ''} [pg_id={r.get('lesson_pg_id') or ''}]"
+            f" > Chunk: {r.get('chunk_name') or ''} [pg_id={r.get('chunk_pg_id') or ''}]"
+            f" | keywords: {int(r.get('kw_count') or 0)}"
+        )
+
     if label == "Keyword":
-        return str(props.get("keyword_name") or "")
-    if label == "Thing":
-        return str(props.get("name") or "Thing")
+        cypher = """
+        MATCH (c:Class)-[:HAS_SUBJECT]->(s:Subject)-[:HAS_TOPIC]->(t:Topic)-[:HAS_LESSON]->(l:Lesson)-[:HAS_CHUNK]->(ch:Chunk)-[:HAS_KEYWORD]->(k:Keyword)
+        WHERE elementId(k) = $id
+        RETURN c.name AS class_name, c.pg_id AS class_pg_id,
+               s.name AS subject_name, s.pg_id AS subject_pg_id,
+               t.name AS topic_name, t.pg_id AS topic_pg_id,
+               l.name AS lesson_name, l.pg_id AS lesson_pg_id,
+               ch.name AS chunk_name, ch.pg_id AS chunk_pg_id,
+               k.name AS keyword_name, k.pg_id AS keyword_pg_id
+        """
+        r = session.run(cypher, id=node_id).single()
+        if not r:
+            return "PATH: (missing Chunk -> Keyword link)"
+        return (
+            f"PATH: Class: {r.get('class_name') or ''} [pg_id={r.get('class_pg_id') or ''}]"
+            f" > Subject: {r.get('subject_name') or ''} [pg_id={r.get('subject_pg_id') or ''}]"
+            f" > Topic: {r.get('topic_name') or ''} [pg_id={r.get('topic_pg_id') or ''}]"
+            f" > Lesson: {r.get('lesson_name') or ''} [pg_id={r.get('lesson_pg_id') or ''}]"
+            f" > Chunk: {r.get('chunk_name') or ''} [pg_id={r.get('chunk_pg_id') or ''}]"
+            f" > Keyword: {r.get('keyword_name') or ''} [pg_id={r.get('keyword_pg_id') or ''}]"
+        )
+
     return ""
-
-
-
-def _entity_id_key(label: str) -> str:
-    return {
-        "Class": "class_id",
-        "Subject": "subject_id",
-        "Topic": "topic_id",
-        "Lesson": "lesson_id",
-        "Chunk": "chunk_id",
-        "Keyword": "keyword_key",  # keyword composite: chunk_id::keyword_name
-        "Thing": "thing_id",
-    }.get(label, "id")
-
-
-def _entity_name_key(label: str) -> str:
-    return {
-        "Class": "class_name",
-        "Subject": "subject_name",
-        "Topic": "topic_name",
-        "Lesson": "lesson_name",
-        "Chunk": "chunk_name",
-        "Keyword": "keyword_name",
-        "Thing": "name",
-    }.get(label, "name")
-
-
-def _entity_id_value(label: str, props: Dict[str, Any]) -> str:
-    # Ưu tiên field "đúng label" trước, fallback postgre_id
-    key = _entity_id_key(label)
-    if key in props and str(props.get(key) or "").strip() != "":
-        return str(props.get(key))
-    # fallback chung
-    return _coalesce(props, ["postgre_id", "keyword_key"], "")
-
-
-def _entity_name_value(label: str, props: Dict[str, Any]) -> str:
-    key = _entity_name_key(label)
-    return str(props.get(key) or "")
 
 
 @router.get("/labels", summary="List labels + count (view-only)")
@@ -124,12 +227,10 @@ def list_nodes(
     if label not in ALLOWED_LABELS:
         raise HTTPException(status_code=404, detail=f"Label '{label}' not allowed")
 
-    # List giữ nguyên: chỉ id/postgreId/name (+updatedAt nếu có)
-    # NOTE: Neo4j comment dùng //, không dùng --.
     cypher = f"""
     MATCH (n:{label})
     RETURN elementId(n) AS id, properties(n) AS p
-    ORDER BY coalesce(toString(n.updated_at), "") DESC
+    ORDER BY coalesce(toString(n.name), "") ASC
     SKIP $skip LIMIT $limit
     """
     rs = session.run(cypher, skip=skip, limit=limit)
@@ -137,119 +238,18 @@ def list_nodes(
     nodes = []
     for r in rs:
         p = r["p"] or {}
-        nodes.append({
-            "id": str(r["id"]),
-            "postgreId": _postgre_id(label, p),
-            "name": _display_name(label, p),
-            "updatedAt": str(p.get("updated_at") or ""),
-            # list không trả relation để UI giữ nguyên
-        })
+        nodes.append(
+            {
+                "id": str(r["id"]),
+                "neoId": str(r["id"]),
+                "postgreId": str(p.get("pg_id") or ""),
+                "name": str(p.get("name") or ""),
+            }
+        )
 
     total = session.run(f"MATCH (n:{label}) RETURN count(n) AS c").single()["c"]
     return {"label": label, "total": int(total), "nodes": nodes}
 
-
-def _relation_for_node(session: NeoSession, label: str, node_id: str) -> str:
-    # Trả về 1 string "PATH: Thing > Class: ... > Subject: ... > ..."
-    # (chỉ dùng cho detail)
-    if label == "Class":
-        cypher = """
-        MATCH (t:Thing {id:"thing"})-[:HAS_CLASS]->(c:Class)
-        WHERE elementId(c) = $id
-        OPTIONAL MATCH (c)-[:HAS_SUBJECT]->(s:Subject)
-        RETURN c.class_name AS class_name, count(s) AS child_count
-        """
-        r = session.run(cypher, id=node_id).single()
-        if not r:
-            return "PATH: (missing Thing -> Class link)"
-        cn = r.get("class_name") or ""
-        cnt = int(r.get("child_count") or 0)
-        return f"PATH: Thing > Class: {cn} | children Subjects: {cnt}"
-
-    if label == "Subject":
-        cypher = """
-        MATCH (c:Class)-[:HAS_SUBJECT]->(s:Subject)
-        WHERE elementId(s) = $id
-        OPTIONAL MATCH (s)-[:HAS_TOPIC]->(t:Topic)
-        RETURN c.class_name AS class_name, s.subject_name AS subject_name, count(t) AS child_count
-        """
-        r = session.run(cypher, id=node_id).single()
-        if not r:
-            return "PATH: (missing Class -> Subject link)"
-        return (
-            f"PATH: Thing > Class: {r.get('class_name') or ''} > Subject: {r.get('subject_name') or ''}"
-            f" | children Topics: {int(r.get('child_count') or 0)}"
-        )
-
-    if label == "Topic":
-        cypher = """
-        MATCH (c:Class)-[:HAS_SUBJECT]->(s:Subject)-[:HAS_TOPIC]->(t:Topic)
-        WHERE elementId(t) = $id
-        OPTIONAL MATCH (t)-[:HAS_LESSON]->(l:Lesson)
-        RETURN c.class_name AS class_name, s.subject_name AS subject_name, t.topic_name AS topic_name,
-               count(l) AS child_count
-        """
-        r = session.run(cypher, id=node_id).single()
-        if not r:
-            return "PATH: (missing Subject -> Topic link)"
-        return (
-            f"PATH: Thing > Class: {r.get('class_name') or ''} > Subject: {r.get('subject_name') or ''}"
-            f" > Topic: {r.get('topic_name') or ''}"
-            f" | children Lessons: {int(r.get('child_count') or 0)}"
-        )
-
-    if label == "Lesson":
-        cypher = """
-        MATCH (c:Class)-[:HAS_SUBJECT]->(s:Subject)-[:HAS_TOPIC]->(t:Topic)-[:HAS_LESSON]->(l:Lesson)
-        WHERE elementId(l) = $id
-        OPTIONAL MATCH (l)-[:HAS_CHUNK]->(ch:Chunk)
-        RETURN c.class_name AS class_name, s.subject_name AS subject_name, t.topic_name AS topic_name,
-               l.lesson_name AS lesson_name, count(ch) AS child_count
-        """
-        r = session.run(cypher, id=node_id).single()
-        if not r:
-            return "PATH: (missing Topic -> Lesson link)"
-        return (
-            f"PATH: Thing > Class: {r.get('class_name') or ''} > Subject: {r.get('subject_name') or ''}"
-            f" > Topic: {r.get('topic_name') or ''} > Lesson: {r.get('lesson_name') or ''}"
-            f" | children Chunks: {int(r.get('child_count') or 0)}"
-        )
-
-    if label == "Chunk":
-        cypher = """
-        MATCH (c:Class)-[:HAS_SUBJECT]->(s:Subject)-[:HAS_TOPIC]->(t:Topic)-[:HAS_LESSON]->(l:Lesson)-[:HAS_CHUNK]->(ch:Chunk)
-        WHERE elementId(ch) = $id
-        OPTIONAL MATCH (ch)-[:HAS_KEYWORD]->(k:Keyword)
-        RETURN c.class_name AS class_name, s.subject_name AS subject_name, t.topic_name AS topic_name,
-               l.lesson_name AS lesson_name, ch.chunk_name AS chunk_name, count(k) AS child_count
-        """
-        r = session.run(cypher, id=node_id).single()
-        if not r:
-            return "PATH: (missing Lesson -> Chunk link)"
-        return (
-            f"PATH: Thing > Class: {r.get('class_name') or ''} > Subject: {r.get('subject_name') or ''}"
-            f" > Topic: {r.get('topic_name') or ''} > Lesson: {r.get('lesson_name') or ''}"
-            f" > Chunk: {r.get('chunk_name') or ''}"
-            f" | children Keywords: {int(r.get('child_count') or 0)}"
-        )
-
-    if label == "Keyword":
-        cypher = """
-        MATCH (c:Class)-[:HAS_SUBJECT]->(s:Subject)-[:HAS_TOPIC]->(t:Topic)-[:HAS_LESSON]->(l:Lesson)-[:HAS_CHUNK]->(ch:Chunk)-[:HAS_KEYWORD]->(k:Keyword)
-        WHERE elementId(k) = $id
-        RETURN c.class_name AS class_name, s.subject_name AS subject_name, t.topic_name AS topic_name,
-               l.lesson_name AS lesson_name, ch.chunk_name AS chunk_name, k.keyword_name AS keyword_name
-        """
-        r = session.run(cypher, id=node_id).single()
-        if not r:
-            return "PATH: (missing Chunk -> Keyword link)"
-        return (
-            f"PATH: Thing > Class: {r.get('class_name') or ''} > Subject: {r.get('subject_name') or ''}"
-            f" > Topic: {r.get('topic_name') or ''} > Lesson: {r.get('lesson_name') or ''}"
-            f" > Chunk: {r.get('chunk_name') or ''} > Keyword: {r.get('keyword_name') or ''}"
-        )
-
-    return ""
 
 @router.get("/nodes/{node_id}", summary="Get node detail (view-only, includes relation)")
 def get_node_detail(
@@ -270,12 +270,13 @@ def get_node_detail(
     label = _pick_label(labels)
 
     node = {
-        "id": str(r["id"]),  # elementId để FE dùng mở detail
+        "id": str(r["id"]),
         "label": label,
-        "entity_id_key": _entity_id_key(label),
-        "entity_id": _entity_id_value(label, props),
-        "entity_name_key": _entity_name_key(label),
-        "entity_name": _entity_name_value(label, props),
+        "entity_id_key": "elementId",
+        "entity_id": str(r["id"]),
+        "entity_name_key": "name",
+        "entity_name": str(props.get("name") or ""),
+        "postgre_id": str(props.get("pg_id") or ""),
         "relation": _relation_for_node(session, label, node_id),
     }
-    return {"node": node}  # ✅ đúng FE: data.node
+    return {"node": node}

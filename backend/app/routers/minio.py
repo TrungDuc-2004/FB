@@ -19,6 +19,7 @@ from ..services.minio_client import get_minio_client
 from ..services.mongo_client import get_mongo_client
 from ..services.mongo_sync import sync_minio_object_to_mongo
 from ..services.postgre_sync_from_mongo import sync_postgre_from_mongo_auto_ids
+from ..services.neo_sync import sync_neo4j_from_maps_and_pg_ids
 router = APIRouter(
     prefix="/admin/minio",
     tags=["Minio"]
@@ -714,6 +715,27 @@ async def insert_item(
                 _hide_mongo_chunk_by_map(sync_res.chunk_map, actor=actor)
             raise HTTPException(status_code=500, detail=f"Postgre sync failed: {e}") from e
 
+        # sync neo4j (không rollback nếu fail, chỉ trả warning để bạn re-sync sau)
+        neo_info: Dict[str, Any] = {"synced": False, "error": None}
+        try:
+            neo_res = sync_neo4j_from_maps_and_pg_ids(
+                class_map=sync_res.class_map,
+                subject_map=sync_res.subject_map,
+                topic_map=sync_res.topic_map or "",
+                lesson_map=sync_res.lesson_map or "",
+                chunk_map=sync_res.chunk_map or "",
+                pg_ids=pg_ids,
+                actor=actor,
+            )
+            neo_info = {
+                "synced": bool(getattr(neo_res, "ok", True)),
+                "createdOrUpdated": getattr(neo_res, "created_or_updated", {}),
+                "keywordCount": getattr(neo_res, "keyword_count", 0),
+                "error": None,
+            }
+        except Exception as e:
+            neo_info = {"synced": False, "error": str(e)}
+
         return {
             "status": "inserted",
             "bucket": bucket,
@@ -741,7 +763,8 @@ async def insert_item(
                 "lessonId": pg_ids.lesson_id,
                 "chunkId": pg_ids.chunk_id,
                 "keywordIds": pg_ids.keyword_ids,
-            }
+            },
+            "neo4j": neo_info,
         }
 
     except HTTPException:
