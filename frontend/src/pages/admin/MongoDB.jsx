@@ -322,6 +322,134 @@ function DocumentModal({ open, onClose, title, initialDoc, onSave, collectionNam
   );
 }
 
+/** ===== Modal: Bulk Import XLSX ===== */
+function ImportXlsxModal({ open, onClose, onImported }) {
+  const [file, setFile] = useState(null);
+  const [sync, setSync] = useState(true);
+  const [category, setCategory] = useState("document");
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!open) {
+      setFile(null);
+      setSync(true);
+      setCategory("document");
+      setLoading(false);
+      setResult(null);
+      setError("");
+    }
+  }, [open]);
+
+  async function runImport() {
+    if (!file) {
+      setError("Bạn chưa chọn file XLSX");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    setResult(null);
+    try {
+      const res = await mongoApi.importMetadataXlsx(file, { sync, category });
+      setResult(res);
+      await onImported?.(res);
+    } catch (e) {
+      setError(String(e?.message || e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (!open) return null;
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" style={{ width: 720 }} onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <h3>Import metadata (XLSX)</h3>
+          <button className="modal-close" onClick={onClose}>
+            ✕
+          </button>
+        </div>
+
+        <div className="modal-body">
+          <p style={{ marginTop: 0 }}>
+            Import sẽ upsert vào MongoDB (classes/subjects/topics/lessons/chunks) và (tuỳ chọn) sync sang PostgreSQL + Neo4j.
+          </p>
+
+          <p style={{ marginTop: 0 }}>
+            Template (map IDs, không cần ref):{" "}
+            <a href="/templates/Metadata_MapID_Template.xlsx" target="_blank" rel="noreferrer">
+              Metadata_MapID_Template.xlsx
+            </a>
+          </p>
+
+          <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
+            <input
+              type="file"
+              accept=".xlsx,.xlsm"
+              onChange={(e) => setFile(e.target.files?.[0] || null)}
+            />
+
+            <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <input type="checkbox" checked={sync} onChange={(e) => setSync(e.target.checked)} />
+              Sync PostgreSQL + Neo4j
+            </label>
+
+            <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              Category
+              <select value={category} onChange={(e) => setCategory(e.target.value)}>
+                <option value="document">document</option>
+                <option value="image">image</option>
+                <option value="video">video</option>
+              </select>
+            </label>
+          </div>
+
+          {error ? (
+            <div className="empty-state" style={{ marginBottom: 12 }}>
+              <div className="empty-state-icon">⚠️</div>
+              <p style={{ whiteSpace: "pre-wrap" }}>{error}</p>
+            </div>
+          ) : null}
+
+          {result ? (
+            <div className="empty-state" style={{ marginBottom: 12 }}>
+              <div className="empty-state-icon">✅</div>
+              <p style={{ whiteSpace: "pre-wrap" }}>
+                Mongo: classes(+{result?.mongo?.classes?.inserted}/~{result?.mongo?.classes?.updated}),
+                subjects(+{result?.mongo?.subjects?.inserted}/~{result?.mongo?.subjects?.updated}),
+                topics(+{result?.mongo?.topics?.inserted}/~{result?.mongo?.topics?.updated}),
+                lessons(+{result?.mongo?.lessons?.inserted}/~{result?.mongo?.lessons?.updated}),
+                chunks(+{result?.mongo?.chunks?.inserted}/~{result?.mongo?.chunks?.updated})\n
+                Sync: ok={result?.sync?.ok}, failed={result?.sync?.failed}\n
+                Errors: {Array.isArray(result?.errors) ? result.errors.length : 0}
+              </p>
+            </div>
+          ) : null}
+
+          {result?.errors?.length ? (
+            <details>
+              <summary>Xem lỗi</summary>
+              <pre style={{ maxHeight: 220, overflow: "auto" }}>{JSON.stringify(result.errors.slice(0, 50), null, 2)}</pre>
+            </details>
+          ) : null}
+        </div>
+
+        <div className="modal-footer">
+          <button className="btn" onClick={onClose} disabled={loading}>
+            Đóng
+          </button>
+          <button className="btn btn-primary" onClick={runImport} disabled={loading}>
+            {loading ? "Đang import..." : "Import"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function MongoDB() {
   const [current, setCurrent] = useState(""); // "" = root collections
   const [currentDocId, setCurrentDocId] = useState(""); // doc detail
@@ -348,6 +476,8 @@ export default function MongoDB() {
   const [openCreateDoc, setOpenCreateDoc] = useState(false);
   const [openEditDoc, setOpenEditDoc] = useState(false);
   const [editDocTarget, setEditDocTarget] = useState(null); // doc
+
+  const [openImport, setOpenImport] = useState(false);
 
   async function reloadCollections() {
     setErr("");
@@ -807,6 +937,9 @@ export default function MongoDB() {
           </div>
 
           <div className="header-actions">
+            <button className="btn" onClick={() => setOpenImport(true)}>
+              Import
+            </button>
             {isRoot ? (
               <button className="btn btn-primary" onClick={() => setOpenCreateCol(true)}>
                 + Collection
@@ -967,6 +1100,15 @@ export default function MongoDB() {
         }
         onSave={saveEditDoc}
         collectionName={currentCollection}
+      />
+
+      <ImportXlsxModal
+        open={openImport}
+        onClose={() => setOpenImport(false)}
+        onImported={async () => {
+          await reloadCollections();
+          if (currentCollection) await reloadDocs(currentCollection);
+        }}
       />
     </div>
   );

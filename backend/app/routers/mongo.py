@@ -1,6 +1,7 @@
 # app/routers/admin_mongo.py
-from fastapi import APIRouter, Query, Path, HTTPException, status, Body, Request
+from fastapi import APIRouter, Query, Path, HTTPException, status, Body, Request, UploadFile, File
 from ..services.mongo_client import get_mongo_client
+from ..services.mongo_bulk_import import import_metadata_xlsx_bytes
 from typing import Any, Dict, Tuple, Optional
 from fastapi.encoders import jsonable_encoder
 from bson import ObjectId
@@ -234,8 +235,8 @@ def get_documents(
 @router.post("/documents/{collection_name}", summary="Thêm document vào collection (generic)")
 def create_document(
     collection_name: str,
+    request: Request,
     body: Dict[str, Any] = Body(...),
-    request: Request = None,
 ):
     col = _normalize_collection_name(collection_name)
     _check_collection_exist(col)
@@ -269,8 +270,8 @@ def create_document(
 def update_document(
     collection_name: str,
     oid: str,
+    request: Request,
     body: Dict[str, Any] = Body(...),
-    request: Request = None,
 ):
     col = _normalize_collection_name(collection_name)
     _check_collection_exist(col)
@@ -315,3 +316,29 @@ def delete_document(collection_name: str = Path(...), oid: str = Path(...)):
 
     r = db[col].delete_one(id_filter)
     return {"deleted": True, "deleted_count": r.deleted_count, "_id": oid}
+
+
+# ========================= BULK IMPORT =========================
+@router.post("/import/xlsx", summary="Bulk import metadata (Mongo map IDs) + sync Postgres/Neo4j")
+async def import_metadata_xlsx(
+    request: Request,
+    file: UploadFile = File(...),
+    sync: bool = Query(True, description="Nếu true: sau import sẽ sync qua PostgreSQL + Neo4j"),
+    category: str = Query("document", description="Giá trị gán cho *_Category trong Mongo"),
+):
+    """Import 1 file Excel (XLSX).
+
+    - Hỗ trợ template cũ (import_key + *_ref)
+    - Hỗ trợ template mới (map IDs trực tiếp, không cần *_ref)
+    - Mặc định: auto sync sang PostgreSQL + Neo4j
+    """
+
+    actor = _get_actor(request)
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=422, detail="Empty file")
+
+    try:
+        return import_metadata_xlsx_bytes(content, actor=actor, category=category, do_sync=sync)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Import failed: {e}") from e

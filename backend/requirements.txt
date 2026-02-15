@@ -7,3 +7,4 @@ neo4j
 sqlalchemy
 psycopg2-binary
 python-multipart
+openpyxl

@@ -71,3 +71,27 @@ export function deleteDocument(collectionName, oid) {
   const id = encodeURIComponent(oid);
   return httpJson(`${API_BASE}/admin/mongo/documents/${c}/${id}`, { method: "DELETE" });
 }
+
+// ========================= BULK IMPORT =========================
+export async function importMetadataXlsx(file, { sync = true, category = "document" } = {}) {
+  if (!file) throw new Error("Missing file");
+
+  const url = new URL(`${API_BASE}/admin/mongo/import/xlsx`);
+  url.searchParams.set("sync", sync ? "true" : "false");
+  url.searchParams.set("category", category);
+
+  const fd = new FormData();
+  fd.append("file", file);
+
+  const res = await fetch(url.toString(), {
+    method: "POST",
+    headers: {
+      "X-Actor": getActor(),
+    },
+    body: fd,
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.detail || JSON.stringify(data) || "Request failed");
+  return data;
+}
