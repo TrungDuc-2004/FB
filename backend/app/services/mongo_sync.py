@@ -10,6 +10,7 @@ from urllib.parse import quote
 from bson import ObjectId
 
 from .mongo_client import get_mongo_client
+from .keyword_embedding import embed_keyword_cached, get_keyword_embedder
 
 
 def _now() -> datetime:
@@ -298,6 +299,7 @@ def sync_minio_object_to_mongo(
     COL_TOPICS = "topics"
     COL_LESSONS = "lessons"
     COL_CHUNKS = "chunks"
+    COL_KEYWORDS = "keywords"
 
     # ====== Upsert CLASS (key = classID) ======
     class_filter = {"classID": class_map}
@@ -426,6 +428,8 @@ def sync_minio_object_to_mongo(
                         "chunkName": chunk_name,
                         "chunkType": chunk_type,
                         "chunkUrl": file_url,
+                        # giữ keywords ở chunk để tương thích dữ liệu cũ/UI,
+                        # nhưng canonical source mới là collection `keywords`.
                         "keywords": keywords,
                         "chunkDescription": chunk_desc,
                         "updatedAt": now,
@@ -448,6 +452,47 @@ def sync_minio_object_to_mongo(
                     "updatedAt": now,
                 }
             ).inserted_id
+
+        # ====== Upsert KEYWORDS (tách riêng collection) ======
+        # Quy ước keyword map ID: <chunk_map>_K1, <chunk_map>_K2, ...
+        # Ví dụ: TH10_CD5_B18_C2_K1
+
+        # 1) Xoá keyword cũ của chunk để tránh lệch (đổi list keyword => rebuild)
+        try:
+            db[COL_KEYWORDS].delete_many({"chunkID": chunk_map})
+        except Exception:
+            # collection chưa tồn tại cũng không sao
+            pass
+
+        # 2) Tạo lại keyword docs + embedding
+        if keywords:
+            embedder = get_keyword_embedder()
+            for idx, kw_name in enumerate(keywords, start=1):
+                kw_name = _clean_str(kw_name)
+                if not kw_name:
+                    continue
+
+                kw_map = f"{chunk_map}_K{idx}"
+                emb = embed_keyword_cached(kw_name)
+
+                db[COL_KEYWORDS].update_one(
+                    {"keywordID": kw_map},
+                    {
+                        "$set": {
+                            "chunkID": chunk_map,
+                            "keywordName": kw_name,
+                            "keywordEmbedding": emb,
+                            "embeddingProvider": getattr(embedder, "name", ""),
+                            "updatedAt": now,
+                        },
+                        "$setOnInsert": {
+                            "status": "active",
+                            "createdBy": actor or "system",
+                            "createdAt": now,
+                        },
+                    },
+                    upsert=True,
+                )
 
     return SyncResult(
         folder_type=folder_type,

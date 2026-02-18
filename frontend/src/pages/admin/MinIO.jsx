@@ -536,11 +536,11 @@ export default function MinIO() {
 
             {canFileActionsHere() && (
               <>
-                <button className="btn btn-primary" onClick={() => setOpenUpload(true)}>
+                {/* <button className="btn btn-primary" onClick={() => setOpenUpload(true)}>
                   Upload
-                </button>
+                </button> */}
                 <button className="btn btn-primary" onClick={() => setOpenInsert(true)}>
-                  Insert
+                Upload
                 </button>
                 <button className="btn" onClick={() => setOpenFilter(true)}>
                   Filter

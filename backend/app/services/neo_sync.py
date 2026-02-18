@@ -26,9 +26,12 @@ NOTE:
 from dataclasses import dataclass
 from typing import Any, Dict
 
+from sqlalchemy import text
+
 from .mongo_client import get_mongo_client
 from .neo_client import neo4j_driver
-from .postgre_sync_from_mongo import PgIds, _keyword_slug, _resolve_chain_from_maps
+from .postgre_client import get_engine
+from .postgre_sync_from_mongo import PgIds, _resolve_chain_from_maps
 
 
 def _clean(v: Any) -> str:
@@ -145,20 +148,24 @@ def _merge_chunk(tx, *, lesson_pg_id: str, lesson_name: str, pg_id: str, name: s
     )
 
 
-def _merge_keywords(tx, *, chunk_pg_id: str, keywords: list[dict[str, str]]):
+def _merge_keywords(tx, *, chunk_pg_id: str, keywords: list[dict[str, object]]):
     """Upsert keyword nodes + rels for a chunk.
 
-    keywords: [{"pg_id": "<chunk_id>::<slug>", "name": "..."}, ...]
+    keywords: [{"pg_id": "...", "name": "...", "embedding": [...]|None}, ...]
     """
     kw_ids = [k.get("pg_id", "") for k in (keywords or []) if k.get("pg_id")]
 
-    # remove stale relations
+    # remove stale relations (và xoá keyword mồ côi vừa bị stale)
     tx.run(
         """
-        MATCH (ch:Chunk {pg_id: $chunk_pg_id})
-        OPTIONAL MATCH (ch)-[r:HAS_KEYWORD]->(k:Keyword)
+        MATCH (ch:Chunk {pg_id: $chunk_pg_id})-[r:HAS_KEYWORD]->(k:Keyword)
         WHERE size($kw_ids) = 0 OR NOT k.pg_id IN $kw_ids
         DELETE r
+        WITH collect(DISTINCT k) AS ks
+        UNWIND ks AS k
+        WITH DISTINCT k
+        WHERE NOT ( (:Chunk)-[:HAS_KEYWORD]->(k) )
+        DETACH DELETE k
         """,
         chunk_pg_id=chunk_pg_id,
         kw_ids=kw_ids,
@@ -168,6 +175,7 @@ def _merge_keywords(tx, *, chunk_pg_id: str, keywords: list[dict[str, str]]):
     for kw in keywords or []:
         kw_pg_id = _clean(kw.get("pg_id"))
         kw_name = _clean(kw.get("name")) or kw_pg_id
+        kw_emb = kw.get("embedding")
         if not kw_pg_id:
             continue
         tx.run(
@@ -175,24 +183,45 @@ def _merge_keywords(tx, *, chunk_pg_id: str, keywords: list[dict[str, str]]):
             MATCH (ch:Chunk {pg_id: $chunk_pg_id})
             MERGE (k:Keyword {pg_id: $kw_pg_id})
             SET k.name = $kw_name
+            SET k.embedding = CASE WHEN $kw_emb IS NULL THEN k.embedding ELSE $kw_emb END
             REMOVE k.neo_id
             MERGE (ch)-[:HAS_KEYWORD]->(k)
             """,
             chunk_pg_id=chunk_pg_id,
             kw_pg_id=kw_pg_id,
             kw_name=kw_name,
+            kw_emb=kw_emb,
         )
 
-    # cleanup orphan keywords of this chunk (keyword_id starts with "<chunk_pg_id>::")
-    tx.run(
-        """
-        MATCH (k:Keyword)
-        WHERE k.pg_id STARTS WITH $prefix
-          AND NOT ( (:Chunk)-[:HAS_KEYWORD]->(k) )
-        DETACH DELETE k
-        """,
-        prefix=f"{chunk_pg_id}::",
-    )
+
+def _fetch_keywords_from_postgre(*, chunk_pg_id: str) -> list[dict[str, object]]:
+    """Lấy keyword từ Postgre để sync xuống Neo4j (đúng flow Mongo -> PG -> Neo).
+
+    Trả về list: {pg_id, name, embedding}
+    """
+    engine = get_engine()
+    out: list[dict[str, object]] = []
+    if not chunk_pg_id:
+        return out
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT keyword_id, keyword_name, keyword_embedding
+                FROM keyword
+                WHERE chunk_id = :chunk_id
+                ORDER BY keyword_id
+                """
+            ),
+            {"chunk_id": chunk_pg_id},
+        ).fetchall()
+        for r in rows:
+            out.append({
+                "pg_id": _clean(r[0]),
+                "name": _clean(r[1]) or _clean(r[0]),
+                "embedding": r[2],
+            })
+    return out
 
 
 def sync_neo4j_from_maps_and_pg_ids(
@@ -304,25 +333,11 @@ def sync_neo4j_from_maps_and_pg_ids(
                 )
                 created_or_updated["Chunk"] = 1
 
-                # 6) Keywords (nếu chunk có keywords)
-                keywords = (chunk_doc or {}).get("keywords") or []
-                if not isinstance(keywords, list):
-                    keywords = []
-
-                kw_pairs: list[dict[str, str]] = []
-                for kw in keywords:
-                    kw_name = _clean(kw)
-                    if not kw_name:
-                        continue
-                    slug = _keyword_slug(kw_name)
-                    if not slug:
-                        continue
-                    kw_id = f"{chunk_pg_id}::{slug}"
-                    kw_pairs.append({"pg_id": kw_id, "name": kw_name})
-
-                if kw_pairs:
-                    session.execute_write(_merge_keywords, chunk_pg_id=chunk_pg_id, keywords=kw_pairs)
-                    keyword_count = len(kw_pairs)
+                # 6) Keywords: lấy từ Postgre (đúng flow Mongo -> PG -> Neo)
+                kw_rows = _fetch_keywords_from_postgre(chunk_pg_id=chunk_pg_id)
+                if kw_rows:
+                    session.execute_write(_merge_keywords, chunk_pg_id=chunk_pg_id, keywords=kw_rows)
+                    keyword_count = len(kw_rows)
 
     finally:
         try:

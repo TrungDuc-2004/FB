@@ -8,7 +8,8 @@ Ghi chú quan trọng:
   user_id, username, password, user_role, is_active, mongo_id
 """
 
-from sqlalchemy import Boolean, Column, ForeignKey, String, Text
+from sqlalchemy import Boolean, Column, ForeignKey, String, Text, Float
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import UUID
 
 from ..services.postgre_client import Base
@@ -68,6 +69,8 @@ class Keyword(Base):
     __tablename__ = "keyword"
     keyword_id = Column(String, primary_key=True)  # VARCHAR(96)
     keyword_name = Column(Text, nullable=False)
+    # NOTE: cần migration thêm cột keyword_embedding REAL[] trong Postgre
+    keyword_embedding = Column(ARRAY(Float), nullable=True)
     mongo_id = Column(String(24), unique=True, nullable=True)
 
     chunk_id = Column(String, ForeignKey("chunk.chunk_id", ondelete="CASCADE"), nullable=False)

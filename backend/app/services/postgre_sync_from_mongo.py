@@ -13,7 +13,7 @@ Schema PG (theo bạn mô tả):
 - topic(topic_id, topic_name, mongo_id, subject_id)
 - lesson(lesson_id, lesson_name, mongo_id, topic_id)
 - chunk(chunk_id, chunk_name, chunk_type, mongo_id, lesson_id)
-- keyword(keyword_id, keyword_name, mongo_id, chunk_id)
+- keyword(keyword_id, keyword_name, keyword_embedding, mongo_id, chunk_id)
 
 Nguồn Mongo (plural): classes, subjects, topics, lessons, chunks.
 """
@@ -67,6 +67,36 @@ def _get_pk_by_mongo(conn, table: str, pk_col: str, mongo_id: str) -> Optional[s
         {"mongo_id": mongo_id},
     ).fetchone()
     return row[0] if row else None
+
+
+def _get_keywords_for_chunk(db, *, chunk_map: str, chunk_doc: Optional[dict] = None) -> List[dict]:
+    """Lấy keyword theo chuẩn mới: collection `keywords`.
+
+    Fallback cho dữ liệu cũ: chunk_doc["keywords"] (list[str]).
+    """
+    chunk_map = _clean(chunk_map)
+    kw_docs: List[dict] = []
+
+    if chunk_map:
+        try:
+            kw_docs = list(db["keywords"].find({"chunkID": chunk_map}).sort("keywordID", 1))
+        except Exception:
+            kw_docs = []
+
+    if kw_docs:
+        return kw_docs
+
+    # legacy
+    legacy = (chunk_doc or {}).get("keywords") or []
+    if not isinstance(legacy, list):
+        legacy = []
+    out: List[dict] = []
+    for i, kw in enumerate(legacy, start=1):
+        kw_name = _clean(kw)
+        if not kw_name:
+            continue
+        out.append({"keywordID": "", "keywordName": kw_name, "keywordEmbedding": None, "_id": None, "_legacy_idx": i})
+    return out
 
 
 @dataclass
@@ -200,9 +230,8 @@ def sync_postgre_from_mongo_ids(
     chunk_name = _clean(ch_doc.get("chunkName"))
     chunk_type = _clean(ch_doc.get("chunkType"))
 
-    keywords = ch_doc.get("keywords") or []
-    if not isinstance(keywords, list):
-        keywords = []
+    chunk_map = _clean(ch_doc.get("chunkID"))
+    kw_docs = _get_keywords_for_chunk(db, chunk_map=chunk_map, chunk_doc=ch_doc)
 
     class_id_guess = _md5_32(mongo_class_id)
     subject_id_guess = _md5_32(mongo_subject_id)
@@ -313,28 +342,37 @@ def sync_postgre_from_mongo_ids(
         conn.execute(text("DELETE FROM keyword WHERE chunk_id = :chunk_id"), {"chunk_id": chunk_id})
 
         keyword_ids: List[str] = []
-        for kw in keywords:
-            kw_name = _clean(kw)
+        for d in kw_docs:
+            kw_name = _clean(d.get("keywordName") or d.get("keyword_name") or d.get("name"))
             if not kw_name:
                 continue
-            kw_id = _sha384_96(f"{chunk_id}:{kw_name}")
+
+            # keyword_id: ưu tiên map id (TH10_..._K1). Nếu thiếu => fallback hash.
+            kw_id = _clean(d.get("keywordID")) or _sha384_96(f"{chunk_id}:{kw_name}")
             keyword_ids.append(kw_id)
+
+            mongo_kw_id = str(d.get("_id")) if d.get("_id") is not None else None
+            kw_emb = d.get("keywordEmbedding")
+            if kw_emb is not None and not isinstance(kw_emb, list):
+                kw_emb = None
 
             conn.execute(
                 text(
                     """
-                    INSERT INTO keyword (keyword_id, keyword_name, mongo_id, chunk_id)
-                    VALUES (:keyword_id, :keyword_name, :mongo_id, :chunk_id)
+                    INSERT INTO keyword (keyword_id, keyword_name, keyword_embedding, mongo_id, chunk_id)
+                    VALUES (:keyword_id, :keyword_name, :keyword_embedding, :mongo_id, :chunk_id)
                     ON CONFLICT (keyword_id) DO UPDATE
-                    SET keyword_name = EXCLUDED.keyword_name,
-                        mongo_id      = COALESCE(EXCLUDED.mongo_id, keyword.mongo_id),
-                        chunk_id      = EXCLUDED.chunk_id
+                    SET keyword_name      = EXCLUDED.keyword_name,
+                        keyword_embedding = COALESCE(EXCLUDED.keyword_embedding, keyword.keyword_embedding),
+                        mongo_id          = COALESCE(EXCLUDED.mongo_id, keyword.mongo_id),
+                        chunk_id          = EXCLUDED.chunk_id
                     """
                 ),
                 {
                     "keyword_id": kw_id,
                     "keyword_name": kw_name,
-                    "mongo_id": None,
+                    "keyword_embedding": kw_emb,
+                    "mongo_id": mongo_kw_id,
                     "chunk_id": chunk_id,
                 },
             )
@@ -446,9 +484,7 @@ def sync_postgre_from_mongo_maps(
     mongo_lesson_id = str((lesson_doc or {}).get("_id")) if lesson_doc else None
     mongo_chunk_id = str((chunk_doc or {}).get("_id")) if chunk_doc else None
 
-    keywords = (chunk_doc or {}).get("keywords") or []
-    if not isinstance(keywords, list):
-        keywords = []
+    kw_docs = _get_keywords_for_chunk(db, chunk_map=chunk_map, chunk_doc=chunk_doc)
 
     engine = get_engine()
 
@@ -560,28 +596,35 @@ def sync_postgre_from_mongo_maps(
             # keywords: xoá cũ rồi insert lại
             conn.execute(text("DELETE FROM keyword WHERE chunk_id = :chunk_id"), {"chunk_id": chunk_id})
 
-            for kw in keywords:
-                kw_name = _clean(kw)
+            for d in kw_docs:
+                kw_name = _clean(d.get("keywordName") or d.get("keyword_name") or d.get("name"))
                 if not kw_name:
                     continue
-                kw_id = _sha384_96(f"{chunk_id}:{kw_name}")
+                kw_id = _clean(d.get("keywordID")) or _sha384_96(f"{chunk_id}:{kw_name}")
                 keyword_ids.append(kw_id)
+
+                mongo_kw_id = str(d.get("_id")) if d.get("_id") is not None else None
+                kw_emb = d.get("keywordEmbedding")
+                if kw_emb is not None and not isinstance(kw_emb, list):
+                    kw_emb = None
 
                 conn.execute(
                     text(
                         """
-                        INSERT INTO keyword (keyword_id, keyword_name, mongo_id, chunk_id)
-                        VALUES (:keyword_id, :keyword_name, :mongo_id, :chunk_id)
+                        INSERT INTO keyword (keyword_id, keyword_name, keyword_embedding, mongo_id, chunk_id)
+                        VALUES (:keyword_id, :keyword_name, :keyword_embedding, :mongo_id, :chunk_id)
                         ON CONFLICT (keyword_id) DO UPDATE
-                        SET keyword_name = EXCLUDED.keyword_name,
-                            mongo_id      = COALESCE(EXCLUDED.mongo_id, keyword.mongo_id),
-                            chunk_id      = EXCLUDED.chunk_id
+                        SET keyword_name      = EXCLUDED.keyword_name,
+                            keyword_embedding = COALESCE(EXCLUDED.keyword_embedding, keyword.keyword_embedding),
+                            mongo_id          = COALESCE(EXCLUDED.mongo_id, keyword.mongo_id),
+                            chunk_id          = EXCLUDED.chunk_id
                         """
                     ),
                     {
                         "keyword_id": kw_id,
                         "keyword_name": kw_name,
-                        "mongo_id": None,
+                        "keyword_embedding": kw_emb,
+                        "mongo_id": mongo_kw_id,
                         "chunk_id": chunk_id,
                     },
                 )
@@ -684,10 +727,8 @@ def sync_postgre_from_mongo_auto_ids(
             lesson_id = lesson_id or f"{topic_id}_L{lnum}"
             chunk_id = f"{lesson_id}_C{cnum}"
 
-    # keywords
-    keywords = (chunk_doc or {}).get("keywords") or []
-    if not isinstance(keywords, list):
-        keywords = []
+    # keywords (collection `keywords` mới; fallback legacy chunk.keywords)
+    kw_docs = _get_keywords_for_chunk(db, chunk_map=chunk_map, chunk_doc=chunk_doc)
 
     engine = get_engine()
 
@@ -797,31 +838,43 @@ def sync_postgre_from_mongo_auto_ids(
             # keywords: xoá cũ rồi insert lại
             conn.execute(text("DELETE FROM keyword WHERE chunk_id = :chunk_id"), {"chunk_id": chunk_id})
 
-            for kw in keywords:
-                kw_name = _clean(kw)
+            for d in kw_docs:
+                kw_name = _clean(d.get("keywordName") or d.get("keyword_name") or d.get("name"))
                 if not kw_name:
                     continue
-                slug = _keyword_slug(kw_name)
-                if not slug:
-                    continue
-                kw_id = f"{chunk_id}::{slug}"
+
+                # keyword_id: ưu tiên map id (TH10_..._K1). Nếu thiếu => fallback theo chuẩn cũ.
+                kw_id = _clean(d.get("keywordID"))
+                if not kw_id:
+                    slug = _keyword_slug(kw_name)
+                    if not slug:
+                        continue
+                    kw_id = f"{chunk_id}::{slug}"
+
                 keyword_ids.append(kw_id)
+
+                mongo_kw_id = str(d.get("_id")) if d.get("_id") is not None else None
+                kw_emb = d.get("keywordEmbedding")
+                if kw_emb is not None and not isinstance(kw_emb, list):
+                    kw_emb = None
 
                 conn.execute(
                     text(
                         """
-                        INSERT INTO keyword (keyword_id, keyword_name, mongo_id, chunk_id)
-                        VALUES (:keyword_id, :keyword_name, :mongo_id, :chunk_id)
+                        INSERT INTO keyword (keyword_id, keyword_name, keyword_embedding, mongo_id, chunk_id)
+                        VALUES (:keyword_id, :keyword_name, :keyword_embedding, :mongo_id, :chunk_id)
                         ON CONFLICT (keyword_id) DO UPDATE
-                        SET keyword_name = EXCLUDED.keyword_name,
-                            mongo_id      = COALESCE(EXCLUDED.mongo_id, keyword.mongo_id),
-                            chunk_id      = EXCLUDED.chunk_id
+                        SET keyword_name      = EXCLUDED.keyword_name,
+                            keyword_embedding = COALESCE(EXCLUDED.keyword_embedding, keyword.keyword_embedding),
+                            mongo_id          = COALESCE(EXCLUDED.mongo_id, keyword.mongo_id),
+                            chunk_id          = EXCLUDED.chunk_id
                         """
                     ),
                     {
                         "keyword_id": kw_id,
                         "keyword_name": kw_name,
-                        "mongo_id": None,
+                        "keyword_embedding": kw_emb,
+                        "mongo_id": mongo_kw_id,
                         "chunk_id": chunk_id,
                     },
                 )
