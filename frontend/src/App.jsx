@@ -1,31 +1,54 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 
-import AdminLayout from "./layouts/AdminLayout";
-import UserLayout from "./layouts/UserLayout";
-
 import Login from "./pages/Login";
 import RequireRole from "./components/RequireRole";
 
-import Dashboard from "./pages/admin/Dashboard";
-import MinIO from "./pages/admin/MinIO";
-import MongoDB from "./pages/admin/MongoDB";
-import PostgreSQL from "./pages/admin/PostgreSQL";
-import Neo4j from "./pages/admin/Neo4j";
-import Users from "./pages/admin/Users";
+import AdminLayout from "./layouts/AdminLayout";
+import UserLayout from "./layouts/UserLayout";
 
+// Admin pages
+// NOTE: các file admin đang dùng tên Home/MinIO/MongoDB/PostgreSQL (khác với import cũ)
+import AdminHome from "./pages/admin/Home";
+import MinioPage from "./pages/admin/MinIO";
+import MongoPage from "./pages/admin/MongoDB";
+import PostgresPage from "./pages/admin/PostgreSQL";
+import Neo4jPage from "./pages/admin/Neo4j";
+import UsersPage from "./pages/admin/Users";
+
+// User pages
 import UserHome from "./pages/user/UserHome";
-import UserProfile from "./pages/user/UserProfile";
+import Search from "./pages/user/UserSearch";
+import Library from "./pages/user/UserLibrary";
+import Saved from "./pages/user/UserSaved";
+import DocumentDetail from "./pages/user/UserDocDetail";
+import DocumentView from "./pages/user/DocumentView";
+import Profile from "./pages/user/UserProfile";
 
 export default function App() {
   return (
     <BrowserRouter>
       <Routes>
-        {/* vào / thì chuyển sang /login */}
         <Route path="/" element={<Navigate to="/login" replace />} />
-
         <Route path="/login" element={<Login />} />
 
-        {/* USER */}
+        {/* Admin */}
+        <Route
+          path="/admin"
+          element={
+            <RequireRole allow="admin">
+              <AdminLayout />
+            </RequireRole>
+          }
+        >
+          <Route index element={<AdminHome />} />
+          <Route path="minio" element={<MinioPage />} />
+          <Route path="mongo" element={<MongoPage />} />
+          <Route path="postgres" element={<PostgresPage />} />
+          <Route path="neo4j" element={<Neo4jPage />} />
+          <Route path="users" element={<UsersPage />} />
+        </Route>
+
+        {/* User */}
         <Route
           path="/user"
           element={
@@ -35,33 +58,18 @@ export default function App() {
           }
         >
           <Route index element={<UserHome />} />
+          <Route path="search" element={<Search />} />
 
-          {/* Student pages (UI giống admin, route dưới /user) */}
-          <Route path="minio" element={<MinIO />} />
-          <Route path="mongo" element={<MongoDB />} />
-          <Route path="postgres" element={<PostgreSQL />} />
-          <Route path="neo4j" element={<Neo4j />} />
-          <Route path="profile" element={<UserProfile />} />
+          {/* Danh sách: giữ cả 2 route để tránh 404 khi bạn đổi tên */}
+          <Route path="library" element={<Library />} />
+          <Route path="user-library" element={<Library />} />
+
+          <Route path="saved" element={<Saved />} />
+          <Route path="docs/:chunkID" element={<DocumentDetail />} />
+          <Route path="view/:chunkID" element={<DocumentView />} />
+          <Route path="profile" element={<Profile />} />
         </Route>
 
-        {/* ADMIN */}
-        <Route
-          path="/admin"
-          element={
-            <RequireRole allow="admin">
-              <AdminLayout />
-            </RequireRole>
-          }
-        >
-          {/* Trang chủ */}
-          <Route index element={<Dashboard />} />
-
-          <Route path="minio" element={<MinIO />} />
-          <Route path="mongo" element={<MongoDB />} />
-          <Route path="postgres" element={<PostgreSQL />} />
-          <Route path="neo4j" element={<Neo4j />} />
-          <Route path="users" element={<Users />} />
-        </Route>
         <Route path="*" element={<h1>404 - Not Found</h1>} />
       </Routes>
     </BrowserRouter>

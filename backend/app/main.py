@@ -6,6 +6,7 @@ from .routers.minio import router as minio_router
 from .routers.postgre import router as postgre_router
 from .routers.mongo import router as mongo_router
 from .routers.neo4j import router as neo_router
+from .routers.user_docs import router as user_docs_router
 
 
 # NOTE: Do NOT connect to Postgres at startup.
@@ -42,3 +43,6 @@ app.include_router(minio_router)
 app.include_router(postgre_router)
 app.include_router(mongo_router)
 app.include_router(neo_router)
+
+# User UI APIs
+app.include_router(user_docs_router)

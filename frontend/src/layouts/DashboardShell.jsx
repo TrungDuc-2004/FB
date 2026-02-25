@@ -78,6 +78,35 @@ const IUser = (
   </svg>
 );
 
+const ISearch = (
+  <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+    <circle cx="9" cy="9" r="5" stroke="currentColor" strokeWidth="1.6" />
+    <path d="M13 13l4 4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+  </svg>
+);
+
+const IList = (
+  <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+    <path d="M5 6h12" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    <path d="M5 10h12" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" opacity="0.8" />
+    <path d="M5 14h12" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" opacity="0.6" />
+    <circle cx="3" cy="6" r="1" fill="currentColor" />
+    <circle cx="3" cy="10" r="1" fill="currentColor" opacity="0.8" />
+    <circle cx="3" cy="14" r="1" fill="currentColor" opacity="0.6" />
+  </svg>
+);
+
+const IStar = (
+  <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+    <path
+      d="M10 3l2.2 4.6 5 .7-3.6 3.5.9 5-4.5-2.4-4.5 2.4.9-5L2.8 8.3l5-.7L10 3Z"
+      stroke="currentColor"
+      strokeWidth="1.4"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
+
 // ===== Topbar icons =====
 function FlagIcon() {
   return (
@@ -180,6 +209,7 @@ export default function DashboardShell({ basePath, navItems }) {
   const username = (localStorage.getItem("username") || "Người dùng").trim();
   const role = (localStorage.getItem("role") || "user").toLowerCase();
   const roleLabel = role === "admin" ? "Quản trị viên" : "Sinh viên";
+  const brandSubtitle = role === "admin" ? "Data Management" : "Tra cứu tài liệu";
   const avatarLetter = (username[0] || "U").toUpperCase();
 
   function logout() {
@@ -198,7 +228,7 @@ export default function DashboardShell({ basePath, navItems }) {
           <div className="brand-badge">SP</div>
           <div className="brand-lines">
             <div className="brand-title">Dashboard</div>
-            <div className="brand-subtitle">Data Management</div>
+            <div className="brand-subtitle">{brandSubtitle}</div>
           </div>
         </div>
 
@@ -228,7 +258,7 @@ export default function DashboardShell({ basePath, navItems }) {
 
         <div className="dash-logout">
           <button className="logout-btn" onClick={logout} type="button">
-            {LogoutIcon}
+            <LogoutIcon />
             <span>Đăng xuất</span>
           </button>
         </div>
@@ -270,4 +300,7 @@ export const DashboardIcons = {
   IDatabase,
   INeo4j,
   IUser,
+  ISearch,
+  IList,
+  IStar,
 };

@@ -29,6 +29,7 @@ from sqlalchemy import text
 
 from .mongo_client import get_mongo_client
 from .postgre_client import get_engine
+from .db_migrations import ensure_keyword_embedding_column
 
 
 def _md5_32(s: str) -> str:
@@ -214,6 +215,8 @@ def sync_postgre_from_mongo_ids(
     mongo_lesson_id: str,
     mongo_chunk_id: str,
 ) -> PgIds:
+    # Ensure schema supports keyword embeddings
+    ensure_keyword_embedding_column()
     mg = get_mongo_client()
     db = mg["db"]
 
@@ -437,6 +440,8 @@ def sync_postgre_from_mongo_maps(
     lesson_map: str = "",
     chunk_map: str = "",
 ) -> PgIds:
+    # Ensure schema supports keyword embeddings
+    ensure_keyword_embedding_column()
     """Sync PG theo map IDs.
 
     - Nếu truyền chunk_map: sync đủ chain + chunk + keywords
@@ -659,6 +664,8 @@ def sync_postgre_from_mongo_auto_ids(
     lesson_map: str = "",
     chunk_map: str = "",
 ) -> PgIds:
+    # Ensure schema supports keyword embeddings
+    ensure_keyword_embedding_column()
     """Sync PG từ Mongo nhưng *ID trong PG* theo chuẩn mới.
 
     Map ID (CD/B/C) chỉ dùng để suy ra số thứ tự T/L/C.
