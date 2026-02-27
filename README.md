@@ -3,14 +3,14 @@
 ## Cấu trúc
 
 - `backend/` : FastAPI (API cho MinIO/MongoDB/PostgreSQL/Neo4j)
-- `frontend/` : React (Vite) Dashboard UI (sidebar + topbar cố định)
+- `frontend/` : React (Vite) Dashboard UI
 
 ## Chạy Backend (FastAPI)
 
 ```bash
-cd backend
+cd ../backend
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+.venv\Scripts\activate
 pip install -r requirements.txt
 
 # cấu hình môi trường
@@ -25,7 +25,7 @@ API: http://localhost:8000
 ## Chạy Frontend (React)
 
 ```bash
-cd frontend
+cd ../frontend
 npm install
 npm run dev
 ```
