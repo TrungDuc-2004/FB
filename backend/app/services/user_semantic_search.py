@@ -4,11 +4,10 @@ import math
 import re
 from typing import Dict, List, Optional, Tuple
 
+from bson import ObjectId
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
-
-from bson import ObjectId
 
 from ..models.model_postgre import Chunk, Class, Keyword, Lesson, Subject, Topic
 from .keyword_embedding import embed_keyword_cached
@@ -16,7 +15,7 @@ from .keyword_embedding import embed_keyword_cached
 _TOKEN_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
 
 # bump this when you replace the file so you can confirm the running code
-_SERVICE_VERSION = "search_join_pg_chunk_mongo_id_v1"
+_SERVICE_VERSION = "search_chunk_only_parent_links_v2_total_consistent"
 
 
 def _extract_keywords(q: str) -> List[str]:
@@ -57,10 +56,6 @@ def _cosine(a: List[float], b: List[float]) -> float:
         nb += y * y
     den = math.sqrt(na) * math.sqrt(nb)
     return float(dot / den) if den > 0 else 0.0
-
-
-def _type_priority(t: str) -> int:
-    return {"chunk": 0, "lesson": 1, "topic": 2, "subject": 3}.get(t, 9)
 
 
 def _valid_object_id_hex(s: str) -> bool:
@@ -128,6 +123,34 @@ def _candidate_chunk_ids_from_filters_pg(
         return None
 
 
+def _load_by_oids(mongo_db, col: str, oid_hex_list: List[str]) -> Dict[str, dict]:
+    """Return map oid_hex -> doc. No category filter."""
+    out: Dict[str, dict] = {}
+    if not oid_hex_list:
+        return out
+    try:
+        # dedupe
+        seen = set()
+        oids = []
+        for x in oid_hex_list:
+            if not _valid_object_id_hex(x):
+                continue
+            if x in seen:
+                continue
+            seen.add(x)
+            oids.append(ObjectId(x))
+
+        if not oids:
+            return out
+
+        docs = list(mongo_db[col].find({"_id": {"$in": oids}}))
+        for d in docs:
+            out[str(d.get("_id"))] = d
+    except Exception:
+        return out
+    return out
+
+
 def semantic_search(
     *,
     q: str,
@@ -144,20 +167,22 @@ def semantic_search(
     mongo_db,
     debug: bool = False,
 ) -> dict:
-    """Semantic search: query -> keyword embeddings -> PG similarity -> join Mongo chunks by **PG chunk.mongo_id**.
+    """Semantic search (chunk-only output, with parent file links).
 
-    - Không filter Mongo theo category.
-    - Multi-level output (flat list): chunk -> lesson -> topic -> subject.
+    Mục tiêu đúng theo yêu cầu hiện tại của bạn:
+    - Kết quả hiển thị: chỉ CHUNK
+    - Từ CHUNK suy ra Lesson/Topic/Subject và đính kèm URL file của từng cấp (nếu có)
+
+    Fix quan trọng trong bản này:
+    - `total` luôn KHỚP với số item thực tế (không còn kiểu 2/3)
+    - Nếu có chunk bị hidden hoặc thiếu metadata, nó sẽ bị loại khỏi danh sách và `total` sẽ giảm tương ứng.
     """
 
     query = (q or "").strip()
     if not query:
         return {"total": 0, "items": []}
 
-    dbg: Dict[str, object] = {
-        "service_version": _SERVICE_VERSION,
-        "category": category,
-    }
+    dbg: Dict[str, object] = {"service_version": _SERVICE_VERSION, "category": category}
 
     # 1) Embed query
     kws = _extract_keywords(query)
@@ -187,9 +212,7 @@ def semantic_search(
     # 4) Score per chunk
     chunk_best: Dict[str, float] = {}
     for emb, chunk_id in rows:
-        if not chunk_id:
-            continue
-        if not emb:
+        if not chunk_id or not emb:
             continue
         best = 0.0
         for qe in q_embs:
@@ -200,263 +223,274 @@ def semantic_search(
         if best > prev:
             chunk_best[chunk_id] = best
 
-    ranked: List[Tuple[str, float]] = sorted(chunk_best.items(), key=lambda x: x[1], reverse=True)
-    dbg["ranked_chunks"] = len(ranked)
+    ranked_all: List[Tuple[str, float]] = sorted(chunk_best.items(), key=lambda x: x[1], reverse=True)
+    dbg["ranked_chunks_scored"] = len(ranked_all)
 
-    if not ranked:
+    if not ranked_all:
         res = {"total": 0, "items": []}
         if debug:
             res["debug"] = dbg
         return res
 
-    # 5) Multi-level needs hierarchy; fetch chunk + joins from PG
-    ranked_chunk_ids = [cid for cid, _ in ranked]
+    # ----
+    # IMPORTANT: total/offset/limit phải dựa trên các chunk "có thể hiển thị".
+    # Ta sẽ lọc trước: chunk tồn tại trong PG + không hidden trong Mongo (nếu có doc).
+    # ----
 
-    # only fetch enough for pagination + roll-up
-    # we still need full ranked list for "total" at all levels; but for speed, we cap roll-up to top N
-    # you can increase cap if needed.
-    cap_for_rollup = max(offset + limit, 50)
-    top_chunk_ids = ranked_chunk_ids[:cap_for_rollup]
+    ranked_chunk_ids = [cid for cid, _ in ranked_all]
 
+    # Load minimal chunk rows from PG to know mongo_id + lesson_id (không join chain để tránh rớt).
     try:
         stmt = (
-            select(
-                Chunk.chunk_id,
-                Chunk.chunk_name,
-                Chunk.chunk_type,
-                Chunk.mongo_id,
-                Lesson.lesson_id,
-                Lesson.lesson_name,
-                Lesson.mongo_id,
-                Topic.topic_id,
-                Topic.topic_name,
-                Topic.mongo_id,
-                Subject.subject_id,
-                Subject.subject_name,
-                Subject.mongo_id,
-                Class.class_id,
-                Class.class_name,
-                Class.mongo_id,
-            )
-            .join(Lesson, Lesson.lesson_id == Chunk.lesson_id)
-            .join(Topic, Topic.topic_id == Lesson.topic_id)
-            .join(Subject, Subject.subject_id == Topic.subject_id)
-            .join(Class, Class.class_id == Subject.class_id)
-            .where(Chunk.chunk_id.in_(top_chunk_ids))
+            select(Chunk.chunk_id, Chunk.chunk_name, Chunk.chunk_type, Chunk.mongo_id, Chunk.lesson_id)
+            .where(Chunk.chunk_id.in_(ranked_chunk_ids))
         )
-        pg_rows = list(pg.execute(stmt).all())
+        chunk_rows = list(pg.execute(stmt).all())
     except SQLAlchemyError:
-        pg_rows = []
+        chunk_rows = []
 
-    dbg["pg_chunk_rows"] = len(pg_rows)
-
-    # Map chunk_id -> hierarchy/meta
-    pg_map: Dict[str, dict] = {}
-    chunk_mongo_hex: List[str] = []
-    for r in pg_rows:
-        (
-            chunk_id,
-            chunk_name,
-            chunk_type,
-            chunk_mongo_id,
-            lesson_id_v,
-            lesson_name,
-            lesson_mongo_id,
-            topic_id_v,
-            topic_name,
-            topic_mongo_id,
-            subject_id_v,
-            subject_name,
-            subject_mongo_id,
-            class_id_v,
-            class_name,
-            class_mongo_id,
-        ) = r
-
-        pg_map[chunk_id] = {
-            "chunkID": chunk_id,
-            "chunkName": chunk_name,
-            "chunkType": chunk_type,
-            "chunkMongoId": chunk_mongo_id,
-            "lesson": {"lessonID": lesson_id_v, "lessonName": lesson_name, "mongoId": lesson_mongo_id},
-            "topic": {"topicID": topic_id_v, "topicName": topic_name, "mongoId": topic_mongo_id},
-            "subject": {"subjectID": subject_id_v, "subjectName": subject_name, "mongoId": subject_mongo_id},
-            "class": {"classID": class_id_v, "className": class_name, "mongoId": class_mongo_id},
+    pg_chunk_min: Dict[str, dict] = {}
+    chunk_mongo_hex_all: List[str] = []
+    for r in chunk_rows:
+        cid, cname, ctype, cmongo, lid = r
+        pg_chunk_min[cid] = {
+            "chunkID": cid,
+            "chunkName": cname,
+            "chunkType": ctype,
+            "chunkMongoId": cmongo,
+            "lessonID": lid,
         }
-        if _valid_object_id_hex(chunk_mongo_id or ""):
-            chunk_mongo_hex.append(chunk_mongo_id)
+        if _valid_object_id_hex(cmongo or ""):
+            chunk_mongo_hex_all.append(cmongo)
 
-    dbg["chunk_mongo_ids_found"] = len(chunk_mongo_hex)
+    dbg["pg_chunk_min_rows"] = len(pg_chunk_min)
 
-    # 6) Load chunk docs from Mongo by _id using **chunk.mongo_id**
-    mongo_chunks_by_oid: Dict[str, dict] = {}
-    mongo_chunks_raw = 0
-    mongo_keys_sample: List[str] = []
-    if chunk_mongo_hex:
-        oids = [ObjectId(x) for x in chunk_mongo_hex]
-        cur = mongo_db["chunks"].find({"_id": {"$in": oids}})
-        docs = list(cur)
-        mongo_chunks_raw = len(docs)
-        for d in docs:
-            oid = str(d.get("_id"))
-            mongo_chunks_by_oid[oid] = d
-        if docs:
-            mongo_keys_sample = sorted(list(docs[0].keys()))
+    # Load mongo chunk docs to filter hidden (if found). No category filter.
+    mongo_chunks_by_oid_all = _load_by_oids(mongo_db, "chunks", chunk_mongo_hex_all)
+    dbg["mongo_chunk_docs_loaded"] = len(mongo_chunks_by_oid_all)
 
-    dbg["mongo_chunks_raw"] = mongo_chunks_raw
-    dbg["mongo_chunk_keys_sample"] = mongo_keys_sample
+    visible_ranked: List[Tuple[str, float]] = []
+    dropped_missing_pg = 0
+    dropped_hidden = 0
 
-    # 7) Build chunk items (only those we can show)
-    # also compute roll-up scores
-    lesson_best: Dict[str, float] = {}
-    topic_best: Dict[str, float] = {}
-    subject_best: Dict[str, float] = {}
+    for cid, score in ranked_all:
+        base = pg_chunk_min.get(cid)
+        if not base:
+            dropped_missing_pg += 1
+            continue
 
-    chunk_items: List[dict] = []
+        doc = None
+        oid_hex = base.get("chunkMongoId")
+        if _valid_object_id_hex(oid_hex or ""):
+            doc = mongo_chunks_by_oid_all.get(oid_hex)
 
-    # helper: get score for chunk
-    score_by_chunk = dict(ranked)
+        if doc is not None and not _status_visible(doc):
+            dropped_hidden += 1
+            continue
 
-    for chunk_id in top_chunk_ids:
-        base = pg_map.get(chunk_id)
+        visible_ranked.append((cid, score))
+
+    dbg["dropped_missing_pg"] = dropped_missing_pg
+    dbg["dropped_hidden"] = dropped_hidden
+
+    total = len(visible_ranked)
+    dbg["ranked_chunks_visible"] = total
+
+    page_pairs = visible_ranked[offset : offset + limit]
+    page_chunk_ids = [cid for cid, _ in page_pairs]
+    score_by_chunk = dict(page_pairs)
+
+    if not page_chunk_ids:
+        res = {"total": total, "items": []}
+        if debug:
+            res["debug"] = dbg
+        return res
+
+    # 5) Build hierarchy from PG (không join chain cứng)
+    # We already have chunk minimal; now load lessons/topics/subjects/classes for the page.
+
+    lesson_ids = []
+    for cid in page_chunk_ids:
+        lid = (pg_chunk_min.get(cid) or {}).get("lessonID")
+        if lid:
+            lesson_ids.append(lid)
+
+    # Lessons
+    pg_lessons: Dict[str, dict] = {}
+    topic_ids = []
+    lesson_mongo_hex: List[str] = []
+    if lesson_ids:
+        try:
+            stmt = select(Lesson.lesson_id, Lesson.lesson_name, Lesson.mongo_id, Lesson.topic_id).where(
+                Lesson.lesson_id.in_(list(set(lesson_ids)))
+            )
+            for lid, lname, lmongo, tid in pg.execute(stmt).all():
+                pg_lessons[lid] = {"lessonID": lid, "lessonName": lname, "mongoId": lmongo, "topicID": tid}
+                if tid:
+                    topic_ids.append(tid)
+                if _valid_object_id_hex(lmongo or ""):
+                    lesson_mongo_hex.append(lmongo)
+        except SQLAlchemyError:
+            pass
+
+    # Topics
+    pg_topics: Dict[str, dict] = {}
+    subject_ids = []
+    topic_mongo_hex: List[str] = []
+    if topic_ids:
+        try:
+            stmt = select(Topic.topic_id, Topic.topic_name, Topic.mongo_id, Topic.subject_id).where(
+                Topic.topic_id.in_(list(set(topic_ids)))
+            )
+            for tid, tname, tmongo, sid in pg.execute(stmt).all():
+                pg_topics[tid] = {"topicID": tid, "topicName": tname, "mongoId": tmongo, "subjectID": sid}
+                if sid:
+                    subject_ids.append(sid)
+                if _valid_object_id_hex(tmongo or ""):
+                    topic_mongo_hex.append(tmongo)
+        except SQLAlchemyError:
+            pass
+
+    # Subjects
+    pg_subjects: Dict[str, dict] = {}
+    class_ids = []
+    subject_mongo_hex: List[str] = []
+    if subject_ids:
+        try:
+            stmt = select(Subject.subject_id, Subject.subject_name, Subject.mongo_id, Subject.class_id).where(
+                Subject.subject_id.in_(list(set(subject_ids)))
+            )
+            for sid, sname, smongo, cid in pg.execute(stmt).all():
+                pg_subjects[sid] = {"subjectID": sid, "subjectName": sname, "mongoId": smongo, "classID": cid}
+                if cid:
+                    class_ids.append(cid)
+                if _valid_object_id_hex(smongo or ""):
+                    subject_mongo_hex.append(smongo)
+        except SQLAlchemyError:
+            pass
+
+    # Classes
+    pg_classes: Dict[str, dict] = {}
+    if class_ids:
+        try:
+            stmt = select(Class.class_id, Class.class_name, Class.mongo_id).where(Class.class_id.in_(list(set(class_ids))))
+            for cid, cname, cmongo in pg.execute(stmt).all():
+                pg_classes[cid] = {"classID": cid, "className": cname, "mongoId": cmongo}
+        except SQLAlchemyError:
+            pass
+
+    # 6) Load parent docs from Mongo to get URL (no category filter)
+    mongo_lessons_by_oid = _load_by_oids(mongo_db, "lessons", lesson_mongo_hex)
+    mongo_topics_by_oid = _load_by_oids(mongo_db, "topics", topic_mongo_hex)
+    mongo_subjects_by_oid = _load_by_oids(mongo_db, "subjects", subject_mongo_hex)
+
+    # 7) Build items
+    items: List[dict] = []
+
+    for cid in page_chunk_ids:
+        base = pg_chunk_min.get(cid)
         if not base:
             continue
 
-        s = float(score_by_chunk.get(chunk_id, 0.0))
+        s = float(score_by_chunk.get(cid, 0.0))
 
-        # roll-up
-        lid = base["lesson"]["lessonID"]
-        tid = base["topic"]["topicID"]
-        sid = base["subject"]["subjectID"]
-        if lid:
-            lesson_best[lid] = max(lesson_best.get(lid, 0.0), s)
-        if tid:
-            topic_best[tid] = max(topic_best.get(tid, 0.0), s)
-        if sid:
-            subject_best[sid] = max(subject_best.get(sid, 0.0), s)
-
-        # join mongo chunk doc
+        # mongo chunk doc (for url/name/desc)
         chunk_doc = None
         oid_hex = base.get("chunkMongoId")
         if _valid_object_id_hex(oid_hex or ""):
-            chunk_doc = mongo_chunks_by_oid.get(oid_hex)
+            chunk_doc = mongo_chunks_by_oid_all.get(oid_hex)
 
-        # if doc exists but hidden -> skip
-        if chunk_doc and not _status_visible(chunk_doc):
-            continue
+        # hierarchy
+        lesson_obj = {"lessonID": "", "lessonName": "", "lessonUrl": ""}
+        topic_obj = {"topicID": "", "topicName": "", "topicUrl": ""}
+        subject_obj = {"subjectID": "", "subjectName": "", "subjectUrl": ""}
+        class_obj = {"classID": "", "className": ""}
 
-        # build fields expected by frontend
+        lid = base.get("lessonID")
+        if lid and lid in pg_lessons:
+            l = pg_lessons[lid]
+            lesson_obj["lessonID"] = l.get("lessonID") or ""
+            lesson_obj["lessonName"] = l.get("lessonName") or ""
+
+            l_oid = l.get("mongoId")
+            if _valid_object_id_hex(l_oid or ""):
+                ldoc = mongo_lessons_by_oid.get(l_oid)
+                if ldoc and _status_visible(ldoc):
+                    lesson_obj["lessonUrl"] = ldoc.get("lessonUrl") or ""
+
+            tid = l.get("topicID")
+            if tid and tid in pg_topics:
+                t = pg_topics[tid]
+                topic_obj["topicID"] = t.get("topicID") or ""
+                topic_obj["topicName"] = t.get("topicName") or ""
+
+                t_oid = t.get("mongoId")
+                if _valid_object_id_hex(t_oid or ""):
+                    tdoc = mongo_topics_by_oid.get(t_oid)
+                    if tdoc and _status_visible(tdoc):
+                        topic_obj["topicUrl"] = tdoc.get("topicUrl") or ""
+
+                sid = t.get("subjectID")
+                if sid and sid in pg_subjects:
+                    sub = pg_subjects[sid]
+                    subject_obj["subjectID"] = sub.get("subjectID") or ""
+                    subject_obj["subjectName"] = sub.get("subjectName") or ""
+
+                    s_oid = sub.get("mongoId")
+                    if _valid_object_id_hex(s_oid or ""):
+                        sdoc = mongo_subjects_by_oid.get(s_oid)
+                        if sdoc and _status_visible(sdoc):
+                            subject_obj["subjectUrl"] = sdoc.get("subjectUrl") or ""
+
+                    cid2 = sub.get("classID")
+                    if cid2 and cid2 in pg_classes:
+                        cl = pg_classes[cid2]
+                        class_obj["classID"] = cl.get("classID") or ""
+                        class_obj["className"] = cl.get("className") or ""
+
         item = {
             "type": "chunk",
-            "id": chunk_id,
-            "name": base.get("chunkName") or chunk_doc.get("chunkName") if chunk_doc else base.get("chunkName"),
+            "id": cid,
+            "name": (chunk_doc.get("chunkName") if chunk_doc else None) or base.get("chunkName") or cid,
             "score": s,
-            "chunkID": chunk_id,
+            "chunkID": cid,
             "chunkName": (chunk_doc.get("chunkName") if chunk_doc else None) or base.get("chunkName"),
             "chunkType": (chunk_doc.get("chunkType") if chunk_doc else None) or base.get("chunkType"),
             "chunkUrl": (chunk_doc.get("chunkUrl") if chunk_doc else None),
             "chunkDescription": (chunk_doc.get("chunkDescription") if chunk_doc else None),
             "keywords": (chunk_doc.get("keywords") if chunk_doc else None) or [],
             "isSaved": False,
-            "class": {"classID": base["class"]["classID"], "className": base["class"]["className"]},
-            "subject": {"subjectID": base["subject"]["subjectID"], "subjectName": base["subject"]["subjectName"]},
-            "topic": {"topicID": base["topic"]["topicID"], "topicName": base["topic"]["topicName"]},
-            "lesson": {"lessonID": base["lesson"]["lessonID"], "lessonName": base["lesson"]["lessonName"]},
+            "class": class_obj,
+            "subject": subject_obj,
+            "topic": topic_obj,
+            "lesson": lesson_obj,
         }
 
-        # saved check (optional)
+        # saved check
         try:
-            saved = mongo_db["user_saved_chunks"].find_one({"username": username, "chunkID": chunk_id})
+            saved = mongo_db["user_saved_chunks"].find_one({"username": username, "chunkID": cid})
             item["isSaved"] = bool(saved)
         except Exception:
             pass
 
-        chunk_items.append(item)
+        items.append(item)
 
-    # If we still have 0 mongo chunks, show why
+    # total must match visible ranked count (after filters)
+    res = {"total": total, "items": items}
+
     if debug:
-        dbg["chunk_items_built"] = len(chunk_items)
-        dbg["missing_chunk_ids_in_pg_join"] = [cid for cid in top_chunk_ids if cid not in pg_map]
-        dbg["chunk_mongo_ids_used"] = chunk_mongo_hex[:10]
-
-    # 8) Build lesson/topic/subject items from roll-up
-    # Use PG names from the first chunk that maps to them.
-    # For convenience, build maps from pg_rows.
-    lesson_meta: Dict[str, dict] = {}
-    topic_meta: Dict[str, dict] = {}
-    subject_meta: Dict[str, dict] = {}
-
-    for base in pg_map.values():
-        lid = base["lesson"]["lessonID"]
-        if lid and lid not in lesson_meta:
-            lesson_meta[lid] = {
-                "lessonID": lid,
-                "lessonName": base["lesson"]["lessonName"],
-                "class": {"classID": base["class"]["classID"], "className": base["class"]["className"]},
-                "subject": {"subjectID": base["subject"]["subjectID"], "subjectName": base["subject"]["subjectName"]},
-                "topic": {"topicID": base["topic"]["topicID"], "topicName": base["topic"]["topicName"]},
+        dbg["items_built"] = len(items)
+        dbg["sample_item"] = (
+            {
+                "chunkID": items[0].get("chunkID"),
+                "chunkUrl": bool(items[0].get("chunkUrl")),
+                "lessonUrl": bool((items[0].get("lesson") or {}).get("lessonUrl")),
+                "topicUrl": bool((items[0].get("topic") or {}).get("topicUrl")),
+                "subjectUrl": bool((items[0].get("subject") or {}).get("subjectUrl")),
             }
-        tid = base["topic"]["topicID"]
-        if tid and tid not in topic_meta:
-            topic_meta[tid] = {
-                "topicID": tid,
-                "topicName": base["topic"]["topicName"],
-                "class": {"classID": base["class"]["classID"], "className": base["class"]["className"]},
-                "subject": {"subjectID": base["subject"]["subjectID"], "subjectName": base["subject"]["subjectName"]},
-            }
-        sid = base["subject"]["subjectID"]
-        if sid and sid not in subject_meta:
-            subject_meta[sid] = {
-                "subjectID": sid,
-                "subjectName": base["subject"]["subjectName"],
-                "class": {"classID": base["class"]["classID"], "className": base["class"]["className"]},
-            }
-
-    lesson_items = [
-        {
-            "type": "lesson",
-            "id": lid,
-            "name": lesson_meta.get(lid, {}).get("lessonName") or lid,
-            "score": float(sc),
-            **lesson_meta.get(lid, {}),
-        }
-        for lid, sc in lesson_best.items()
-        if lid in lesson_meta
-    ]
-
-    topic_items = [
-        {
-            "type": "topic",
-            "id": tid,
-            "name": topic_meta.get(tid, {}).get("topicName") or tid,
-            "score": float(sc),
-            **topic_meta.get(tid, {}),
-        }
-        for tid, sc in topic_best.items()
-        if tid in topic_meta
-    ]
-
-    subject_items = [
-        {
-            "type": "subject",
-            "id": sid,
-            "name": subject_meta.get(sid, {}).get("subjectName") or sid,
-            "score": float(sc),
-            **subject_meta.get(sid, {}),
-        }
-        for sid, sc in subject_best.items()
-        if sid in subject_meta
-    ]
-
-    # 9) Merge + sort (chunk -> subject)
-    all_items = chunk_items + lesson_items + topic_items + subject_items
-    all_items.sort(key=lambda x: (_type_priority(x.get("type", "")), -float(x.get("score", 0.0))))
-
-    total = len(all_items)
-    paged = all_items[offset : offset + limit]
-
-    res = {"total": total, "items": paged}
-    if debug:
-        dbg["total_items_after_merge"] = total
+            if items
+            else {}
+        )
         res["debug"] = dbg
+
     return res

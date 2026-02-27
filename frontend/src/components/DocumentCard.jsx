@@ -20,6 +20,10 @@ export default function DocumentCard({ doc, onToggleSave }) {
   const type = doc?.chunkType || doc?.lesson?.lessonType || "";
   const desc = doc?.chunkDescription || "";
 
+  const lessonUrl = doc?.lesson?.lessonUrl || "";
+  const topicUrl = doc?.topic?.topicUrl || "";
+  const subjectUrl = doc?.subject?.subjectUrl || "";
+
   return (
     <div
       style={{
@@ -55,16 +59,13 @@ export default function DocumentCard({ doc, onToggleSave }) {
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ display: "flex", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
           <div style={{ fontSize: 15, fontWeight: 800, color: "#0f172a" }}>{name}</div>
-          {doc?.chunkID ? (
-            <div style={{ fontSize: 12, color: "#64748b" }}>{doc.chunkID}</div>
-          ) : null}
+          {doc?.chunkID ? <div style={{ fontSize: 12, color: "#64748b" }}>{doc.chunkID}</div> : null}
         </div>
+
         <div style={{ marginTop: 4, fontSize: 12.5, color: "#475569" }}>{metaLine(doc)}</div>
 
         {desc ? (
-          <div style={{ marginTop: 8, fontSize: 13, color: "#334155", lineHeight: 1.5 }}>
-            {shortText(desc)}
-          </div>
+          <div style={{ marginTop: 8, fontSize: 13, color: "#334155", lineHeight: 1.5 }}>{shortText(desc)}</div>
         ) : null}
 
         <div style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -82,9 +83,27 @@ export default function DocumentCard({ doc, onToggleSave }) {
           >
             {doc?.isSaved ? "★ Đã lưu" : "☆ Lưu"}
           </button>
+
           {doc?.chunkUrl ? (
             <a className="btn" href={doc.chunkUrl} target="_blank" rel="noreferrer">
-              Mở link
+              Mở chunk
+            </a>
+          ) : null}
+
+          {/* Link suy ra từ chunk -> lesson/topic/subject (nếu có file riêng) */}
+          {lessonUrl ? (
+            <a className="btn" href={lessonUrl} target="_blank" rel="noreferrer" title="File của bài học">
+              Mở bài
+            </a>
+          ) : null}
+          {topicUrl ? (
+            <a className="btn" href={topicUrl} target="_blank" rel="noreferrer" title="File của chủ đề">
+              Mở chủ đề
+            </a>
+          ) : null}
+          {subjectUrl ? (
+            <a className="btn" href={subjectUrl} target="_blank" rel="noreferrer" title="File của môn">
+              Mở môn
             </a>
           ) : null}
         </div>

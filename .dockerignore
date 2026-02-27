@@ -1,0 +1,19 @@
+.git/
+.venv/
+backend/.venv/
+frontend/node_modules/
+frontend/dist/
+**/__pycache__/
+**/*.py[cod]
+**/*.log
+
+# Local env files (copy from *.example instead)
+.env
+.env.*
+backend/.env
+backend/core/config.env
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/

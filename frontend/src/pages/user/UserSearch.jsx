@@ -84,14 +84,13 @@ export default function Search() {
     const urlTopicID = (sp.get("topicID") || "").trim();
     const urlLessonID = (sp.get("lessonID") || "").trim();
 
-    // chỉ set khi khác để tránh loop
     if (urlQ !== q) setQ(urlQ);
     if (urlClassID !== classID) setClassID(urlClassID);
     if (urlSubjectID !== subjectID) setSubjectID(urlSubjectID);
     if (urlTopicID !== topicID) setTopicID(urlTopicID);
     if (urlLessonID !== lessonID) setLessonID(urlLessonID);
 
-    // nếu có query trên URL thì auto search
+    // auto search nếu có q
     if (urlQ) {
       (async () => {
         try {
@@ -106,7 +105,10 @@ export default function Search() {
             limit: 50,
             offset: 0,
           });
-          const items = res?.items || res?.results || [];
+
+          const rawItems = res?.items || res?.results || [];
+          // Chỉ hiển thị chunk. Lesson/Topic/Subject sẽ được suy ra từ chunk và hiển thị link ngay trong card.
+          const items = rawItems.filter((x) => (x?.type || "chunk") === "chunk" || x?.chunkID);
           const total = typeof res?.total === "number" ? res.total : items.length;
           setResult({ total, items });
         } catch (e) {
@@ -204,7 +206,8 @@ export default function Search() {
       ...params,
     });
 
-    const items = res?.items || res?.results || [];
+    const rawItems = res?.items || res?.results || [];
+    const items = rawItems.filter((x) => (x?.type || "chunk") === "chunk" || x?.chunkID);
     const total = typeof res?.total === "number" ? res.total : items.length;
 
     setResult({ total, items });
@@ -236,7 +239,6 @@ export default function Search() {
 
   async function onToggleSave(doc) {
     try {
-      // chỉ chunk mới có save
       if (!doc?.chunkID) return;
       const r = await toggleSave(doc.chunkID);
       setResult((prev) => ({
@@ -316,7 +318,7 @@ export default function Search() {
 
       <div style={{ margin: "10px 0", color: "#0f172a", fontWeight: 800 }}>Kết quả: {totalText}</div>
 
-      {!loading && !err && result.total === 0 ? (
+      {!loading && !err && shown === 0 ? (
         <div className="empty-state">
           <div className="empty-state-icon">🔎</div>
           <div>Chưa có kết quả. Hãy thử đổi từ khoá hoặc chọn bộ lọc khác.</div>
@@ -324,46 +326,9 @@ export default function Search() {
       ) : null}
 
       <div style={{ display: "grid", gap: 12 }}>
-        {(result.items || []).map((d, idx) => {
-          // chunk: giữ UI cũ
-          if ((d?.type || "chunk") === "chunk" || d?.chunkID) {
-            return <DocumentCard key={d.chunkID || `${idx}`} doc={d} onToggleSave={onToggleSave} />;
-          }
-
-          // lesson/topic/subject: card đơn giản
-          const typeLabel = d?.type === "lesson" ? "Bài học" : d?.type === "topic" ? "Chủ đề" : d?.type === "subject" ? "Môn" : d?.type;
-          return (
-            <div
-              key={`${d?.type || "item"}-${d?.id || idx}`}
-              style={{
-                background: "#fff",
-                border: "1px solid #e2e8f0",
-                borderRadius: 14,
-                padding: 14,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: 12,
-              }}
-            >
-              <div style={{ minWidth: 0 }}>
-                <div style={{ fontWeight: 900, color: "#0f172a", marginBottom: 4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                  {typeLabel}: {d?.name || d?.id}
-                </div>
-                <div style={{ color: "#64748b", fontSize: 13, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                  {d?.class?.className ? `Lớp ${d.class.className}` : ""}
-                  {d?.subject?.subjectName ? ` • ${d.subject.subjectName}` : ""}
-                  {d?.topic?.topicName ? ` • ${d.topic.topicName}` : ""}
-                  {d?.lesson?.lessonName ? ` • ${d.lesson.lessonName}` : ""}
-                </div>
-              </div>
-
-              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                <div style={{ fontWeight: 900, color: "#0f172a" }}>{typeof d?.score === "number" ? d.score.toFixed(3) : ""}</div>
-              </div>
-            </div>
-          );
-        })}
+        {(result.items || []).map((d, idx) => (
+          <DocumentCard key={d.chunkID || `${idx}`} doc={d} onToggleSave={onToggleSave} />
+        ))}
       </div>
     </div>
   );
