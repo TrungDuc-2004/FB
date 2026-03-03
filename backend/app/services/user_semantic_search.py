@@ -5,7 +5,7 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from bson import ObjectId
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -15,7 +15,7 @@ from .keyword_embedding import embed_keyword_cached
 _TOKEN_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
 
 # bump this when you replace the file so you can confirm the running code
-_SERVICE_VERSION = "search_chunk_only_parent_links_v2_total_consistent"
+_SERVICE_VERSION = "search_chunk_only_parent_links_lex_first_v1"
 
 
 def _extract_keywords(q: str) -> List[str]:
@@ -39,6 +39,27 @@ def _extract_keywords(q: str) -> List[str]:
             kws.append(t)
 
     return kws[:12]
+
+
+def _lex_terms_from_keywords(kws: List[str]) -> List[str]:
+    """Pick a small set of terms for lexical matching.
+
+    We primarily care about phrases like 'thông tin' and a few longer tokens.
+    """
+    out: List[str] = []
+    for k in kws:
+        k = (k or "").strip()
+        if len(k) < 3:
+            continue
+        # keep the full phrase
+        if " " in k:
+            if k not in out:
+                out.append(k)
+            continue
+        # keep only longer tokens to avoid too-broad matches
+        if len(k) >= 4 and k not in out:
+            out.append(k)
+    return out[:6]
 
 
 def _cosine(a: List[float], b: List[float]) -> float:
@@ -72,6 +93,36 @@ def _status_visible(doc: dict) -> bool:
     # bạn dùng activity/hidden, đôi khi active
     st = (doc or {}).get("status")
     return st not in {"hidden", "HIDDEN"}
+
+
+def _read_keywords_from_chunk_doc(doc: Optional[dict]) -> List[str]:
+    if not doc:
+        return []
+
+    # common variants seen across your repo
+    for k in ("keywordItems", "keywords", "keyword", "keyword_names", "keywordNames"):
+        v = doc.get(k)
+        if not v:
+            continue
+
+        # list of strings
+        if isinstance(v, list) and (len(v) == 0 or isinstance(v[0], str)):
+            return [str(x) for x in v if str(x).strip()]
+
+        # list of dicts like {keywordName: ...}
+        if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
+            out = []
+            for it in v:
+                name = it.get("keywordName") or it.get("name")
+                if name:
+                    out.append(str(name))
+            return out
+
+        # string
+        if isinstance(v, str):
+            return [v]
+
+    return []
 
 
 def _candidate_chunk_ids_from_filters_pg(
@@ -129,26 +180,45 @@ def _load_by_oids(mongo_db, col: str, oid_hex_list: List[str]) -> Dict[str, dict
     if not oid_hex_list:
         return out
     try:
-        # dedupe
-        seen = set()
-        oids = []
-        for x in oid_hex_list:
-            if not _valid_object_id_hex(x):
-                continue
-            if x in seen:
-                continue
-            seen.add(x)
-            oids.append(ObjectId(x))
-
+        oids = [ObjectId(x) for x in oid_hex_list if _valid_object_id_hex(x)]
         if not oids:
             return out
-
         docs = list(mongo_db[col].find({"_id": {"$in": oids}}))
         for d in docs:
             out[str(d.get("_id"))] = d
     except Exception:
         return out
     return out
+
+
+def _pg_chunks_matching_terms(
+    *,
+    pg: Session,
+    terms: List[str],
+    cand_chunks: Optional[List[str]],
+) -> List[str]:
+    """Return chunk_ids where keyword_name ILIKE any term."""
+    if not terms:
+        return []
+
+    try:
+        cond = or_(*[Keyword.keyword_name.ilike(f"%{t}%") for t in terms])
+        stmt = select(Keyword.chunk_id).where(cond)
+        if cand_chunks is not None:
+            if len(cand_chunks) == 0:
+                return []
+            stmt = stmt.where(Keyword.chunk_id.in_(cand_chunks))
+        rows = list(pg.execute(stmt).all())
+        out = []
+        seen = set()
+        for (cid,) in rows:
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            out.append(cid)
+        return out
+    except Exception:
+        return []
 
 
 def semantic_search(
@@ -167,15 +237,22 @@ def semantic_search(
     mongo_db,
     debug: bool = False,
 ) -> dict:
-    """Semantic search (chunk-only output, with parent file links).
+    """Semantic search (chunk-only output), but with **lexical-first** filtering.
 
-    Mục tiêu đúng theo yêu cầu hiện tại của bạn:
-    - Kết quả hiển thị: chỉ CHUNK
-    - Từ CHUNK suy ra Lesson/Topic/Subject và đính kèm URL file của từng cấp (nếu có)
+    Why:
+      You reported "tìm 'thông tin' nhưng chunk không có keyword thông tin".
+      If the query terms can be found lexically in keyword_name, we restrict results
+      to ONLY chunks that have matching keywords.
 
-    Fix quan trọng trong bản này:
-    - `total` luôn KHỚP với số item thực tế (không còn kiểu 2/3)
-    - Nếu có chunk bị hidden hoặc thiếu metadata, nó sẽ bị loại khỏi danh sách và `total` sẽ giảm tương ứng.
+    Flow:
+      - extract keywords from query
+      - (optional) lexical filter: keyword_name ILIKE '%term%'
+      - embed query keywords
+      - score PG Keyword.keyword_embedding -> rank chunks
+      - join Mongo chunks by PG Chunk.mongo_id
+      - attach lesson/topic/subject URLs (also by mongo_id)
+
+    Output: 1 list chỉ gồm chunk items.
     """
 
     query = (q or "").strip()
@@ -184,286 +261,250 @@ def semantic_search(
 
     dbg: Dict[str, object] = {"service_version": _SERVICE_VERSION, "category": category}
 
-    # 1) Embed query
+    # 1) Extract keywords
     kws = _extract_keywords(query)
-    q_embs = [embed_keyword_cached(k) for k in kws]
+    dbg["query_keywords"] = kws[:]
 
     # 2) Candidate restriction by filters (PG graph)
     cand_chunks = _candidate_chunk_ids_from_filters_pg(
         pg=pg, classID=classID, subjectID=subjectID, topicID=topicID, lessonID=lessonID
     )
 
-    # 3) Load PG keywords with embeddings
+    # 3) Lexical-first filter (only if it yields anything)
+    lex_terms = _lex_terms_from_keywords(kws)
+    lex_chunk_ids = _pg_chunks_matching_terms(pg=pg, terms=lex_terms, cand_chunks=cand_chunks)
+    dbg["lex_terms"] = lex_terms
+    dbg["lex_chunk_hits"] = len(lex_chunk_ids)
+
+    # 4) Embed query
+    q_embs = [embed_keyword_cached(k) for k in kws]
+
+    # 5) Load PG keywords with embeddings (also load keyword_name for transparency)
     try:
-        stmt = select(Keyword.keyword_embedding, Keyword.chunk_id).where(Keyword.keyword_embedding.isnot(None))
-        if cand_chunks is not None:
+        stmt = (
+            select(Keyword.keyword_embedding, Keyword.chunk_id, Keyword.keyword_name)
+            .where(Keyword.keyword_embedding.isnot(None))
+        )
+        # if lexical hits exist, restrict to those chunk ids
+        if lex_chunk_ids:
+            stmt = stmt.where(Keyword.chunk_id.in_(lex_chunk_ids))
+        elif cand_chunks is not None:
             if len(cand_chunks) == 0:
                 res = {"total": 0, "items": []}
                 if debug:
                     res["debug"] = {**dbg, "pg_rows_with_embedding": 0, "ranked_chunks": 0}
                 return res
             stmt = stmt.where(Keyword.chunk_id.in_(cand_chunks))
+
         rows = list(pg.execute(stmt).all())
     except SQLAlchemyError:
         rows = []
 
     dbg["pg_rows_with_embedding"] = len(rows)
 
-    # 4) Score per chunk
+    # 6) Score per chunk + keep top matched keyword names
     chunk_best: Dict[str, float] = {}
-    for emb, chunk_id in rows:
+    chunk_top_kw: Dict[str, List[Tuple[float, str]]] = {}
+
+    for emb, chunk_id, kw_name in rows:
         if not chunk_id or not emb:
             continue
+
         best = 0.0
         for qe in q_embs:
             best = max(best, _cosine(list(emb), qe))
         if best <= 0:
             continue
+
         prev = chunk_best.get(chunk_id, 0.0)
         if best > prev:
             chunk_best[chunk_id] = best
 
-    ranked_all: List[Tuple[str, float]] = sorted(chunk_best.items(), key=lambda x: x[1], reverse=True)
-    dbg["ranked_chunks_scored"] = len(ranked_all)
+        if kw_name:
+            arr = chunk_top_kw.get(chunk_id, [])
+            arr.append((best, str(kw_name)))
+            # keep top 5 by score
+            arr.sort(key=lambda x: x[0], reverse=True)
+            chunk_top_kw[chunk_id] = arr[:5]
 
-    if not ranked_all:
+    ranked: List[Tuple[str, float]] = sorted(chunk_best.items(), key=lambda x: x[1], reverse=True)
+    dbg["ranked_chunks"] = len(ranked)
+    dbg["lex_mode"] = bool(lex_chunk_ids)
+
+    if not ranked:
         res = {"total": 0, "items": []}
         if debug:
             res["debug"] = dbg
         return res
 
-    # ----
-    # IMPORTANT: total/offset/limit phải dựa trên các chunk "có thể hiển thị".
-    # Ta sẽ lọc trước: chunk tồn tại trong PG + không hidden trong Mongo (nếu có doc).
-    # ----
-
-    ranked_chunk_ids = [cid for cid, _ in ranked_all]
-
-    # Load minimal chunk rows from PG to know mongo_id + lesson_id (không join chain để tránh rớt).
-    try:
-        stmt = (
-            select(Chunk.chunk_id, Chunk.chunk_name, Chunk.chunk_type, Chunk.mongo_id, Chunk.lesson_id)
-            .where(Chunk.chunk_id.in_(ranked_chunk_ids))
-        )
-        chunk_rows = list(pg.execute(stmt).all())
-    except SQLAlchemyError:
-        chunk_rows = []
-
-    pg_chunk_min: Dict[str, dict] = {}
-    chunk_mongo_hex_all: List[str] = []
-    for r in chunk_rows:
-        cid, cname, ctype, cmongo, lid = r
-        pg_chunk_min[cid] = {
-            "chunkID": cid,
-            "chunkName": cname,
-            "chunkType": ctype,
-            "chunkMongoId": cmongo,
-            "lessonID": lid,
-        }
-        if _valid_object_id_hex(cmongo or ""):
-            chunk_mongo_hex_all.append(cmongo)
-
-    dbg["pg_chunk_min_rows"] = len(pg_chunk_min)
-
-    # Load mongo chunk docs to filter hidden (if found). No category filter.
-    mongo_chunks_by_oid_all = _load_by_oids(mongo_db, "chunks", chunk_mongo_hex_all)
-    dbg["mongo_chunk_docs_loaded"] = len(mongo_chunks_by_oid_all)
-
-    visible_ranked: List[Tuple[str, float]] = []
-    dropped_missing_pg = 0
-    dropped_hidden = 0
-
-    for cid, score in ranked_all:
-        base = pg_chunk_min.get(cid)
-        if not base:
-            dropped_missing_pg += 1
-            continue
-
-        doc = None
-        oid_hex = base.get("chunkMongoId")
-        if _valid_object_id_hex(oid_hex or ""):
-            doc = mongo_chunks_by_oid_all.get(oid_hex)
-
-        if doc is not None and not _status_visible(doc):
-            dropped_hidden += 1
-            continue
-
-        visible_ranked.append((cid, score))
-
-    dbg["dropped_missing_pg"] = dropped_missing_pg
-    dbg["dropped_hidden"] = dropped_hidden
-
-    total = len(visible_ranked)
-    dbg["ranked_chunks_visible"] = total
-
-    page_pairs = visible_ranked[offset : offset + limit]
+    # We will build items and set total = len(items) to avoid confusing "2/3".
+    page_pairs = ranked[offset : offset + limit]
     page_chunk_ids = [cid for cid, _ in page_pairs]
     score_by_chunk = dict(page_pairs)
 
-    if not page_chunk_ids:
-        res = {"total": total, "items": []}
-        if debug:
-            res["debug"] = dbg
-        return res
+    # 7) Fetch chunk + hierarchy from PG (includes mongo_id for each level)
+    try:
+        stmt = (
+            select(
+                Chunk.chunk_id,
+                Chunk.chunk_name,
+                Chunk.chunk_type,
+                Chunk.mongo_id,
+                Lesson.lesson_id,
+                Lesson.lesson_name,
+                Lesson.mongo_id,
+                Topic.topic_id,
+                Topic.topic_name,
+                Topic.mongo_id,
+                Subject.subject_id,
+                Subject.subject_name,
+                Subject.mongo_id,
+                Class.class_id,
+                Class.class_name,
+                Class.mongo_id,
+            )
+            .join(Lesson, Lesson.lesson_id == Chunk.lesson_id)
+            .join(Topic, Topic.topic_id == Lesson.topic_id)
+            .join(Subject, Subject.subject_id == Topic.subject_id)
+            .join(Class, Class.class_id == Subject.class_id)
+            .where(Chunk.chunk_id.in_(page_chunk_ids))
+        )
+        pg_rows = list(pg.execute(stmt).all())
+    except SQLAlchemyError:
+        pg_rows = []
 
-    # 5) Build hierarchy from PG (không join chain cứng)
-    # We already have chunk minimal; now load lessons/topics/subjects/classes for the page.
+    dbg["pg_chunk_rows"] = len(pg_rows)
 
-    lesson_ids = []
-    for cid in page_chunk_ids:
-        lid = (pg_chunk_min.get(cid) or {}).get("lessonID")
-        if lid:
-            lesson_ids.append(lid)
-
-    # Lessons
-    pg_lessons: Dict[str, dict] = {}
-    topic_ids = []
+    # Map chunk_id -> hierarchy/meta (and mongo ids)
+    pg_map: Dict[str, dict] = {}
+    chunk_mongo_hex: List[str] = []
     lesson_mongo_hex: List[str] = []
-    if lesson_ids:
-        try:
-            stmt = select(Lesson.lesson_id, Lesson.lesson_name, Lesson.mongo_id, Lesson.topic_id).where(
-                Lesson.lesson_id.in_(list(set(lesson_ids)))
-            )
-            for lid, lname, lmongo, tid in pg.execute(stmt).all():
-                pg_lessons[lid] = {"lessonID": lid, "lessonName": lname, "mongoId": lmongo, "topicID": tid}
-                if tid:
-                    topic_ids.append(tid)
-                if _valid_object_id_hex(lmongo or ""):
-                    lesson_mongo_hex.append(lmongo)
-        except SQLAlchemyError:
-            pass
-
-    # Topics
-    pg_topics: Dict[str, dict] = {}
-    subject_ids = []
     topic_mongo_hex: List[str] = []
-    if topic_ids:
-        try:
-            stmt = select(Topic.topic_id, Topic.topic_name, Topic.mongo_id, Topic.subject_id).where(
-                Topic.topic_id.in_(list(set(topic_ids)))
-            )
-            for tid, tname, tmongo, sid in pg.execute(stmt).all():
-                pg_topics[tid] = {"topicID": tid, "topicName": tname, "mongoId": tmongo, "subjectID": sid}
-                if sid:
-                    subject_ids.append(sid)
-                if _valid_object_id_hex(tmongo or ""):
-                    topic_mongo_hex.append(tmongo)
-        except SQLAlchemyError:
-            pass
-
-    # Subjects
-    pg_subjects: Dict[str, dict] = {}
-    class_ids = []
     subject_mongo_hex: List[str] = []
-    if subject_ids:
-        try:
-            stmt = select(Subject.subject_id, Subject.subject_name, Subject.mongo_id, Subject.class_id).where(
-                Subject.subject_id.in_(list(set(subject_ids)))
-            )
-            for sid, sname, smongo, cid in pg.execute(stmt).all():
-                pg_subjects[sid] = {"subjectID": sid, "subjectName": sname, "mongoId": smongo, "classID": cid}
-                if cid:
-                    class_ids.append(cid)
-                if _valid_object_id_hex(smongo or ""):
-                    subject_mongo_hex.append(smongo)
-        except SQLAlchemyError:
-            pass
 
-    # Classes
-    pg_classes: Dict[str, dict] = {}
-    if class_ids:
-        try:
-            stmt = select(Class.class_id, Class.class_name, Class.mongo_id).where(Class.class_id.in_(list(set(class_ids))))
-            for cid, cname, cmongo in pg.execute(stmt).all():
-                pg_classes[cid] = {"classID": cid, "className": cname, "mongoId": cmongo}
-        except SQLAlchemyError:
-            pass
+    for r in pg_rows:
+        (
+            chunk_id,
+            chunk_name,
+            chunk_type,
+            chunk_mongo_id,
+            lesson_id_v,
+            lesson_name,
+            lesson_mongo_id,
+            topic_id_v,
+            topic_name,
+            topic_mongo_id,
+            subject_id_v,
+            subject_name,
+            subject_mongo_id,
+            class_id_v,
+            class_name,
+            class_mongo_id,
+        ) = r
 
-    # 6) Load parent docs from Mongo to get URL (no category filter)
+        pg_map[chunk_id] = {
+            "chunkID": chunk_id,
+            "chunkName": chunk_name,
+            "chunkType": chunk_type,
+            "chunkMongoId": chunk_mongo_id,
+            "lesson": {"lessonID": lesson_id_v, "lessonName": lesson_name, "mongoId": lesson_mongo_id},
+            "topic": {"topicID": topic_id_v, "topicName": topic_name, "mongoId": topic_mongo_id},
+            "subject": {"subjectID": subject_id_v, "subjectName": subject_name, "mongoId": subject_mongo_id},
+            "class": {"classID": class_id_v, "className": class_name, "mongoId": class_mongo_id},
+        }
+
+        if _valid_object_id_hex(chunk_mongo_id or ""):
+            chunk_mongo_hex.append(chunk_mongo_id)
+        if _valid_object_id_hex(lesson_mongo_id or ""):
+            lesson_mongo_hex.append(lesson_mongo_id)
+        if _valid_object_id_hex(topic_mongo_id or ""):
+            topic_mongo_hex.append(topic_mongo_id)
+        if _valid_object_id_hex(subject_mongo_id or ""):
+            subject_mongo_hex.append(subject_mongo_id)
+
+    # 8) Load Mongo docs by _id (no category filter)
+    mongo_chunks_by_oid = _load_by_oids(mongo_db, "chunks", chunk_mongo_hex)
     mongo_lessons_by_oid = _load_by_oids(mongo_db, "lessons", lesson_mongo_hex)
     mongo_topics_by_oid = _load_by_oids(mongo_db, "topics", topic_mongo_hex)
     mongo_subjects_by_oid = _load_by_oids(mongo_db, "subjects", subject_mongo_hex)
 
-    # 7) Build items
+    dbg["mongo_chunks_raw"] = len(mongo_chunks_by_oid)
+
+    # 9) Build items (chunk only) + attach parent links
     items: List[dict] = []
+    dropped_hidden = 0
+    dropped_missing_pg_join = 0
 
     for cid in page_chunk_ids:
-        base = pg_chunk_min.get(cid)
+        base = pg_map.get(cid)
         if not base:
+            dropped_missing_pg_join += 1
             continue
 
         s = float(score_by_chunk.get(cid, 0.0))
 
-        # mongo chunk doc (for url/name/desc)
+        # join mongo chunk doc
         chunk_doc = None
         oid_hex = base.get("chunkMongoId")
         if _valid_object_id_hex(oid_hex or ""):
-            chunk_doc = mongo_chunks_by_oid_all.get(oid_hex)
+            chunk_doc = mongo_chunks_by_oid.get(oid_hex)
 
-        # hierarchy
-        lesson_obj = {"lessonID": "", "lessonName": "", "lessonUrl": ""}
-        topic_obj = {"topicID": "", "topicName": "", "topicUrl": ""}
-        subject_obj = {"subjectID": "", "subjectName": "", "subjectUrl": ""}
-        class_obj = {"classID": "", "className": ""}
+        if chunk_doc and not _status_visible(chunk_doc):
+            dropped_hidden += 1
+            continue
 
-        lid = base.get("lessonID")
-        if lid and lid in pg_lessons:
-            l = pg_lessons[lid]
-            lesson_obj["lessonID"] = l.get("lessonID") or ""
-            lesson_obj["lessonName"] = l.get("lessonName") or ""
+        # join parent docs (for url)
+        lesson_doc = None
+        topic_doc = None
+        subject_doc = None
 
-            l_oid = l.get("mongoId")
-            if _valid_object_id_hex(l_oid or ""):
-                ldoc = mongo_lessons_by_oid.get(l_oid)
-                if ldoc and _status_visible(ldoc):
-                    lesson_obj["lessonUrl"] = ldoc.get("lessonUrl") or ""
+        l_oid = base["lesson"].get("mongoId")
+        t_oid = base["topic"].get("mongoId")
+        s_oid = base["subject"].get("mongoId")
 
-            tid = l.get("topicID")
-            if tid and tid in pg_topics:
-                t = pg_topics[tid]
-                topic_obj["topicID"] = t.get("topicID") or ""
-                topic_obj["topicName"] = t.get("topicName") or ""
+        if _valid_object_id_hex(l_oid or ""):
+            lesson_doc = mongo_lessons_by_oid.get(l_oid)
+        if _valid_object_id_hex(t_oid or ""):
+            topic_doc = mongo_topics_by_oid.get(t_oid)
+        if _valid_object_id_hex(s_oid or ""):
+            subject_doc = mongo_subjects_by_oid.get(s_oid)
 
-                t_oid = t.get("mongoId")
-                if _valid_object_id_hex(t_oid or ""):
-                    tdoc = mongo_topics_by_oid.get(t_oid)
-                    if tdoc and _status_visible(tdoc):
-                        topic_obj["topicUrl"] = tdoc.get("topicUrl") or ""
+        # if any parent is hidden, still allow chunk but just don't show parent link
+        lesson_url = lesson_doc.get("lessonUrl") if (lesson_doc and _status_visible(lesson_doc)) else ""
+        topic_url = topic_doc.get("topicUrl") if (topic_doc and _status_visible(topic_doc)) else ""
+        subject_url = subject_doc.get("subjectUrl") if (subject_doc and _status_visible(subject_doc)) else ""
 
-                sid = t.get("subjectID")
-                if sid and sid in pg_subjects:
-                    sub = pg_subjects[sid]
-                    subject_obj["subjectID"] = sub.get("subjectID") or ""
-                    subject_obj["subjectName"] = sub.get("subjectName") or ""
-
-                    s_oid = sub.get("mongoId")
-                    if _valid_object_id_hex(s_oid or ""):
-                        sdoc = mongo_subjects_by_oid.get(s_oid)
-                        if sdoc and _status_visible(sdoc):
-                            subject_obj["subjectUrl"] = sdoc.get("subjectUrl") or ""
-
-                    cid2 = sub.get("classID")
-                    if cid2 and cid2 in pg_classes:
-                        cl = pg_classes[cid2]
-                        class_obj["classID"] = cl.get("classID") or ""
-                        class_obj["className"] = cl.get("className") or ""
+        matched_kw = [name for _, name in chunk_top_kw.get(cid, [])]
 
         item = {
             "type": "chunk",
             "id": cid,
-            "name": (chunk_doc.get("chunkName") if chunk_doc else None) or base.get("chunkName") or cid,
+            "name": base.get("chunkName") or (chunk_doc.get("chunkName") if chunk_doc else cid),
             "score": s,
             "chunkID": cid,
             "chunkName": (chunk_doc.get("chunkName") if chunk_doc else None) or base.get("chunkName"),
             "chunkType": (chunk_doc.get("chunkType") if chunk_doc else None) or base.get("chunkType"),
             "chunkUrl": (chunk_doc.get("chunkUrl") if chunk_doc else None),
             "chunkDescription": (chunk_doc.get("chunkDescription") if chunk_doc else None),
-            "keywords": (chunk_doc.get("keywords") if chunk_doc else None) or [],
+            "keywords": _read_keywords_from_chunk_doc(chunk_doc),
+            "matchedKeywords": matched_kw,
             "isSaved": False,
-            "class": class_obj,
-            "subject": subject_obj,
-            "topic": topic_obj,
-            "lesson": lesson_obj,
+            "class": {"classID": base["class"]["classID"], "className": base["class"]["className"]},
+            "subject": {
+                "subjectID": base["subject"]["subjectID"],
+                "subjectName": base["subject"]["subjectName"],
+                "subjectUrl": subject_url,
+            },
+            "topic": {
+                "topicID": base["topic"]["topicID"],
+                "topicName": base["topic"]["topicName"],
+                "topicUrl": topic_url,
+            },
+            "lesson": {
+                "lessonID": base["lesson"]["lessonID"],
+                "lessonName": base["lesson"]["lessonName"],
+                "lessonUrl": lesson_url,
+            },
         }
 
         # saved check
@@ -475,22 +516,20 @@ def semantic_search(
 
         items.append(item)
 
-    # total must match visible ranked count (after filters)
-    res = {"total": total, "items": items}
+    # total should reflect what we actually return (avoid confusing 2/3)
+    res = {"total": len(items), "items": items}
 
     if debug:
         dbg["items_built"] = len(items)
-        dbg["sample_item"] = (
-            {
+        dbg["dropped_hidden"] = dropped_hidden
+        dbg["dropped_missing_pg_join"] = dropped_missing_pg_join
+        # show why a chunk was returned
+        if items:
+            dbg["sample_item_match"] = {
                 "chunkID": items[0].get("chunkID"),
-                "chunkUrl": bool(items[0].get("chunkUrl")),
-                "lessonUrl": bool((items[0].get("lesson") or {}).get("lessonUrl")),
-                "topicUrl": bool((items[0].get("topic") or {}).get("topicUrl")),
-                "subjectUrl": bool((items[0].get("subject") or {}).get("subjectUrl")),
+                "keywords_in_doc": items[0].get("keywords"),
+                "matchedKeywords": items[0].get("matchedKeywords"),
             }
-            if items
-            else {}
-        )
         res["debug"] = dbg
 
     return res
