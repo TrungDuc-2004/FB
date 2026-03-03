@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import "../../styles/admin/page.css";
 import DocumentCard from "../../components/DocumentCard";
@@ -60,6 +60,9 @@ export default function Search() {
 
   const [result, setResult] = useState({ total: 0, items: [] });
 
+  // tránh race condition: chỉ nhận kết quả của request mới nhất
+  const reqSeqRef = useRef(0);
+
   useEffect(() => {
     (async () => {
       try {
@@ -75,7 +78,7 @@ export default function Search() {
     })();
   }, []);
 
-  // URL -> state (hỗ trợ /user/search?q=...)
+  // URL -> state + auto search
   useEffect(() => {
     const sp = new URLSearchParams(location.search || "");
     const urlQ = (sp.get("q") || "").trim();
@@ -84,41 +87,58 @@ export default function Search() {
     const urlTopicID = (sp.get("topicID") || "").trim();
     const urlLessonID = (sp.get("lessonID") || "").trim();
 
+    // set state (tránh loop)
     if (urlQ !== q) setQ(urlQ);
     if (urlClassID !== classID) setClassID(urlClassID);
     if (urlSubjectID !== subjectID) setSubjectID(urlSubjectID);
     if (urlTopicID !== topicID) setTopicID(urlTopicID);
     if (urlLessonID !== lessonID) setLessonID(urlLessonID);
 
-    // auto search nếu có q
-    if (urlQ) {
-      (async () => {
-        try {
-          setLoading(true);
-          setErr("");
-          const res = await searchDocs({
-            q: urlQ,
-            classID: urlClassID,
-            subjectID: urlSubjectID,
-            topicID: urlTopicID,
-            lessonID: urlLessonID,
-            limit: 50,
-            offset: 0,
-          });
-
-          const rawItems = res?.items || res?.results || [];
-          // Chỉ hiển thị chunk. Lesson/Topic/Subject sẽ được suy ra từ chunk và hiển thị link ngay trong card.
-          const items = rawItems.filter((x) => (x?.type || "chunk") === "chunk" || x?.chunkID);
-          const total = typeof res?.total === "number" ? res.total : items.length;
-          setResult({ total, items });
-        } catch (e) {
-          setErr(String(e?.message || e));
-          setResult({ total: 0, items: [] });
-        } finally {
-          setLoading(false);
-        }
-      })();
+    // nếu không có query thì reset kết quả
+    if (!urlQ) {
+      setResult({ total: 0, items: [] });
+      return;
     }
+
+    const myReq = ++reqSeqRef.current;
+
+    (async () => {
+      try {
+        setLoading(true);
+        setErr("");
+        // reset kết quả để tránh “dính” item cũ
+        setResult({ total: 0, items: [] });
+
+        const res = await searchDocs({
+          q: urlQ,
+          classID: urlClassID,
+          subjectID: urlSubjectID,
+          topicID: urlTopicID,
+          lessonID: urlLessonID,
+          limit: 50,
+          offset: 0,
+        });
+
+        // nếu request này không còn là mới nhất thì bỏ
+        if (myReq !== reqSeqRef.current) return;
+
+        const items = res?.items || res?.results || [];
+        const total = typeof res?.total === "number" ? res.total : items.length;
+
+        // safety: chỉ hiển thị chunk
+        const chunkItems = (items || []).filter((x) => (x?.type || "chunk") === "chunk" || x?.chunkID);
+
+        setResult({ total, items: chunkItems });
+      } catch (e) {
+        if (myReq !== reqSeqRef.current) return;
+        setErr(String(e?.message || e));
+        setResult({ total: 0, items: [] });
+      } finally {
+        if (myReq !== reqSeqRef.current) return;
+        setLoading(false);
+      }
+    })();
+
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.search]);
 
@@ -196,45 +216,21 @@ export default function Search() {
     }
   }
 
-  async function runSearch(params = {}) {
-    const res = await searchDocs({
-      q,
-      classID,
-      subjectID,
-      topicID,
-      lessonID,
-      ...params,
-    });
-
-    const rawItems = res?.items || res?.results || [];
-    const items = rawItems.filter((x) => (x?.type || "chunk") === "chunk" || x?.chunkID);
-    const total = typeof res?.total === "number" ? res.total : items.length;
-
-    setResult({ total, items });
-  }
-
-  async function onSubmit(e) {
+  function onSubmit(e) {
     e?.preventDefault?.();
-    try {
-      setLoading(true);
-      setErr("");
 
-      // giữ query lên URL để refresh vẫn còn
-      const sp = new URLSearchParams();
-      if (q?.trim()) sp.set("q", q.trim());
-      if (classID) sp.set("classID", classID);
-      if (subjectID) sp.set("subjectID", subjectID);
-      if (topicID) sp.set("topicID", topicID);
-      if (lessonID) sp.set("lessonID", lessonID);
-      navigate({ pathname: "/user/search", search: sp.toString() ? `?${sp.toString()}` : "" }, { replace: true });
+    // chỉ update URL. Auto-search sẽ chạy trong useEffect
+    const sp = new URLSearchParams();
+    if (q?.trim()) sp.set("q", q.trim());
+    if (classID) sp.set("classID", classID);
+    if (subjectID) sp.set("subjectID", subjectID);
+    if (topicID) sp.set("topicID", topicID);
+    if (lessonID) sp.set("lessonID", lessonID);
 
-      await runSearch({ limit: 50, offset: 0 });
-    } catch (e2) {
-      setErr(String(e2?.message || e2));
-      setResult({ total: 0, items: [] });
-    } finally {
-      setLoading(false);
-    }
+    navigate(
+      { pathname: "/user/search", search: sp.toString() ? `?${sp.toString()}` : "" },
+      { replace: true }
+    );
   }
 
   async function onToggleSave(doc) {
@@ -251,7 +247,8 @@ export default function Search() {
   }
 
   const shown = (result.items || []).length;
-  const totalText = result.total > shown ? `${shown}/${result.total}` : `${shown}`;
+  // hiển thị count theo items thật (tránh lệch total)
+  const totalText = `${shown}`;
 
   return (
     <div>
