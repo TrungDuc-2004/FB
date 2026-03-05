@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 from bson import ObjectId
@@ -15,7 +16,34 @@ from .keyword_embedding import embed_keyword_cached
 _TOKEN_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
 
 # bump this when you replace the file so you can confirm the running code
-_SERVICE_VERSION = "search_chunk_only_parent_links_lex_first_v1"
+_SERVICE_VERSION = "search_chunk_only_phrase_and_coverage_v2"
+
+
+# Vietnamese-ish stop words + a few generic fillers. Keep it small; we just want to avoid
+# building concepts from "tài liệu", "về", ... which makes lexical matching too broad.
+_STOP = {
+    "tài",
+    "liệu",
+    "về",
+    "của",
+    "cho",
+    "là",
+    "các",
+    "những",
+    "một",
+    "này",
+    "đó",
+    "ở",
+    "trong",
+    "và",
+    "hoặc",
+    "the",
+    "a",
+    "an",
+    "of",
+    "to",
+    "in",
+}
 
 
 def _extract_keywords(q: str) -> List[str]:
@@ -41,6 +69,49 @@ def _extract_keywords(q: str) -> List[str]:
     return kws[:12]
 
 
+def _concepts_from_query(q: str) -> List[str]:
+    """Build *concepts* for phrase search.
+
+    IMPORTANT: We DO NOT want the query to be treated as OR of single tokens.
+    So we prioritize bigrams/phrases ("phần cứng", "máy tính") and only add
+    unigrams when needed (typically English/alpha-numeric like "cpu", "ram", "linux").
+    """
+
+    s = (q or "").strip().lower()
+    if not s:
+        return []
+
+    raw_tokens = [t for t in _TOKEN_RE.findall(s) if t]
+    tokens = [t for t in raw_tokens if t not in _STOP and len(t) >= 2]
+    if not tokens:
+        return []
+
+    concepts: List[str] = []
+
+    # 1) Bigrams first (phrase intent)
+    for i in range(len(tokens) - 1):
+        a, b = tokens[i], tokens[i + 1]
+        if len(a) < 3 or len(b) < 3:
+            continue
+        bg = f"{a} {b}".strip()
+        if bg not in concepts:
+            concepts.append(bg)
+
+    # 2) Add alpha-numeric unigrams (CPU/RAM/Linux/Neo4j...) to not lose intent
+    for t in tokens:
+        if re.search(r"[0-9A-Za-z]", t) and len(t) >= 3:
+            if t not in concepts:
+                concepts.append(t)
+
+    # 3) Fallback: if we failed to build bigrams (single-word query, etc.)
+    if not concepts:
+        for t in tokens:
+            if len(t) >= 3 and t not in concepts:
+                concepts.append(t)
+
+    return concepts[:6]
+
+
 def _lex_terms_from_keywords(kws: List[str]) -> List[str]:
     """Pick a small set of terms for lexical matching.
 
@@ -57,7 +128,8 @@ def _lex_terms_from_keywords(kws: List[str]) -> List[str]:
                 out.append(k)
             continue
         # keep only longer tokens to avoid too-broad matches
-        if len(k) >= 4 and k not in out:
+        # BUT allow short alpha-numeric (cpu/ram) too.
+        if (len(k) >= 4 or (re.search(r"[0-9A-Za-z]", k) and len(k) >= 3)) and k not in out:
             out.append(k)
     return out[:6]
 
@@ -221,6 +293,46 @@ def _pg_chunks_matching_terms(
         return []
 
 
+def _pg_chunks_matching_terms_min_hits(
+    *,
+    pg: Session,
+    terms: List[str],
+    cand_chunks: Optional[List[str]],
+    min_hits: int,
+) -> List[str]:
+    """Return chunk_ids where keyword_name ILIKE terms with >= min_hits coverage.
+
+    We intentionally count coverage by term (AND-ish), not by keyword rows.
+    This prevents phrase queries from being filtered too broadly.
+    """
+
+    if not terms:
+        return []
+    if min_hits <= 1:
+        return _pg_chunks_matching_terms(pg=pg, terms=terms, cand_chunks=cand_chunks)
+
+    counts: Dict[str, int] = defaultdict(int)
+    try:
+        for t in terms:
+            if not t:
+                continue
+            stmt = select(Keyword.chunk_id).where(Keyword.keyword_name.ilike(f"%{t}%"))
+            if cand_chunks is not None:
+                if len(cand_chunks) == 0:
+                    return []
+                stmt = stmt.where(Keyword.chunk_id.in_(cand_chunks))
+            rows = list(pg.execute(stmt).all())
+            # count each chunk once per term
+            seen_term = {cid for (cid,) in rows if cid}
+            for cid in seen_term:
+                counts[cid] += 1
+
+        out = [cid for cid, c in counts.items() if c >= int(min_hits)]
+        return out
+    except Exception:
+        return []
+
+
 def semantic_search(
     *,
     q: str,
@@ -261,23 +373,35 @@ def semantic_search(
 
     dbg: Dict[str, object] = {"service_version": _SERVICE_VERSION, "category": category}
 
-    # 1) Extract keywords
-    kws = _extract_keywords(query)
-    dbg["query_keywords"] = kws[:]
+    # 1) Build concepts (phrase-first, avoid OR on single tokens)
+    concepts = _concepts_from_query(query)
+    dbg["query_concepts"] = concepts[:]
+
+    if not concepts:
+        return {"total": 0, "items": []}
 
     # 2) Candidate restriction by filters (PG graph)
     cand_chunks = _candidate_chunk_ids_from_filters_pg(
         pg=pg, classID=classID, subjectID=subjectID, topicID=topicID, lessonID=lessonID
     )
 
-    # 3) Lexical-first filter (only if it yields anything)
-    lex_terms = _lex_terms_from_keywords(kws)
-    lex_chunk_ids = _pg_chunks_matching_terms(pg=pg, terms=lex_terms, cand_chunks=cand_chunks)
+    # Require >=2 concept coverage when the query has multiple concepts.
+    # This is the key change that makes "phần cứng máy tính" not return
+    # results about "máy tính" OR "phần cứng" alone.
+    must_coverage = 2 if len(concepts) >= 2 else 1
+
+    # 3) Lexical filter (coverage-aware). Only restrict if it yields anything.
+    lex_terms = _lex_terms_from_keywords(concepts)
+    lex_chunk_ids = _pg_chunks_matching_terms_min_hits(
+        pg=pg, terms=lex_terms, cand_chunks=cand_chunks, min_hits=must_coverage
+    )
     dbg["lex_terms"] = lex_terms
     dbg["lex_chunk_hits"] = len(lex_chunk_ids)
 
-    # 4) Embed query
-    q_embs = [embed_keyword_cached(k) for k in kws]
+    dbg["must_coverage"] = must_coverage
+
+    # 4) Embed concepts
+    q_embs = [embed_keyword_cached(c) for c in concepts]
 
     # 5) Load PG keywords with embeddings (also load keyword_name for transparency)
     try:
@@ -302,34 +426,51 @@ def semantic_search(
 
     dbg["pg_rows_with_embedding"] = len(rows)
 
-    # 6) Score per chunk + keep top matched keyword names
-    chunk_best: Dict[str, float] = {}
+    # 6) Score per chunk (coverage + sum). Do NOT use max(sim) anymore.
+    #    This prevents phrase query from degenerating into OR.
+    # NOTE: default provider in this repo is HashEmbedder (see keyword_embedding.py).
+    # For hash vectors (dim=256), unrelated text can still have small non-zero cosine.
+    # We keep threshold modest, and rely on must_coverage>=2 to maintain precision.
+    SIM_TH = 0.18 if must_coverage >= 2 else 0.22
+
+    chunk_concept_best: Dict[str, List[float]] = defaultdict(lambda: [0.0] * len(q_embs))
     chunk_top_kw: Dict[str, List[Tuple[float, str]]] = {}
 
     for emb, chunk_id, kw_name in rows:
         if not chunk_id or not emb:
             continue
 
-        best = 0.0
-        for qe in q_embs:
-            best = max(best, _cosine(list(emb), qe))
-        if best <= 0:
-            continue
+        vec = list(emb)
+        bests = chunk_concept_best[chunk_id]
 
-        prev = chunk_best.get(chunk_id, 0.0)
-        if best > prev:
-            chunk_best[chunk_id] = best
+        max_for_kw = 0.0
+        for i, qe in enumerate(q_embs):
+            sim = _cosine(vec, qe)
+            if sim > max_for_kw:
+                max_for_kw = sim
+            if sim > bests[i]:
+                bests[i] = sim
 
         if kw_name:
             arr = chunk_top_kw.get(chunk_id, [])
-            arr.append((best, str(kw_name)))
-            # keep top 5 by score
+            arr.append((max_for_kw, str(kw_name)))
             arr.sort(key=lambda x: x[0], reverse=True)
             chunk_top_kw[chunk_id] = arr[:5]
 
-    ranked: List[Tuple[str, float]] = sorted(chunk_best.items(), key=lambda x: x[1], reverse=True)
+    chunk_score: Dict[str, float] = {}
+    for cid, bests in chunk_concept_best.items():
+        coverage = sum(1 for s in bests if s >= SIM_TH)
+        if coverage < must_coverage:
+            continue
+        score = float(sum(bests)) + 0.15 * float(coverage)
+        if coverage == len(bests) and len(bests) >= 2:
+            score += 0.10
+        chunk_score[cid] = score
+
+    ranked: List[Tuple[str, float]] = sorted(chunk_score.items(), key=lambda x: x[1], reverse=True)
     dbg["ranked_chunks"] = len(ranked)
     dbg["lex_mode"] = bool(lex_chunk_ids)
+    dbg["sim_th"] = SIM_TH
 
     if not ranked:
         res = {"total": 0, "items": []}
