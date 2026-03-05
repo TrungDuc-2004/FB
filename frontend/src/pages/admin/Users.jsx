@@ -20,7 +20,7 @@ function fmtTime(s) {
 function UserModal({ open, onClose, title, initial, onSave }) {
   const [username, setUsername] = useState(initial?.username || "");
   const [password, setPassword] = useState(""); // edit cũng bắt nhập lại
-  const [role, setRole] = useState(initial?.role || "user");
+  const [role, setRole] = useState(initial?.role || "users");
   const [active, setActive] = useState(initial?.active ?? true);
 
   useEffect(() => {

@@ -16,7 +16,7 @@ from .keyword_embedding import embed_keyword_cached
 _TOKEN_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
 
 # bump this when you replace the file so you can confirm the running code
-_SERVICE_VERSION = "search_chunk_only_phrase_and_coverage_v2"
+_SERVICE_VERSION = "search_chunk_only_phrase_strict_v4_intent_strip"
 
 
 # Vietnamese-ish stop words + a few generic fillers. Keep it small; we just want to avoid
@@ -46,6 +46,153 @@ _STOP = {
 }
 
 
+# Strip intent-style prefixes ONLY when they are clearly just a lead-in, e.g.
+#   "thông tin về phần cứng máy tính" -> "phần cứng máy tính"
+# while keeping searches like "thông tin" or "thông tin dữ liệu" intact.
+_INTENT_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:tìm|tìm\s+kiếm|tra\s+cứu)\s+)?"  # optional leading verb
+    r"(?:(?:các|những)\s+)?"  # optional plural
+    r"(?:(thông\s+tin|tài\s+liệu|kiến\s+thức|nội\s+dung))\s+"  # intent head
+    r"(về|cho|liên\s+quan\s+đến|liên\s+quan\s+tới|nói\s+về)\s+"  # connector
+    r"(.+?)\s*$",
+    flags=re.IGNORECASE | re.UNICODE,
+)
+
+
+def _strip_intent_prefix(q: str) -> Tuple[str, Dict[str, object]]:
+    """Remove only *lead-in* phrases like 'thông tin về ...'.
+
+    Returns (new_query, debug_meta).
+    """
+
+    s = _norm_spaces(q)
+    if not s:
+        return s, {"intent_stripped": False}
+
+    m = _INTENT_PREFIX_RE.match(s)
+    if not m:
+        return s, {"intent_stripped": False}
+
+    head = _norm_spaces(m.group(1) or "")
+    link = _norm_spaces(m.group(2) or "")
+    rest = _norm_spaces(m.group(3) or "")
+    if not rest:
+        return s, {"intent_stripped": False}
+
+    return rest, {"intent_stripped": True, "intent_head": head, "intent_link": link}
+
+
+
+def _norm_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _like_pat(term: str) -> str:
+    """ILIKE pattern tolerant to '_' / multiple separators.
+
+    Example: 'phần cứng' -> '%phần%cứng%'
+    This matches 'phần cứng', 'phần_cứng', 'phần---cứng', ...
+    """
+
+    t = _norm_spaces((term or "").lower())
+    if not t:
+        return "%"
+    t = t.replace(" ", "%")
+    return f"%{t}%"
+
+
+def _tokens_no_stop(q: str) -> list[str]:
+    s = (q or "").strip().lower()
+    if not s:
+        return []
+    raw = [t for t in _TOKEN_RE.findall(s) if t]
+    toks = [t for t in raw if t not in _STOP and len(t) >= 2]
+    return toks
+
+
+def _pg_term_has_hit(*, pg: Session, term: str, cand_chunks: Optional[list[str]]) -> bool:
+    """Return True if term appears in PG keyword_name OR chunk_name (within cand_chunks if provided)."""
+
+    pat = _like_pat(term)
+    try:
+        stmt = select(Keyword.keyword_id).where(Keyword.keyword_name.ilike(pat))
+        if cand_chunks is not None:
+            if len(cand_chunks) == 0:
+                return False
+            stmt = stmt.where(Keyword.chunk_id.in_(cand_chunks))
+        stmt = stmt.limit(1)
+        if list(pg.execute(stmt).all()):
+            return True
+    except Exception:
+        pass
+
+    try:
+        stmt2 = select(Chunk.chunk_id).where(Chunk.chunk_name.ilike(pat))
+        if cand_chunks is not None:
+            if len(cand_chunks) == 0:
+                return False
+            stmt2 = stmt2.where(Chunk.chunk_id.in_(cand_chunks))
+        stmt2 = stmt2.limit(1)
+        if list(pg.execute(stmt2).all()):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _segment_concepts_strict(*, pg: Session, tokens: list[str], cand_chunks: Optional[list[str]]) -> list[str]:
+    """Greedy longest-match segmentation into phrases that actually exist in data.
+
+    Goal: multi-word queries behave like AND (no fallback to single-word OR).
+    We only accept a segmentation if it *covers all tokens* (each token is part of
+    a chosen phrase/unigram that has a hit). Otherwise we return [].
+    """
+
+    if not tokens:
+        return []
+
+    n = len(tokens)
+    max_ngram = 5  # up to 5-gram to catch phrases like 'hệ điều hành linux'
+    out: list[str] = []
+    i = 0
+    covered = 0
+
+    while i < n:
+        found = None
+        # try longest phrase starting at i
+        for L in range(min(max_ngram, n - i), 1, -1):
+            phrase = " ".join(tokens[i : i + L])
+            if _pg_term_has_hit(pg=pg, term=phrase, cand_chunks=cand_chunks):
+                found = phrase
+                out.append(phrase)
+                i += L
+                covered += L
+                break
+
+        if found:
+            continue
+
+        # unigram fallback (still strict, because we must cover all tokens)
+        t = tokens[i]
+        if _pg_term_has_hit(pg=pg, term=t, cand_chunks=cand_chunks):
+            out.append(t)
+            covered += 1
+        i += 1
+
+    # must cover all tokens (otherwise we'd broaden too much)
+    if covered < n:
+        return []
+
+    # de-dup preserve order
+    seen = set()
+    dedup = []
+    for c in out:
+        if c and c not in seen:
+            seen.add(c)
+            dedup.append(c)
+
+    return dedup[:8]
 def _extract_keywords(q: str) -> List[str]:
     s = (q or "").strip()
     if not s:
@@ -91,7 +238,7 @@ def _concepts_from_query(q: str) -> List[str]:
     # 1) Bigrams first (phrase intent)
     for i in range(len(tokens) - 1):
         a, b = tokens[i], tokens[i + 1]
-        if len(a) < 3 or len(b) < 3:
+        if len(a) < 2 or len(b) < 2:
             continue
         bg = f"{a} {b}".strip()
         if bg not in concepts:
@@ -263,34 +410,52 @@ def _load_by_oids(mongo_db, col: str, oid_hex_list: List[str]) -> Dict[str, dict
     return out
 
 
+
+
 def _pg_chunks_matching_terms(
     *,
     pg: Session,
     terms: List[str],
     cand_chunks: Optional[List[str]],
 ) -> List[str]:
-    """Return chunk_ids where keyword_name ILIKE any term."""
+    """Return chunk_ids where keyword_name or chunk_name ILIKE any term."""
     if not terms:
         return []
 
+    out: List[str] = []
+    seen: set[str] = set()
+
     try:
-        cond = or_(*[Keyword.keyword_name.ilike(f"%{t}%") for t in terms])
+        cond = or_(*[Keyword.keyword_name.ilike(_like_pat(t)) for t in terms if t])
         stmt = select(Keyword.chunk_id).where(cond)
         if cand_chunks is not None:
             if len(cand_chunks) == 0:
                 return []
             stmt = stmt.where(Keyword.chunk_id.in_(cand_chunks))
         rows = list(pg.execute(stmt).all())
-        out = []
-        seen = set()
         for (cid,) in rows:
-            if not cid or cid in seen:
-                continue
-            seen.add(cid)
-            out.append(cid)
-        return out
+            if cid and cid not in seen:
+                seen.add(cid)
+                out.append(cid)
     except Exception:
-        return []
+        pass
+
+    try:
+        cond2 = or_(*[Chunk.chunk_name.ilike(_like_pat(t)) for t in terms if t])
+        stmt2 = select(Chunk.chunk_id).where(cond2)
+        if cand_chunks is not None:
+            if len(cand_chunks) == 0:
+                return out
+            stmt2 = stmt2.where(Chunk.chunk_id.in_(cand_chunks))
+        rows2 = list(pg.execute(stmt2).all())
+        for (cid,) in rows2:
+            if cid and cid not in seen:
+                seen.add(cid)
+                out.append(cid)
+    except Exception:
+        pass
+
+    return out
 
 
 def _pg_chunks_matching_terms_min_hits(
@@ -300,37 +465,63 @@ def _pg_chunks_matching_terms_min_hits(
     cand_chunks: Optional[List[str]],
     min_hits: int,
 ) -> List[str]:
-    """Return chunk_ids where keyword_name ILIKE terms with >= min_hits coverage.
+    """Return chunk_ids where >= min_hits distinct terms match (AND-ish).
 
-    We intentionally count coverage by term (AND-ish), not by keyword rows.
-    This prevents phrase queries from being filtered too broadly.
+    Matching sources:
+      - Keyword.keyword_name ILIKE
+      - Chunk.chunk_name ILIKE
+
+    Patterns are tolerant to '_' vs ' ' (see _like_pat).
     """
 
     if not terms:
         return []
+
     if min_hits <= 1:
         return _pg_chunks_matching_terms(pg=pg, terms=terms, cand_chunks=cand_chunks)
 
     counts: Dict[str, int] = defaultdict(int)
+
+    def _chunk_ids_for_term(t: str) -> set[str]:
+        pat = _like_pat(t)
+        ids: set[str] = set()
+        try:
+            stmt = select(Keyword.chunk_id).where(Keyword.keyword_name.ilike(pat))
+            if cand_chunks is not None:
+                if len(cand_chunks) == 0:
+                    return set()
+                stmt = stmt.where(Keyword.chunk_id.in_(cand_chunks))
+            rows = list(pg.execute(stmt).all())
+            ids |= {cid for (cid,) in rows if cid}
+        except Exception:
+            pass
+
+        try:
+            stmt2 = select(Chunk.chunk_id).where(Chunk.chunk_name.ilike(pat))
+            if cand_chunks is not None:
+                if len(cand_chunks) == 0:
+                    return ids
+                stmt2 = stmt2.where(Chunk.chunk_id.in_(cand_chunks))
+            rows2 = list(pg.execute(stmt2).all())
+            ids |= {cid for (cid,) in rows2 if cid}
+        except Exception:
+            pass
+
+        return ids
+
     try:
         for t in terms:
             if not t:
                 continue
-            stmt = select(Keyword.chunk_id).where(Keyword.keyword_name.ilike(f"%{t}%"))
-            if cand_chunks is not None:
-                if len(cand_chunks) == 0:
-                    return []
-                stmt = stmt.where(Keyword.chunk_id.in_(cand_chunks))
-            rows = list(pg.execute(stmt).all())
-            # count each chunk once per term
-            seen_term = {cid for (cid,) in rows if cid}
-            for cid in seen_term:
+            ids = _chunk_ids_for_term(t)
+            for cid in ids:
                 counts[cid] += 1
 
-        out = [cid for cid, c in counts.items() if c >= int(min_hits)]
-        return out
+        return [cid for cid, c in counts.items() if c >= int(min_hits)]
     except Exception:
         return []
+
+
 
 
 def semantic_search(
@@ -349,22 +540,18 @@ def semantic_search(
     mongo_db,
     debug: bool = False,
 ) -> dict:
-    """Semantic search (chunk-only output), but with **lexical-first** filtering.
+    """Semantic search (chunk-only), with **strict AND for multi-word queries**.
 
-    Why:
-      You reported "tìm 'thông tin' nhưng chunk không có keyword thông tin".
-      If the query terms can be found lexically in keyword_name, we restrict results
-      to ONLY chunks that have matching keywords.
+    Requirement (from your report):
+      - Query like "phần cứng máy tính" must NOT return docs about "phần cứng" OR "máy tính" alone.
+      - If we can't satisfy the phrase/AND intent, return empty (no broad fallback).
 
-    Flow:
-      - extract keywords from query
-      - (optional) lexical filter: keyword_name ILIKE '%term%'
-      - embed query keywords
-      - score PG Keyword.keyword_embedding -> rank chunks
-      - join Mongo chunks by PG Chunk.mongo_id
-      - attach lesson/topic/subject URLs (also by mongo_id)
-
-    Output: 1 list chỉ gồm chunk items.
+    Strategy:
+      - If query has >=2 meaningful tokens: strict mode
+          * segment the query into phrases/unigrams that actually exist in PG data
+          * require ALL concepts to match (keyword_name OR chunk_name)
+          * do NOT fallback to looser semantic OR
+      - Otherwise: keep the previous behavior (coverage-aware semantic ranking).
     """
 
     query = (q or "").strip()
@@ -373,52 +560,99 @@ def semantic_search(
 
     dbg: Dict[str, object] = {"service_version": _SERVICE_VERSION, "category": category}
 
-    # 1) Build concepts (phrase-first, avoid OR on single tokens)
-    concepts = _concepts_from_query(query)
-    dbg["query_concepts"] = concepts[:]
+    # Intent lead-in stripping (ONLY for patterns like "thông tin về ...").
+    # This prevents strict-mode from incorrectly requiring "thông tin" to exist as a keyword
+    # when the user is clearly just asking *about* something.
+    stripped_query, intent_meta = _strip_intent_prefix(query)
+    if intent_meta.get("intent_stripped"):
+        dbg["original_query"] = query
+        dbg.update(intent_meta)
+        query = stripped_query
 
-    if not concepts:
-        return {"total": 0, "items": []}
-
-    # 2) Candidate restriction by filters (PG graph)
+    # Candidate restriction by filters (PG graph)
     cand_chunks = _candidate_chunk_ids_from_filters_pg(
         pg=pg, classID=classID, subjectID=subjectID, topicID=topicID, lessonID=lessonID
     )
 
-    # Require >=2 concept coverage when the query has multiple concepts.
-    # This is the key change that makes "phần cứng máy tính" not return
-    # results about "máy tính" OR "phần cứng" alone.
-    must_coverage = 2 if len(concepts) >= 2 else 1
+    tokens = _tokens_no_stop(query)
+    strict_mode = len(tokens) >= 2
 
-    # 3) Lexical filter (coverage-aware). Only restrict if it yields anything.
-    lex_terms = _lex_terms_from_keywords(concepts)
-    lex_chunk_ids = _pg_chunks_matching_terms_min_hits(
-        pg=pg, terms=lex_terms, cand_chunks=cand_chunks, min_hits=must_coverage
-    )
-    dbg["lex_terms"] = lex_terms
-    dbg["lex_chunk_hits"] = len(lex_chunk_ids)
+    # 1) Build concepts
+    if strict_mode:
+        concepts = _segment_concepts_strict(pg=pg, tokens=tokens, cand_chunks=cand_chunks)
+        dbg["strict_mode"] = True
+        dbg["query_tokens"] = tokens
+        dbg["query_concepts"] = concepts[:]
 
-    dbg["must_coverage"] = must_coverage
+        if not concepts:
+            res = {"total": 0, "items": []}
+            if debug:
+                dbg["reason"] = "strict_mode_no_full_coverage"
+                res["debug"] = dbg
+            return res
 
-    # 4) Embed concepts
+        # strict: must match ALL concepts
+        must_coverage = len(concepts)
+        lex_terms = concepts
+
+        lex_chunk_ids = _pg_chunks_matching_terms_min_hits(
+            pg=pg, terms=lex_terms, cand_chunks=cand_chunks, min_hits=must_coverage
+        )
+
+        dbg["lex_terms"] = lex_terms
+        dbg["must_coverage"] = must_coverage
+        dbg["lex_chunk_hits"] = len(lex_chunk_ids)
+
+        if not lex_chunk_ids:
+            res = {"total": 0, "items": []}
+            if debug:
+                dbg["reason"] = "strict_mode_no_lex_hits"
+                res["debug"] = dbg
+            return res
+
+        restrict_chunk_ids = lex_chunk_ids
+
+    else:
+        concepts = _concepts_from_query(query)
+        dbg["strict_mode"] = False
+        dbg["query_concepts"] = concepts[:]
+
+        if not concepts:
+            return {"total": 0, "items": []}
+
+        # legacy: require >=2 concept coverage when we have 2+ concepts
+        must_coverage = 2 if len(concepts) >= 2 else 1
+
+        # Lexical filter (coverage-aware). Only restrict if it yields anything.
+        lex_terms = _lex_terms_from_keywords(concepts)
+        lex_chunk_ids = _pg_chunks_matching_terms_min_hits(
+            pg=pg, terms=lex_terms, cand_chunks=cand_chunks, min_hits=must_coverage
+        )
+        dbg["lex_terms"] = lex_terms
+        dbg["lex_chunk_hits"] = len(lex_chunk_ids)
+        dbg["must_coverage"] = must_coverage
+
+        restrict_chunk_ids = lex_chunk_ids if lex_chunk_ids else cand_chunks
+
+    # 2) Embed concepts (for ranking)
     q_embs = [embed_keyword_cached(c) for c in concepts]
 
-    # 5) Load PG keywords with embeddings (also load keyword_name for transparency)
+    # 3) Load PG keywords with embeddings (also load keyword_name for transparency)
     try:
         stmt = (
             select(Keyword.keyword_embedding, Keyword.chunk_id, Keyword.keyword_name)
             .where(Keyword.keyword_embedding.isnot(None))
         )
-        # if lexical hits exist, restrict to those chunk ids
-        if lex_chunk_ids:
-            stmt = stmt.where(Keyword.chunk_id.in_(lex_chunk_ids))
-        elif cand_chunks is not None:
-            if len(cand_chunks) == 0:
+
+        if restrict_chunk_ids is not None:
+            if len(restrict_chunk_ids) == 0:
                 res = {"total": 0, "items": []}
                 if debug:
-                    res["debug"] = {**dbg, "pg_rows_with_embedding": 0, "ranked_chunks": 0}
+                    dbg["pg_rows_with_embedding"] = 0
+                    dbg["ranked_chunks"] = 0
+                    res["debug"] = dbg
                 return res
-            stmt = stmt.where(Keyword.chunk_id.in_(cand_chunks))
+            stmt = stmt.where(Keyword.chunk_id.in_(restrict_chunk_ids))
 
         rows = list(pg.execute(stmt).all())
     except SQLAlchemyError:
@@ -426,51 +660,87 @@ def semantic_search(
 
     dbg["pg_rows_with_embedding"] = len(rows)
 
-    # 6) Score per chunk (coverage + sum). Do NOT use max(sim) anymore.
-    #    This prevents phrase query from degenerating into OR.
-    # NOTE: default provider in this repo is HashEmbedder (see keyword_embedding.py).
-    # For hash vectors (dim=256), unrelated text can still have small non-zero cosine.
-    # We keep threshold modest, and rely on must_coverage>=2 to maintain precision.
-    SIM_TH = 0.18 if must_coverage >= 2 else 0.22
-
-    chunk_concept_best: Dict[str, List[float]] = defaultdict(lambda: [0.0] * len(q_embs))
+    # 4) Score per chunk
     chunk_top_kw: Dict[str, List[Tuple[float, str]]] = {}
 
-    for emb, chunk_id, kw_name in rows:
-        if not chunk_id or not emb:
-            continue
+    if strict_mode:
+        # Strict mode: lexical filtering already ensures AND.
+        # We use embedding only for ranking; we do NOT drop chunks based on cosine thresholds.
+        chunk_concept_best: Dict[str, List[float]] = defaultdict(lambda: [0.0] * len(q_embs))
 
-        vec = list(emb)
-        bests = chunk_concept_best[chunk_id]
+        for emb, chunk_id, kw_name in rows:
+            if not chunk_id or not emb:
+                continue
+            vec = list(emb)
+            bests = chunk_concept_best[chunk_id]
 
-        max_for_kw = 0.0
-        for i, qe in enumerate(q_embs):
-            sim = _cosine(vec, qe)
-            if sim > max_for_kw:
-                max_for_kw = sim
-            if sim > bests[i]:
-                bests[i] = sim
+            max_for_kw = 0.0
+            for i, qe in enumerate(q_embs):
+                sim = _cosine(vec, qe)
+                if sim > max_for_kw:
+                    max_for_kw = sim
+                if sim > bests[i]:
+                    bests[i] = sim
 
-        if kw_name:
-            arr = chunk_top_kw.get(chunk_id, [])
-            arr.append((max_for_kw, str(kw_name)))
-            arr.sort(key=lambda x: x[0], reverse=True)
-            chunk_top_kw[chunk_id] = arr[:5]
+            if kw_name:
+                arr = chunk_top_kw.get(chunk_id, [])
+                arr.append((max_for_kw, str(kw_name)))
+                arr.sort(key=lambda x: x[0], reverse=True)
+                chunk_top_kw[chunk_id] = arr[:5]
 
-    chunk_score: Dict[str, float] = {}
-    for cid, bests in chunk_concept_best.items():
-        coverage = sum(1 for s in bests if s >= SIM_TH)
-        if coverage < must_coverage:
-            continue
-        score = float(sum(bests)) + 0.15 * float(coverage)
-        if coverage == len(bests) and len(bests) >= 2:
-            score += 0.10
-        chunk_score[cid] = score
+        chunk_score: Dict[str, float] = {}
+        for cid in restrict_chunk_ids or []:
+            bests = chunk_concept_best.get(cid, [0.0] * len(q_embs))
+            coverage = sum(1 for s in bests if s > 0.0)
+            score = float(sum(bests)) + 0.05 * float(coverage)
+            chunk_score[cid] = score
 
-    ranked: List[Tuple[str, float]] = sorted(chunk_score.items(), key=lambda x: x[1], reverse=True)
-    dbg["ranked_chunks"] = len(ranked)
-    dbg["lex_mode"] = bool(lex_chunk_ids)
-    dbg["sim_th"] = SIM_TH
+        ranked: List[Tuple[str, float]] = sorted(chunk_score.items(), key=lambda x: x[1], reverse=True)
+        dbg["ranked_chunks"] = len(ranked)
+        dbg["lex_mode"] = True
+        dbg["sim_th"] = "disabled_in_strict_mode"
+
+    else:
+        # Non-strict: keep coverage + threshold to avoid OR behavior.
+        SIM_TH = 0.18 if must_coverage >= 2 else 0.22
+
+        chunk_concept_best: Dict[str, List[float]] = defaultdict(lambda: [0.0] * len(q_embs))
+
+        for emb, chunk_id, kw_name in rows:
+            if not chunk_id or not emb:
+                continue
+
+            vec = list(emb)
+            bests = chunk_concept_best[chunk_id]
+
+            max_for_kw = 0.0
+            for i, qe in enumerate(q_embs):
+                sim = _cosine(vec, qe)
+                if sim > max_for_kw:
+                    max_for_kw = sim
+                if sim > bests[i]:
+                    bests[i] = sim
+
+            if kw_name:
+                arr = chunk_top_kw.get(chunk_id, [])
+                arr.append((max_for_kw, str(kw_name)))
+                arr.sort(key=lambda x: x[0], reverse=True)
+                chunk_top_kw[chunk_id] = arr[:5]
+
+        chunk_score: Dict[str, float] = {}
+        for cid, bests in chunk_concept_best.items():
+            coverage = sum(1 for s in bests if s >= SIM_TH)
+            if coverage < must_coverage:
+                continue
+            score = float(sum(bests)) + 0.15 * float(coverage)
+            if coverage == len(bests) and len(bests) >= 2:
+                score += 0.10
+            chunk_score[cid] = score
+
+        ranked = sorted(chunk_score.items(), key=lambda x: x[1], reverse=True)
+        dbg["ranked_chunks"] = len(ranked)
+        dbg["lex_mode"] = False
+        dbg["sim_th"] = SIM_TH
 
     if not ranked:
         res = {"total": 0, "items": []}
@@ -478,12 +748,11 @@ def semantic_search(
             res["debug"] = dbg
         return res
 
-    # We will build items and set total = len(items) to avoid confusing "2/3".
     page_pairs = ranked[offset : offset + limit]
     page_chunk_ids = [cid for cid, _ in page_pairs]
     score_by_chunk = dict(page_pairs)
 
-    # 7) Fetch chunk + hierarchy from PG (includes mongo_id for each level)
+    # 5) Fetch chunk + hierarchy from PG
     try:
         stmt = (
             select(
@@ -516,7 +785,7 @@ def semantic_search(
 
     dbg["pg_chunk_rows"] = len(pg_rows)
 
-    # Map chunk_id -> hierarchy/meta (and mongo ids)
+    # Map chunk_id -> hierarchy/meta
     pg_map: Dict[str, dict] = {}
     chunk_mongo_hex: List[str] = []
     lesson_mongo_hex: List[str] = []
@@ -563,7 +832,7 @@ def semantic_search(
         if _valid_object_id_hex(subject_mongo_id or ""):
             subject_mongo_hex.append(subject_mongo_id)
 
-    # 8) Load Mongo docs by _id (no category filter)
+    # 6) Load Mongo docs
     mongo_chunks_by_oid = _load_by_oids(mongo_db, "chunks", chunk_mongo_hex)
     mongo_lessons_by_oid = _load_by_oids(mongo_db, "lessons", lesson_mongo_hex)
     mongo_topics_by_oid = _load_by_oids(mongo_db, "topics", topic_mongo_hex)
@@ -571,7 +840,7 @@ def semantic_search(
 
     dbg["mongo_chunks_raw"] = len(mongo_chunks_by_oid)
 
-    # 9) Build items (chunk only) + attach parent links
+    # 7) Build items
     items: List[dict] = []
     dropped_hidden = 0
     dropped_missing_pg_join = 0
@@ -584,7 +853,6 @@ def semantic_search(
 
         s = float(score_by_chunk.get(cid, 0.0))
 
-        # join mongo chunk doc
         chunk_doc = None
         oid_hex = base.get("chunkMongoId")
         if _valid_object_id_hex(oid_hex or ""):
@@ -594,7 +862,6 @@ def semantic_search(
             dropped_hidden += 1
             continue
 
-        # join parent docs (for url)
         lesson_doc = None
         topic_doc = None
         subject_doc = None
@@ -610,7 +877,6 @@ def semantic_search(
         if _valid_object_id_hex(s_oid or ""):
             subject_doc = mongo_subjects_by_oid.get(s_oid)
 
-        # if any parent is hidden, still allow chunk but just don't show parent link
         lesson_url = lesson_doc.get("lessonUrl") if (lesson_doc and _status_visible(lesson_doc)) else ""
         topic_url = topic_doc.get("topicUrl") if (topic_doc and _status_visible(topic_doc)) else ""
         subject_url = subject_doc.get("subjectUrl") if (subject_doc and _status_visible(subject_doc)) else ""
@@ -648,7 +914,6 @@ def semantic_search(
             },
         }
 
-        # saved check
         try:
             saved = mongo_db["user_saved_chunks"].find_one({"username": username, "chunkID": cid})
             item["isSaved"] = bool(saved)
@@ -657,14 +922,12 @@ def semantic_search(
 
         items.append(item)
 
-    # total should reflect what we actually return (avoid confusing 2/3)
     res = {"total": len(items), "items": items}
 
     if debug:
         dbg["items_built"] = len(items)
         dbg["dropped_hidden"] = dropped_hidden
         dbg["dropped_missing_pg_join"] = dropped_missing_pg_join
-        # show why a chunk was returned
         if items:
             dbg["sample_item_match"] = {
                 "chunkID": items[0].get("chunkID"),

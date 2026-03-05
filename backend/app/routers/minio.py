@@ -88,21 +88,79 @@ def _runtime():
     return client, default_bucket, public_base
 
 
-def _split_virtual(virtual: str, default_bucket: Optional[str], *, allow_empty_key: bool) -> Tuple[str, str]:
-    """
-    Virtual path từ UI -> (bucket, key)
 
-    - Nếu có MINIO_BUCKET: bucket=MINIO_BUCKET, key=virtual (có thể rỗng nếu allow_empty_key=True)
-    - Nếu không có MINIO_BUCKET: virtual phải có dạng: "<bucket>" hoặc "<bucket>/<key>"
+# UI luôn dùng 3 "bucket" ảo: documents/images/video.
+# - Multi-bucket mode: chúng là bucket thật.
+# - Single-bucket mode (MINIO_BUCKET set): ta map documents -> root, images/video -> folder prefix,
+#   và nếu bucket thật tồn tại (bucket_exists) thì ưu tiên dùng bucket thật.
+VIRTUAL_SECTIONS = {"documents", "images", "video"}
+
+def _bucket_exists_safe(client, bucket: str) -> bool:
+    try:
+        return bool(bucket) and client is not None and client.bucket_exists(bucket)
+    except Exception:
+        return False
+
+
+def _split_virtual(
+    virtual: str,
+    default_bucket: Optional[str],
+    client=None,
+    *,
+    allow_empty_key: bool,
+) -> Tuple[str, str]:
+    """Virtual path từ UI -> (bucket, key)
+
+    UI của bạn luôn truyền đường dẫn kiểu: <section>/<...>
+    với section ∈ {documents, images, video}.
+
+    - Nếu không set MINIO_BUCKET: coi section là bucket thật (multi-bucket mode).
+    - Nếu có MINIO_BUCKET (single-bucket mode):
+        * Nếu bucket thật tên section tồn tại -> ưu tiên dùng bucket thật.
+        * Nếu không tồn tại bucket thật:
+            - documents -> map vào root (key bỏ prefix documents/)
+            - images/video -> map vào folder prefix images/ hoặc video/ trong bucket default.
+
+    Hàm này vẫn tương thích với trường hợp client khác gửi key thuần (không có section).
     """
+
     p = clean_path(virtual)
 
+    # single-bucket mode
     if default_bucket:
         if not allow_empty_key and not p:
             raise HTTPException(status_code=400, detail="Path is required")
+        if not p:
+            return default_bucket, ""
+
+        head, tail = (p.split("/", 1) + [""])[:2]  # always 2 items
+        head = (head or "").strip()
+        tail = (tail or "").strip()
+
+        # UI-style: <section>/<key>
+        if head in VIRTUAL_SECTIONS:
+            # If section bucket really exists, treat it as real bucket
+            if _bucket_exists_safe(client, head):
+                if not allow_empty_key and not tail:
+                    raise HTTPException(status_code=400, detail="Thiếu key sau bucket. VD: documents/class-10")
+                return head, tail
+
+            # Otherwise, map into default bucket
+            if head == "documents":
+                # documents maps to root
+                if not allow_empty_key and not tail:
+                    raise HTTPException(status_code=400, detail="Thiếu key sau bucket. VD: documents/class-10")
+                return default_bucket, tail
+
+            # images/video maps to folder prefix under default bucket
+            if not tail:
+                return default_bucket, head
+            return default_bucket, f"{head}/{tail}"
+
+        # Backward compatible: key-only
         return default_bucket, p
 
-    # multi-bucket mode
+    # multi-bucket mode (bucket-per-section)
     if not p:
         if allow_empty_key:
             return "", ""
@@ -123,16 +181,47 @@ def _split_virtual(virtual: str, default_bucket: Optional[str], *, allow_empty_k
     return bucket, key
 
 
+
+
+
 def _to_virtual(default_bucket: Optional[str], bucket: str, key: str) -> str:
+    """Format đường dẫn trả về cho UI.
+
+    UI luôn dùng format: <section>/<key>.
+
+    - Multi-bucket mode: trả "bucket/key".
+    - Single-bucket mode:
+        * Nếu bucket != default_bucket (đã auto-detect bucket thật) -> trả "bucket/key".
+        * Nếu bucket == default_bucket: suy ra section theo prefix (images/, video/), còn lại coi là documents.
     """
-    Format đường dẫn trả về cho UI.
-    - single-bucket: trả key
-    - multi-bucket: trả "bucket/key"
-    """
+
     k = clean_path(key)
+
     if default_bucket:
-        return k
+        # If we ended up using a real bucket that is not the default, behave like multi-bucket.
+        if bucket and bucket != default_bucket:
+            return f"{bucket}/{k}" if k else bucket
+
+        # Map internal key -> virtual section
+        if not k:
+            return "documents"
+
+        # Old data may already include documents/ prefix
+        if k == "documents" or k.startswith("documents/"):
+            rest = k[len("documents/"):] if k.startswith("documents/") else ""
+            return f"documents/{rest}" if rest else "documents"
+
+        for sec in ("images", "video"):
+            if k == sec or k.startswith(sec + "/"):
+                return k
+
+        # Default: documents section maps to root
+        return f"documents/{k}"
+
+    # multi-bucket
     return f"{bucket}/{k}" if k else bucket
+
+
 
 
 def _public_url(client, public_base: str, bucket: str, object_key: str) -> str:
@@ -226,7 +315,7 @@ def open_file(
 ):
     client, default_bucket, _public_base = _runtime()
 
-    bucket, key = _split_virtual(object_key, default_bucket, allow_empty_key=False)
+    bucket, key = _split_virtual(object_key, default_bucket, client, allow_empty_key=False)
     key = clean_path(key)
 
     try:
@@ -246,6 +335,7 @@ def open_file(
 
     media_type = getattr(stat, "content_type", None) or "application/octet-stream"
     return StreamingResponse(_stream_minio_object(resp), media_type=media_type, headers=headers)
+
 
 
 @router.get("/list", summary="Lấy ra cấu trúc list trong MinIO (url mở được ngay qua backend)")
@@ -272,7 +362,7 @@ def list_structure(
         except S3Error as e:
             raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
 
-    bucket, key = _split_virtual(path, default_bucket, allow_empty_key=True)
+    bucket, key = _split_virtual(path, default_bucket, client, allow_empty_key=True)
     key = clean_path(key)
     prefix = folder_marker(key)
 
@@ -280,8 +370,8 @@ def list_structure(
         objects = client.list_objects(bucket, prefix=prefix, recursive=False)
 
         folder_names: Set[str] = set()
-        folders = []
-        files = []
+        folders: List[Dict[str, Any]] = []
+        files: List[Dict[str, Any]] = []
 
         for obj in objects:
             name = obj.object_name
@@ -293,16 +383,16 @@ def list_structure(
             if not rest:
                 continue
 
+            # Folder / prefix
             if getattr(obj, "is_dir", False) or rest.endswith("/") or "/" in rest:
                 folder = rest.strip("/").split("/", 1)[0]
                 if folder:
                     folder_names.add(folder)
                 continue
 
-            object_key = name
+            # File trực tiếp
             file_name = rest.split("/")[-1]
-
-            virtual_key = _to_virtual(default_bucket, bucket, object_key)
+            virtual_key = _to_virtual(default_bucket, bucket, name)
 
             files.append({
                 "object_key": virtual_key,
@@ -312,6 +402,35 @@ def list_structure(
                 "last_modified": obj.last_modified.isoformat() if getattr(obj, "last_modified", None) else None,
                 "url": _backend_open_url(request, virtual_key),
             })
+
+        # FALLBACK: một số MinIO/S3 trả delimiter prefixes không ổn định.
+        # Nếu list recursive=False ra rỗng nhưng prefix thực sự có dữ liệu, ta list recursive=True và tự suy ra level-1.
+        if not folder_names and not files:
+            try:
+                if prefix_has_anything(client, bucket, prefix):
+                    for obj in client.list_objects(bucket, prefix=prefix, recursive=True):
+                        name = obj.object_name
+                        if prefix and name == prefix:
+                            continue
+                        rest = name[len(prefix):] if prefix else name
+                        if not rest:
+                            continue
+                        if "/" in rest:
+                            folder = rest.split("/", 1)[0].strip()
+                            if folder:
+                                folder_names.add(folder)
+                            continue
+                        virtual_key = _to_virtual(default_bucket, bucket, name)
+                        files.append({
+                            "object_key": virtual_key,
+                            "name": rest,
+                            "size": getattr(obj, "size", None),
+                            "etag": getattr(obj, "etag", None),
+                            "last_modified": obj.last_modified.isoformat() if getattr(obj, "last_modified", None) else None,
+                            "url": _backend_open_url(request, virtual_key),
+                        })
+            except Exception:
+                pass
 
         for folder in sorted(folder_names, key=lambda x: x.lower()):
             inner_full = f"{key}/{folder}" if key else folder
@@ -335,14 +454,16 @@ def list_structure(
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
 
 
+
+
 # =================== PUT =================== #
 
 @router.put("/folders/", summary="Đổi tên folder")
 def rename_folder(body: RenameFolderBody):
     client, default_bucket, _ = _runtime()
 
-    b1, old_rel = _split_virtual(body.old_path, default_bucket, allow_empty_key=False)
-    b2, new_rel = _split_virtual(body.new_path, default_bucket, allow_empty_key=False)
+    b1, old_rel = _split_virtual(body.old_path, default_bucket, client, allow_empty_key=False)
+    b2, new_rel = _split_virtual(body.new_path, default_bucket, client, allow_empty_key=False)
 
     if b1 != b2:
         raise HTTPException(status_code=400, detail="Không hỗ trợ rename folder giữa 2 bucket khác nhau")
@@ -415,7 +536,7 @@ def rename_folder(body: RenameFolderBody):
 def rename_object(request: Request, body: RenameObjectBody):
     client, default_bucket, public_base = _runtime()
 
-    bucket, old_key = _split_virtual(body.object_key, default_bucket, allow_empty_key=False)
+    bucket, old_key = _split_virtual(body.object_key, default_bucket, client, allow_empty_key=False)
     old_key = clean_path(old_key)
 
     new_name = os.path.basename(body.new_name.strip())
@@ -465,7 +586,7 @@ def rename_object(request: Request, body: RenameObjectBody):
 def create_folder(body: CreateFolderBody):
     client, default_bucket, _ = _runtime()
 
-    bucket, rel = _split_virtual(body.full_path, default_bucket, allow_empty_key=False)
+    bucket, rel = _split_virtual(body.full_path, default_bucket, client, allow_empty_key=False)
     full_path = clean_path(rel)
 
     marker = folder_marker(full_path)
@@ -506,7 +627,7 @@ async def upload_files_to_path(
     client, default_bucket, public_base = _runtime()
     actor = _get_actor(request)
 
-    bucket, rel = _split_virtual(path, default_bucket, allow_empty_key=True)
+    bucket, rel = _split_virtual(path, default_bucket, client, allow_empty_key=True)
     p = clean_path(rel)
     prefix = folder_marker(p)
 
@@ -641,7 +762,7 @@ async def insert_item(
     actor = _get_actor(request)
     meta = _parse_meta_json(meta_json)
 
-    bucket, rel = _split_virtual(path, default_bucket, allow_empty_key=True)
+    bucket, rel = _split_virtual(path, default_bucket, client, allow_empty_key=True)
     p = clean_path(rel)
     prefix = folder_marker(p)
 
@@ -779,7 +900,7 @@ async def insert_item(
 def delete_folder(path: str = Query(..., min_length=1, description="full path folder, ví dụ documents/class-10")):
     client, default_bucket, _ = _runtime()
 
-    bucket, rel = _split_virtual(path, default_bucket, allow_empty_key=False)
+    bucket, rel = _split_virtual(path, default_bucket, client, allow_empty_key=False)
     p = clean_path(rel)
     prefix = folder_marker(p)
 
@@ -811,7 +932,7 @@ def delete_folder(path: str = Query(..., min_length=1, description="full path fo
 def delete_object(object_key: str = Query(..., min_length=1)):
     client, default_bucket, _ = _runtime()
 
-    bucket, key = _split_virtual(object_key, default_bucket, allow_empty_key=False)
+    bucket, key = _split_virtual(object_key, default_bucket, client, allow_empty_key=False)
     key = clean_path(key)
 
     try:
