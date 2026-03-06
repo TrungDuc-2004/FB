@@ -4,45 +4,55 @@ import "../styles/login.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 
-export default function Login() {
+export default function ForgotPassword() {
   const navigate = useNavigate();
   const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
   const [isLoading, setIsLoading] = useState(false);
 
   async function handleSubmit(e) {
     e.preventDefault();
     setError("");
+    setSuccess("");
 
     const u = username.trim();
-    const pw = password.trim();
+    const pw = newPassword.trim();
+    const cpw = confirmPassword.trim();
 
-    if (!u || !pw) {
+    if (!u || !pw || !cpw) {
       setError("Vui lòng nhập đầy đủ thông tin");
+      return;
+    }
+    if (pw.length < 6) {
+      setError("Mật khẩu mới phải có ít nhất 6 ký tự");
+      return;
+    }
+    if (pw !== cpw) {
+      setError("Mật khẩu xác nhận không khớp");
       return;
     }
 
     setIsLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/admin/postgre/login`, {
+      const res = await fetch(`${API_BASE}/admin/postgre/forgot-password`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: u, password: pw }),
+        body: JSON.stringify({
+          username: u,
+          new_password: pw,
+          confirm_password: cpw,
+        }),
       });
-
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setError(data?.detail || "Đăng nhập thất bại");
+        setError(data?.detail || "Đổi mật khẩu thất bại");
         return;
       }
-
-      localStorage.setItem("role", data.role || "user");
-      localStorage.setItem("user_id", data.user_id || "");
-      localStorage.setItem("username", data.username || u);
-
-      if ((data.role || "").toLowerCase() === "admin") navigate("/admin");
-      else navigate("/user");
+      setSuccess("Đổi mật khẩu thành công. Dữ liệu đã được cập nhật ở PostgreSQL và MongoDB.");
+      setTimeout(() => navigate("/login"), 1200);
     } catch (err) {
       setError(String(err?.message || err || "Network error"));
     } finally {
@@ -53,7 +63,7 @@ export default function Login() {
   return (
     <div className="login-page">
       <div className="background-image"></div>
-      <div className="login-container">
+      <div className="login-container auth-container-wide">
         <div className="login-card">
           <div className="header">
             <div className="logo">
@@ -66,8 +76,7 @@ export default function Login() {
           </div>
 
           <div className="form-container">
-            <h2 className="form-title">Đăng nhập hệ thống</h2>
-
+            <h2 className="form-title">Quên mật khẩu</h2>
             <form className="login-form" onSubmit={handleSubmit}>
               <div className="input-group">
                 <div className="input-field">
@@ -81,13 +90,22 @@ export default function Login() {
                     autoFocus
                   />
                 </div>
-
                 <div className="input-field">
                   <input
                     type="password"
-                    placeholder="Mật khẩu"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Mật khẩu mới"
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    className="input-control"
+                    disabled={isLoading}
+                  />
+                </div>
+                <div className="input-field">
+                  <input
+                    type="password"
+                    placeholder="Xác nhận mật khẩu mới"
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
                     className="input-control"
                     disabled={isLoading}
                   />
@@ -100,15 +118,16 @@ export default function Login() {
                   <span>{error}</span>
                 </div>
               )}
+              {success && <div className="success-message">{success}</div>}
 
               <button type="submit" className="submit-btn" disabled={isLoading}>
-                {isLoading ? "Đang đăng nhập..." : "Đăng nhập"}
+                {isLoading ? "Đang cập nhật..." : "Đặt lại mật khẩu"}
               </button>
             </form>
 
-            <div className="auth-links auth-links-center">
-              <Link to="/register">Đăng ký tài khoản</Link>
-              <Link to="/forgot-password">Quên mật khẩu</Link>
+            <div className="auth-links">
+              <Link to="/login">Quay lại đăng nhập</Link>
+              <Link to="/register">Tạo tài khoản mới</Link>
             </div>
           </div>
         </div>

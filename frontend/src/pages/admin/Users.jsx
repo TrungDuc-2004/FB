@@ -115,6 +115,8 @@ export default function Users() {
 
   // ✅ data từ Mongo
   const [users, setUsers] = useState([]); // {id,username,role,active,updatedAt}
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
 
   // modal
   const [openCreate, setOpenCreate] = useState(false);
@@ -122,6 +124,8 @@ export default function Users() {
   const [editTarget, setEditTarget] = useState(null);
 
   async function reloadUsers() {
+    setLoading(true);
+    setError("");
     const data = await userApi.listUsers({ limit: 500, offset: 0 });
     const docs = data.documents || [];
 
@@ -135,12 +139,14 @@ export default function Users() {
     }));
 
     setUsers(mapped);
+    setLoading(false);
   }
 
   useEffect(() => {
     reloadUsers().catch((e) => {
       console.error(e);
-      alert(`Load users failed: ${e.message || e}`);
+      setError(e.message || String(e));
+      setLoading(false);
     });
   }, []);
 
@@ -284,6 +290,14 @@ export default function Users() {
       </div>
 
       <div className="table-wrapper">
+        {loading ? (
+          <div style={{ padding: 24, textAlign: "center" }}>Đang tải danh sách user...</div>
+        ) : error ? (
+          <div style={{ padding: 24, textAlign: "center" }}>
+            <div style={{ marginBottom: 12, color: "#b42318" }}>Load users failed: {error}</div>
+            <button className="btn btn-primary" onClick={() => reloadUsers().catch((e) => { setError(e.message || String(e)); setLoading(false); })}>Thử lại</button>
+          </div>
+        ) : (
         <DataTable
           pageSize={7}
           columns={columns}
@@ -313,6 +327,7 @@ export default function Users() {
             </div>
           )}
         />
+        )}
       </div>
 
       <UserModal

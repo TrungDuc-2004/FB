@@ -21,21 +21,21 @@ async function httpJson(url, options = {}) {
 
 export function listUsers({ limit = 500, offset = 0 } = {}) {
   const url = new URL(`${API_BASE}/admin/mongo/documents`);
-  url.searchParams.set("collection_name", "user");
+  url.searchParams.set("collection_name", "users");
   url.searchParams.set("limit", String(limit));
   url.searchParams.set("offset", String(offset));
   return httpJson(url.toString(), { method: "GET" });
 }
 
 export function createUser(payload) {
-  return httpJson(`${API_BASE}/admin/mongo/documents/user`, {
+  return httpJson(`${API_BASE}/admin/mongo/documents/users`, {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export function updateUser(oid, payload) {
-  return httpJson(`${API_BASE}/admin/mongo/documents/user/${encodeURIComponent(oid)}`, {
+  return httpJson(`${API_BASE}/admin/mongo/documents/users/${encodeURIComponent(oid)}`, {
     method: "PUT",
     body: JSON.stringify(payload),
   });
