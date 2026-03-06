@@ -20,6 +20,9 @@ from ..services.mongo_client import get_mongo_client
 from ..services.mongo_sync import sync_minio_object_to_mongo
 from ..services.postgre_sync_from_mongo import sync_postgre_from_mongo_auto_ids
 from ..services.neo_sync import sync_neo4j_from_maps_and_pg_ids
+from ..services.media_sync import sync_minio_media_to_mongo
+from ..services.postgre_media_sync import sync_postgre_media_from_mongo
+from ..services.neo_media_sync import sync_media_to_neo4j
 router = APIRouter(
     prefix="/admin/minio",
     tags=["Minio"]
@@ -247,6 +250,16 @@ def _get_actor(request: Request | None) -> str:
     return request.headers.get("x-user") or request.headers.get("x-actor") or "system"
 
 
+def _infer_category_from_path(path: str) -> str:
+    parts = [p for p in clean_path(path).split("/") if p]
+    head = (parts[0] if parts else "").lower()
+    if head == "images":
+        return "image"
+    if head in ("video", "videos"):
+        return "video"
+    return "document"
+
+
 def _parse_meta_json(meta_json: str) -> Dict[str, Any]:
     if not meta_json:
         return {}
@@ -283,6 +296,21 @@ def _hide_mongo_chunk_by_map(chunk_map: str, actor: str = "system") -> None:
         db = mg["db"]
         db["chunks"].update_one(
             {"chunkID": chunk_map},
+            {"$set": {"status": "hidden", "updatedAt": datetime.now(timezone.utc), "updatedBy": actor}},
+        )
+    except Exception:
+        pass
+
+
+
+
+def _hide_mongo_media(collection: str, mongo_id: str, actor: str = "system") -> None:
+    try:
+        mg = get_mongo_client()
+        db = mg["db"]
+        from bson import ObjectId
+        db[collection].update_one(
+            {"_id": ObjectId(mongo_id)},
             {"$set": {"status": "hidden", "updatedAt": datetime.now(timezone.utc), "updatedBy": actor}},
         )
     except Exception:
@@ -761,6 +789,7 @@ async def insert_item(
     client, default_bucket, public_base = _runtime()
     actor = _get_actor(request)
     meta = _parse_meta_json(meta_json)
+    category = _infer_category_from_path(path)
 
     bucket, rel = _split_virtual(path, default_bucket, client, allow_empty_key=True)
     p = clean_path(rel)
@@ -782,7 +811,6 @@ async def insert_item(
         pass
 
     try:
-        # upload minio
         if file:
             client.put_object(
                 bucket,
@@ -802,7 +830,76 @@ async def insert_item(
                 content_type="text/plain",
             )
 
-        # sync mongo
+        if category in ("image", "video"):
+            try:
+                media_res = sync_minio_media_to_mongo(
+                    bucket=bucket,
+                    object_key=object_key,
+                    meta={**meta, "category": category, "name": name or meta.get("name", "")},
+                    actor=actor,
+                )
+            except Exception as e:
+                try:
+                    client.remove_object(bucket, object_key)
+                except Exception:
+                    pass
+                raise HTTPException(status_code=500, detail=f"Mongo media sync failed: {e}") from e
+
+            try:
+                pg_media = sync_postgre_media_from_mongo(
+                    media_type=media_res.media_type,
+                    mongo_id=str(media_res.mongo_id),
+                )
+            except Exception as e:
+                try:
+                    client.remove_object(bucket, object_key)
+                except Exception:
+                    pass
+                _hide_mongo_media(media_res.collection, str(media_res.mongo_id), actor=actor)
+                raise HTTPException(status_code=500, detail=f"Postgre media sync failed: {e}") from e
+
+            neo_info: Dict[str, Any] = {"synced": False, "error": None}
+            try:
+                neo_res = sync_media_to_neo4j(
+                    media_type=pg_media.media_type,
+                    media_id=pg_media.media_id,
+                    mongo_id=pg_media.mongo_id,
+                    follow_id=pg_media.follow_id,
+                    follow_type=pg_media.follow_type,
+                )
+                neo_info = {
+                    "synced": bool(getattr(neo_res, "ok", True)),
+                    "createdOrUpdated": getattr(neo_res, "created_or_updated", {}),
+                    "error": None,
+                }
+            except Exception as e:
+                neo_info = {"synced": False, "error": str(e)}
+
+            return {
+                "status": "inserted",
+                "bucket": bucket,
+                "path": _to_virtual(default_bucket, bucket, p) if p else (bucket if not default_bucket else ""),
+                "object_key": _to_virtual(default_bucket, bucket, object_key),
+                "url": _backend_open_url(request, _to_virtual(default_bucket, bucket, object_key)),
+                "meta_json": meta_json or "",
+                "mongo": {
+                    "collection": media_res.collection,
+                    "mediaType": media_res.media_type,
+                    "mongoId": str(media_res.mongo_id),
+                    "mapID": media_res.map_id,
+                    "followMap": media_res.follow_map,
+                    "followType": media_res.follow_type,
+                },
+                "postgre": {
+                    "mediaId": pg_media.media_id,
+                    "mediaName": pg_media.media_name,
+                    "mongoId": pg_media.mongo_id,
+                    "followId": pg_media.follow_id,
+                    "followType": pg_media.follow_type,
+                },
+                "neo4j": neo_info,
+            }
+
         try:
             sync_res = sync_minio_object_to_mongo(
                 bucket=bucket,
@@ -816,7 +913,7 @@ async def insert_item(
             except Exception:
                 pass
             raise HTTPException(status_code=500, detail=f"Mongo sync failed: {e}") from e
-        # sync postgre (MAP IDs)
+
         try:
             pg_ids = sync_postgre_from_mongo_auto_ids(
                 class_map=sync_res.class_map,
@@ -830,13 +927,10 @@ async def insert_item(
                 client.remove_object(bucket, object_key)
             except Exception:
                 pass
-
-            # nếu là chunk thì ẩn chunk (tránh hiển thị rác)
             if sync_res.chunk_map:
                 _hide_mongo_chunk_by_map(sync_res.chunk_map, actor=actor)
             raise HTTPException(status_code=500, detail=f"Postgre sync failed: {e}") from e
 
-        # sync neo4j (không rollback nếu fail, chỉ trả warning để bạn re-sync sau)
         neo_info: Dict[str, Any] = {"synced": False, "error": None}
         try:
             neo_res = sync_neo4j_from_maps_and_pg_ids(

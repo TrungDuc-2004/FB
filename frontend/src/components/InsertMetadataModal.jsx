@@ -1,4 +1,3 @@
-// frontend/src/components/InsertMetadataModal.jsx
 import { useEffect, useMemo, useState } from "react";
 import "../styles/admin/modal.css";
 
@@ -19,7 +18,6 @@ function inferFolderType(folderName = "") {
   const parts = splitPath(folderName);
   const last = normalizeFolderType(parts[parts.length - 1] || "");
   if (["subject", "topic", "lesson", "chunk"].includes(last)) return last;
-  // fallback: nếu không rõ thì coi như subject (theo flow bạn đang dùng)
   return "subject";
 }
 
@@ -47,9 +45,8 @@ function parseTopicMap(topic_map = "") {
   if (!m) return null;
   const subject_map = m[1];
   const topicNumber = m[2];
-  const class_map = deriveClassMapFromSubjectMap(subject_map);
   return {
-    class_map,
+    class_map: deriveClassMapFromSubjectMap(subject_map),
     subject_map,
     topic_map: s,
     topicNumber,
@@ -64,9 +61,8 @@ function parseLessonMap(lesson_map = "") {
   const topicNumber = m[2];
   const lessonNumber = m[3];
   const topic_map = `${subject_map}_CD${topicNumber}`;
-  const class_map = deriveClassMapFromSubjectMap(subject_map);
   return {
-    class_map,
+    class_map: deriveClassMapFromSubjectMap(subject_map),
     subject_map,
     topic_map,
     lesson_map: s,
@@ -85,9 +81,8 @@ function parseChunkMap(chunk_map = "") {
   const chunkNumber = m[4];
   const topic_map = `${subject_map}_CD${topicNumber}`;
   const lesson_map = `${topic_map}_B${lessonNumber}`;
-  const class_map = deriveClassMapFromSubjectMap(subject_map);
   return {
-    class_map,
+    class_map: deriveClassMapFromSubjectMap(subject_map),
     subject_map,
     topic_map,
     lesson_map,
@@ -98,69 +93,95 @@ function parseChunkMap(chunk_map = "") {
   };
 }
 
+function parseMediaMapID(mapID = "") {
+  const s = String(mapID || "").trim();
+  const m = s.match(/^(IMG|VD)_(.+)$/i);
+  if (!m) return null;
+  const prefix = m[1].toUpperCase();
+  const followMap = m[2];
+  const chunk = parseChunkMap(followMap);
+  if (chunk) return { prefix, followType: "chunk", followMap, ...chunk };
+  const lesson = parseLessonMap(followMap);
+  if (lesson) return { prefix, followType: "lesson", followMap, ...lesson };
+  const topic = parseTopicMap(followMap);
+  if (topic) return { prefix, followType: "topic", followMap, ...topic };
+  return {
+    prefix,
+    followType: "subject",
+    followMap,
+    class_map: deriveClassMapFromSubjectMap(followMap),
+    subject_map: followMap,
+    topic_map: "",
+    lesson_map: "",
+    chunk_map: "",
+  };
+}
+
 function defaultMeta(folderType, category) {
   return {
-    // file
     name: "",
-
-    // map ids
     class_map: "",
     subject_map: "",
     topic_map: "",
     lesson_map: "",
     chunk_map: "",
-
-    // display/name fields (giảm tối đa)
     subjectName: "",
     subjectTitle: "",
-
     topicName: "",
-
     lessonName: "",
     lessonType: "",
-
     chunkName: "",
     chunkType: "",
     keywords: "",
     chunkDescription: "",
-
-    // derived numbers (không bắt nhập)
     topicNumber: "",
     lessonNumber: "",
     chunkNumber: "",
-
-    // category dựa theo bucket
     category,
-
-    // hint
     folderType,
+    mapID: "",
+    imgDescription: "",
+    videoDescription: "",
   };
 }
 
-function toPayload(meta) {
-  // Gửi map chain đầy đủ cho backend (backend có thể tự derive, nhưng gửi đủ để không gãy)
+function toDocumentPayload(meta) {
   const m = { ...meta };
-
-  // alias camelCase
   m.classMap = m.class_map;
   m.subjectMap = m.subject_map;
   m.topicMap = m.topic_map;
   m.lessonMap = m.lesson_map;
   m.chunkMap = m.chunk_map;
-
-  // alias "ID" để Postgre sync dễ đọc
   m.classID = m.class_map;
   m.subjectID = m.subject_map;
   m.topicID = m.topic_map;
   m.lessonID = m.lesson_map;
   m.chunkID = m.chunk_map;
-
   return m;
+}
+
+function toMediaPayload(meta, category, file) {
+  const name = String(meta.name || file?.name || "").trim();
+  const out = {
+    name,
+    category,
+    folderType: meta.folderType,
+    mapID: String(meta.mapID || "").trim(),
+  };
+  if (category === "image") {
+    out.imgName = name;
+    out.imgDescription = String(meta.imgDescription || "").trim();
+  } else {
+    out.videoName = name;
+    out.videoDescription = String(meta.videoDescription || "").trim();
+  }
+  return out;
 }
 
 export default function InsertMetadataModal({ open, onClose, folderName, onInsert }) {
   const folderType = useMemo(() => inferFolderType(folderName), [folderName]);
   const category = useMemo(() => inferCategory(folderName), [folderName]);
+  const isMedia = category === "image" || category === "video";
 
   const [meta, setMeta] = useState(() => defaultMeta(folderType, category));
   const [file, setFile] = useState(null);
@@ -171,48 +192,36 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
     setFile(null);
   }, [open, folderType, category]);
 
-  // ====== Derive chain từ "map sâu nhất" (user chỉ cần nhập 1 ô) ======
   useEffect(() => {
-    if (!open) return;
-
+    if (!open || isMedia) return;
     setMeta((prev) => {
       const next = { ...prev };
-
       if (folderType === "subject") {
-        if (next.subject_map) {
-          next.class_map = next.class_map || deriveClassMapFromSubjectMap(next.subject_map);
-        }
+        if (next.subject_map) next.class_map = next.class_map || deriveClassMapFromSubjectMap(next.subject_map);
         return next;
       }
-
       if (folderType === "topic") {
-        if (!next.topic_map) return next;
         const d = parseTopicMap(next.topic_map);
-        if (!d) return next;
-        return { ...next, ...d };
+        return d ? { ...next, ...d } : next;
       }
-
       if (folderType === "lesson") {
-        if (!next.lesson_map) return next;
         const d = parseLessonMap(next.lesson_map);
-        if (!d) return next;
-        return { ...next, ...d };
+        return d ? { ...next, ...d } : next;
       }
-
       if (folderType === "chunk") {
-        if (!next.chunk_map) return next;
         const d = parseChunkMap(next.chunk_map);
         if (!d) return next;
-
-        // chunkType mặc định = lessonType nếu chưa có
         if (!next.chunkType && next.lessonType) d.chunkType = next.lessonType;
-
         return { ...next, ...d };
       }
-
       return next;
     });
-  }, [open, folderType, meta.subject_map, meta.topic_map, meta.lesson_map, meta.chunk_map, meta.lessonType]);
+  }, [open, isMedia, folderType, meta.subject_map, meta.topic_map, meta.lesson_map, meta.chunk_map, meta.lessonType]);
+
+  const mediaDerived = useMemo(() => {
+    if (!isMedia || !meta.mapID) return null;
+    return parseMediaMapID(meta.mapID);
+  }, [isMedia, meta.mapID]);
 
   if (!open) return null;
 
@@ -220,59 +229,66 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
     setMeta((prev) => ({ ...prev, [k]: v }));
   }
 
-  function submit(e) {
-    e.preventDefault();
-
-    // validate map sâu nhất
-    const needMapKey =
-      folderType === "chunk" ? "chunk_map" : folderType === "lesson" ? "lesson_map" : folderType === "topic" ? "topic_map" : "subject_map";
-
-    const mv = String(meta[needMapKey] || "").trim();
-    if (!mv) {
-      alert(`Vui lòng nhập ${needMapKey}`);
-      return;
+  function validateMedia() {
+    const mapID = String(meta.mapID || "").trim();
+    if (!mapID) {
+      alert("Vui lòng nhập mapID");
+      return false;
     }
-
-    // validate file/name
-    const hasName = String(meta.name || "").trim();
-    if (!file && !hasName) {
-      alert("Vui lòng nhập tên file (có đuôi) hoặc chọn file");
-      return;
+    const parsed = parseMediaMapID(mapID);
+    if (!parsed) {
+      alert("mapID không đúng format");
+      return false;
     }
-
-    // chunk folder: khuyến nghị có keyword
-    if (folderType === "chunk") {
-      const kw = String(meta.keywords || "").trim();
-      if (!kw) {
-        const ok = window.confirm("Bạn chưa nhập keywords. Vẫn tiếp tục insert?");
-        if (!ok) return;
-      }
-
-      // chunk bắt buộc phải có lesson_map (để Postgre biết cha trực tiếp)
-      if (!String(meta.lesson_map || "").trim()) {
-        alert("chunk_map không đúng format. VD: TH10_CD1_B1_C1");
-        return;
-      }
+    const expectedPrefix = category === "image" ? "IMG" : "VD";
+    if (parsed.prefix !== expectedPrefix) {
+      alert(`mapID phải bắt đầu bằng ${expectedPrefix}_`);
+      return false;
     }
-
-    onInsert({ meta: toPayload(meta), file });
+    if (parsed.followType !== folderType) {
+      alert(`mapID đang là cấp ${parsed.followType}, nhưng thư mục hiện tại là ${folderType}`);
+      return false;
+    }
+    if (!file && !String(meta.name || "").trim()) {
+      alert("Vui lòng nhập tên file hoặc chọn file");
+      return false;
+    }
+    return true;
   }
 
-  const titleMap = {
-    subject: "Insert (Subject)",
-    topic: "Insert (Topic)",
-    lesson: "Insert (Lesson)",
-    chunk: "Insert (Chunk)",
-  };
+  function validateDocument() {
+    const needMapKey =
+      folderType === "chunk" ? "chunk_map" : folderType === "lesson" ? "lesson_map" : folderType === "topic" ? "topic_map" : "subject_map";
+    if (!String(meta[needMapKey] || "").trim()) {
+      alert(`Vui lòng nhập ${needMapKey}`);
+      return false;
+    }
+    if (!file && !String(meta.name || "").trim()) {
+      alert("Vui lòng nhập tên file (có đuôi) hoặc chọn file");
+      return false;
+    }
+    if (folderType === "chunk" && !String(meta.lesson_map || "").trim()) {
+      alert("chunk_map không đúng format. VD: TH10_CD1_B1_C1");
+      return false;
+    }
+    return true;
+  }
 
-  const subtitleMap = {
-    subject: "Chỉ cần nhập subject_map (VD TH10). Class sẽ suy ra (L10).",
-    topic: "Chỉ cần nhập topic_map (VD TH10_CD1).",
-    lesson: "Chỉ cần nhập lesson_map (VD TH10_CD1_B1).",
-    chunk: "Chỉ cần nhập chunk_map (VD TH10_CD1_B1_C1). Lesson sẽ suy ra (TH10_CD1_B1).",
-  };
+  function submit(e) {
+    e.preventDefault();
+    if (isMedia) {
+      if (!validateMedia()) return;
+      onInsert({ meta: toMediaPayload(meta, category, file), file });
+      return;
+    }
+    if (!validateDocument()) return;
+    if (folderType === "chunk" && !String(meta.keywords || "").trim()) {
+      const ok = window.confirm("Bạn chưa nhập keywords. Vẫn tiếp tục insert?");
+      if (!ok) return;
+    }
+    onInsert({ meta: toDocumentPayload(meta), file });
+  }
 
-  // ====== Field sets (giảm tối đa theo yêu cầu) ======
   const mapFieldByType = {
     subject: "subject_map",
     topic: "topic_map",
@@ -287,115 +303,123 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
     chunk: ["chunkName", "chunkType", "keywords", "chunkDescription"],
   };
 
-  const label = {
-    subject_map: "subject_map (VD: TH10)",
-    topic_map: "topic_map (VD: TH10_CD1)",
-    lesson_map: "lesson_map (VD: TH10_CD1_B1)",
-    chunk_map: "chunk_map (VD: TH10_CD1_B1_C1)",
-
-    subjectName: "Subject Name (tên môn)",
-    subjectTitle: "Subject Title",
-
-    topicName: "Topic Name",
-
-    lessonName: "Lesson Name",
-    lessonType: "Lesson Type (tùy chọn)",
-
-    chunkName: "Chunk Name",
-    chunkType: "Chunk Type (VD: pdf/docx/video...)",
-    keywords: "Keywords (phân tách bằng , ; xuống dòng)",
-    chunkDescription: "Chunk Description",
-
-    name: "Tên file (nếu không chọn file)",
-  };
-
-  const placeholder = {
-    subject_map: "TH10",
-    topic_map: "TH10_CD1",
-    lesson_map: "TH10_CD1_B1",
-    chunk_map: "TH10_CD1_B1_C1",
-
-    subjectName: "Tin học",
-    subjectTitle: "Tin học 10",
-
-    topicName: "Chủ đề 1",
-
-    lessonName: "Bài 1",
-    lessonType: "theory / practice / ...",
-
-    chunkName: "Phân tích đề thi...",
-    chunkType: "docx / pdf / video",
-    keywords: "keyword1, keyword2",
-    chunkDescription: "Mô tả ngắn...",
-
-    name: "vd: bai1.docx (phải có đuôi)",
-  };
-
-  function renderInput(k) {
-    const commonProps = {
-      id: k,
-      value: meta[k] ?? "",
-      onChange: (e) => change(k, e.target.value),
-      placeholder: placeholder[k] || "",
-    };
-
-    if (k === "chunkDescription") {
-      return <textarea {...commonProps} className="kv-input" rows={3} />;
-    }
-
-    return <input {...commonProps} />;
-  }
-
   const mapKey = mapFieldByType[folderType] || "subject_map";
   const infoFields = infoFieldsByType[folderType] || [];
 
-  // ====== show derived chain để user kiểm (readonly) ======
-  const derivedRows = [
-    { k: "class_map", v: meta.class_map },
-    { k: "subject_map", v: meta.subject_map },
-    { k: "topic_map", v: meta.topic_map },
-    { k: "lesson_map", v: meta.lesson_map },
-  ].filter((x) => x.v);
+  const titleMap = {
+    subject: isMedia ? `Upload ${category === "image" ? "Image" : "Video"} (Subject)` : "Insert (Subject)",
+    topic: isMedia ? `Upload ${category === "image" ? "Image" : "Video"} (Topic)` : "Insert (Topic)",
+    lesson: isMedia ? `Upload ${category === "image" ? "Image" : "Video"} (Lesson)` : "Insert (Lesson)",
+    chunk: isMedia ? `Upload ${category === "image" ? "Image" : "Video"} (Chunk)` : "Insert (Chunk)",
+  };
+
+  const mapHintByType = {
+    subject: category === "image" ? "IMG_TH10" : "VD_TH10",
+    topic: category === "image" ? "IMG_TH10_CD1" : "VD_TH10_CD1",
+    lesson: category === "image" ? "IMG_TH10_CD1_B1" : "VD_TH10_CD1_B1",
+    chunk: category === "image" ? "IMG_TH10_CD1_B1_C1" : "VD_TH10_CD1_B1_C1",
+  };
+
+  const derivedRows = isMedia
+    ? [
+        { k: "class_map", v: mediaDerived?.class_map },
+        { k: "subject_map", v: mediaDerived?.subject_map },
+        { k: "topic_map", v: mediaDerived?.topic_map },
+        { k: "lesson_map", v: mediaDerived?.lesson_map },
+        { k: "chunk_map", v: mediaDerived?.chunk_map },
+      ].filter((x) => x.v)
+    : [
+        { k: "class_map", v: meta.class_map },
+        { k: "subject_map", v: meta.subject_map },
+        { k: "topic_map", v: meta.topic_map },
+        { k: "lesson_map", v: meta.lesson_map },
+      ].filter((x) => x.v);
+
+  function renderInput(key) {
+    if (key === "keywords" || key === "chunkDescription" || key === "imgDescription" || key === "videoDescription") {
+      return (
+        <textarea
+          id={key}
+          value={meta[key] || ""}
+          onChange={(e) => change(key, e.target.value)}
+          placeholder={
+            key === "keywords"
+              ? "CPU, RAM, Mainboard"
+              : key === "imgDescription"
+                ? "Mô tả ảnh"
+                : key === "videoDescription"
+                  ? "Mô tả video"
+                  : "Mô tả"
+          }
+          rows={4}
+        />
+      );
+    }
+    return (
+      <input
+        id={key}
+        value={meta[key] || ""}
+        onChange={(e) => change(key, e.target.value)}
+        placeholder={
+          key === mapKey
+            ? (folderType === "subject" ? "TH10" : folderType === "topic" ? "TH10_CD1" : folderType === "lesson" ? "TH10_CD1_B1" : "TH10_CD1_B1_C1")
+            : key === "name"
+              ? "ten_file.pdf"
+              : ""
+        }
+      />
+    );
+  }
 
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <h3 className="modal-title">{titleMap[folderType] || "Insert"}</h3>
-          <p className="modal-subtitle">{subtitleMap[folderType] || ""}</p>
-          <button className="modal-close" onClick={onClose}>
-            ×
-          </button>
+          <p className="modal-subtitle">
+            {isMedia
+              ? `Nhập mapID đúng cấp ${folderType}. Ví dụ: ${mapHintByType[folderType]}`
+              : folderType === "subject"
+                ? "Chỉ cần nhập subject_map (VD TH10). Class sẽ suy ra (L10)."
+                : folderType === "topic"
+                  ? "Chỉ cần nhập topic_map (VD TH10_CD1)."
+                  : folderType === "lesson"
+                    ? "Chỉ cần nhập lesson_map (VD TH10_CD1_B1)."
+                    : "Chỉ cần nhập chunk_map (VD TH10_CD1_B1_C1). Lesson sẽ suy ra (TH10_CD1_B1)."}
+          </p>
+          <button className="modal-close" onClick={onClose}>×</button>
         </div>
 
-        {/* form phải là flex để body cuộn */}
         <form className="modal-form" onSubmit={submit}>
           <div className="modal-body">
             <div className="modal-note" style={{ marginTop: 0 }}>
-              <div>
-                <strong>Đang ở:</strong> {folderName || "(root)"}
-              </div>
-              <div>
-                <strong>Folder type:</strong> {folderType}
-              </div>
-              <div>
-                <strong>Category (from bucket):</strong> {category}
-              </div>
+              <div><strong>Đang ở:</strong> {folderName || "(root)"}</div>
+              <div><strong>Folder type:</strong> {folderType}</div>
+              <div><strong>Category:</strong> {category}</div>
             </div>
 
-            {/* MAP (chỉ 1 ô nhập) */}
             <div style={{ marginTop: 16, marginBottom: 8, fontWeight: 600, color: "#0f172a" }}>
               Mapping ID
             </div>
 
             <div className="form-grid">
               <div className="field">
-                <label htmlFor={mapKey}>{label[mapKey]}</label>
-                {renderInput(mapKey)}
+                <label htmlFor={isMedia ? "mapID" : mapKey}>
+                  {isMedia ? `mapID (VD: ${mapHintByType[folderType]})` : mapKey}
+                </label>
+                {isMedia ? (
+                  <input
+                    id="mapID"
+                    value={meta.mapID}
+                    onChange={(e) => change("mapID", e.target.value)}
+                    placeholder={mapHintByType[folderType]}
+                  />
+                ) : (
+                  renderInput(mapKey)
+                )}
               </div>
             </div>
 
-            {/* Derived chain (readonly) */}
             {derivedRows.length > 0 && (
               <div className="modal-note" style={{ marginTop: 12 }}>
                 <strong>Map suy ra:</strong>
@@ -405,51 +429,62 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
                       {r.k}: {r.v}
                     </div>
                   ))}
-                  {folderType === "chunk" && meta.chunk_map ? (
-                    <div style={{ fontFamily: "monospace", fontSize: 12 }}>
-                      chunk_map: {meta.chunk_map}
-                    </div>
+                  {isMedia && mediaDerived?.followType ? (
+                    <div style={{ fontFamily: "monospace", fontSize: 12 }}>follow_type: {mediaDerived.followType}</div>
                   ) : null}
                 </div>
               </div>
             )}
 
-            {/* INFO */}
             <div style={{ marginTop: 16, marginBottom: 8, fontWeight: 600, color: "#0f172a" }}>
               Thông tin
             </div>
 
-            <div className="form-grid">
-              {infoFields
-                .filter((k) => k !== "chunkDescription")
-                .map((k) => (
-                  <div className="field" key={k}>
-                    <label htmlFor={k}>{label[k]}</label>
-                    {renderInput(k)}
+            {isMedia ? (
+              <>
+                <div className="field">
+                  <label htmlFor="name">{category === "image" ? "Tên ảnh" : "Tên video"}</label>
+                  <input
+                    id="name"
+                    value={meta.name}
+                    onChange={(e) => change("name", e.target.value)}
+                    placeholder={category === "image" ? "so_do_cpu.png" : "gioi_thieu_cpu.mp4"}
+                  />
+                </div>
+                <div className="field" style={{ marginTop: 16 }}>
+                  <label htmlFor={category === "image" ? "imgDescription" : "videoDescription"}>
+                    {category === "image" ? "Mô tả ảnh" : "Mô tả video"}
+                  </label>
+                  {renderInput(category === "image" ? "imgDescription" : "videoDescription")}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="form-grid">
+                  {infoFields.filter((k) => k !== "chunkDescription").map((k) => (
+                    <div className="field" key={k}>
+                      <label htmlFor={k}>{k}</label>
+                      {renderInput(k)}
+                    </div>
+                  ))}
+                </div>
+                {infoFields.includes("chunkDescription") && (
+                  <div className="field" style={{ marginTop: 16 }}>
+                    <label htmlFor="chunkDescription">chunkDescription</label>
+                    {renderInput("chunkDescription")}
                   </div>
-                ))}
-            </div>
-
-            {infoFields.includes("chunkDescription") && (
-              <div className="field" style={{ marginTop: 16 }}>
-                <label htmlFor="chunkDescription">{label.chunkDescription}</label>
-                {renderInput("chunkDescription")}
-              </div>
+                )}
+                <div className="field" style={{ marginTop: 8 }}>
+                  <label htmlFor="name">Tên file (nếu không chọn file)</label>
+                  <input
+                    id="name"
+                    value={meta.name}
+                    onChange={(e) => change("name", e.target.value)}
+                    placeholder="ten_file.pdf"
+                  />
+                </div>
+              </>
             )}
-
-            {/* File name + upload */}
-            <div className="field" style={{ marginTop: 8 }}>
-              <label htmlFor="name">{label.name}</label>
-              <input
-                id="name"
-                value={meta.name}
-                onChange={(e) => change("name", e.target.value)}
-                placeholder={placeholder.name}
-              />
-              <div style={{ fontSize: 12, color: "rgba(15,23,42,0.6)", marginTop: 8 }}>
-                Nếu bạn chọn file bên dưới thì có thể để trống tên.
-              </div>
-            </div>
 
             <div className="field">
               <label htmlFor="file">Chọn file (tuỳ chọn)</label>
@@ -462,18 +497,16 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
             </div>
 
             <div className="modal-note">
-              <strong>Lưu ý:</strong> URL lưu vào Mongo sẽ dùng <code>MINIO_PUBLIC_BASE_URL</code> + <code>/{"<bucket>"}/{"<object_key>"}</code>.
-              Chunk sẽ lưu quan hệ <code>lessonID = lesson_map</code> để Postgre sync.
+              <strong>Lưu ý:</strong>{" "}
+              {isMedia
+                ? "MongoDB sẽ là nguồn gốc metadata. Postgre chỉ lưu quan hệ media và Neo4j sẽ tự sync node group theo follow_type."
+                : <>URL lưu vào Mongo sẽ dùng <code>MINIO_PUBLIC_BASE_URL</code> + <code>/&lt;bucket&gt;/&lt;object_key&gt;</code>.</>}
             </div>
           </div>
 
           <div className="modal-footer">
-            <button className="btn" type="button" onClick={onClose}>
-              Huỷ
-            </button>
-            <button className="btn btn-primary" type="submit">
-              Insert
-            </button>
+            <button className="btn" type="button" onClick={onClose}>Huỷ</button>
+            <button className="btn btn-primary" type="submit">Insert</button>
           </div>
         </form>
       </div>
