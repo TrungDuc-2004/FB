@@ -8,7 +8,6 @@ import RequireRole from "./components/RequireRole";
 import AdminLayout from "./layouts/AdminLayout";
 import UserLayout from "./layouts/UserLayout";
 
-import AdminHome from "./pages/admin/Home";
 import MinioPage from "./pages/admin/MinIO";
 import MongoPage from "./pages/admin/MongoDB";
 import PostgresPage from "./pages/admin/PostgreSQL";
@@ -40,7 +39,7 @@ export default function App() {
             </RequireRole>
           }
         >
-          <Route index element={<AdminHome />} />
+          <Route index element={<Navigate to="minio" replace />} />
           <Route path="minio" element={<MinioPage />} />
           <Route path="mongo" element={<MongoPage />} />
           <Route path="postgres" element={<PostgresPage />} />

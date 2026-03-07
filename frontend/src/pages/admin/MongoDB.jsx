@@ -1,5 +1,5 @@
 // pages/admin/MongoDB.jsx
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import "../../styles/admin/page.css";
 import "../../styles/admin/modal.css";
 import DataTable from "../../components/DataTable";
@@ -44,6 +44,14 @@ function parseValue(v) {
   if (/^-?\d+(\.\d+)?$/.test(s)) return Number(s);
 
   return s;
+}
+
+function formatBytes(bytes = 0) {
+  const value = Number(bytes || 0);
+  if (!value) return "0 KB";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(2)} MB`;
 }
 
 function defaultPairsForCollection(col) {
@@ -324,6 +332,7 @@ function DocumentModal({ open, onClose, title, initialDoc, onSave, collectionNam
 
 /** ===== Modal: Bulk Import XLSX ===== */
 function ImportXlsxModal({ open, onClose, onImported }) {
+  const fileInputRef = useRef(null);
   const [file, setFile] = useState(null);
   const [sync, setSync] = useState(true);
   const [category, setCategory] = useState("document");
@@ -341,6 +350,18 @@ function ImportXlsxModal({ open, onClose, onImported }) {
       setError("");
     }
   }, [open]);
+
+  const mongoSummary = [
+    { key: "classes", label: "Classes" },
+    { key: "subjects", label: "Subjects" },
+    { key: "topics", label: "Topics" },
+    { key: "lessons", label: "Lessons" },
+    { key: "chunks", label: "Chunks" },
+  ];
+
+  function openFilePicker() {
+    fileInputRef.current?.click();
+  }
 
   async function runImport() {
     if (!file) {
@@ -364,75 +385,176 @@ function ImportXlsxModal({ open, onClose, onImported }) {
   if (!open) return null;
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" style={{ width: 720 }} onClick={(e) => e.stopPropagation()}>
-        <div className="modal-header">
-          <h3>Import metadata (XLSX)</h3>
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal import-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header import-modal-header">
+          <div>
+            <h3 className="modal-title">Import metadata (XLSX)</h3>
+            <p className="modal-subtitle">
+              Upsert dữ liệu vào MongoDB và có thể đồng bộ sang PostgreSQL + Neo4j ngay trong một lần import.
+            </p>
+          </div>
           <button className="modal-close" onClick={onClose}>
             ✕
           </button>
         </div>
 
-        <div className="modal-body">
-          <p style={{ marginTop: 0 }}>
-            Import sẽ upsert vào MongoDB (classes/subjects/topics/lessons/chunks) và (tuỳ chọn) sync sang PostgreSQL + Neo4j.
-          </p>
+        <div className="modal-body import-modal-body">
+          <div className="import-hero">
+            <div className="import-hero-icon">⇪</div>
+            <div>
+              <div className="import-hero-title">Nạp dữ liệu metadata từ file Excel</div>
+              <p className="import-hero-text">
+                File sẽ được upsert vào MongoDB theo các cấp classes / subjects / topics / lessons / chunks.
+                Bạn có thể bật thêm sync để đẩy dữ liệu liên quan sang PostgreSQL và Neo4j.
+              </p>
+            </div>
+          </div>
 
-          <p style={{ marginTop: 0 }}>
-            Template (map IDs, không cần ref):{" "}
-            <a href="/templates/Metadata_MapID_Template.xlsx" target="_blank" rel="noreferrer">
-              Metadata_MapID_Template.xlsx
-            </a>
-          </p>
+          <div className="import-grid">
+            <section className="import-card">
+              <div className="import-card-head">
+                <div>
+                  <div className="import-card-title">Tệp import</div>
+                  <div className="import-card-desc">Chọn file .xlsx hoặc .xlsm theo đúng template.</div>
+                </div>
+                <a
+                  className="import-template-link"
+                  href="/templates/Metadata_MapID_Template.xlsx"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Tải template
+                </a>
+              </div>
 
-          <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
-            <input
-              type="file"
-              accept=".xlsx,.xlsm"
-              onChange={(e) => setFile(e.target.files?.[0] || null)}
-            />
+              <input
+                ref={fileInputRef}
+                className="import-hidden-input"
+                type="file"
+                accept=".xlsx,.xlsm"
+                onChange={(e) => setFile(e.target.files?.[0] || null)}
+              />
 
-            <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <input type="checkbox" checked={sync} onChange={(e) => setSync(e.target.checked)} />
-              Sync PostgreSQL + Neo4j
-            </label>
+              <div
+                className={`import-upload-box ${file ? "has-file" : ""}`}
+                onClick={openFilePicker}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    openFilePicker();
+                  }
+                }}
+              >
+                <div className="import-upload-icon">📄</div>
+                {file ? (
+                  <>
+                    <div className="import-upload-title">{file.name}</div>
+                    <div className="import-upload-meta">Dung lượng: {formatBytes(file.size)}</div>
+                  </>
+                ) : (
+                  <>
+                    <div className="import-upload-title">Kéo thả hoặc bấm để chọn file</div>
+                    <div className="import-upload-meta">Hỗ trợ .xlsx, .xlsm</div>
+                  </>
+                )}
+              </div>
 
-            <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              Category
-              <select value={category} onChange={(e) => setCategory(e.target.value)}>
-                <option value="document">document</option>
-                <option value="image">image</option>
-                <option value="video">video</option>
-              </select>
-            </label>
+              <div className="import-upload-actions">
+                <button type="button" className="btn" onClick={openFilePicker}>
+                  Chọn file
+                </button>
+                {file ? (
+                  <button type="button" className="btn" onClick={() => setFile(null)}>
+                    Bỏ chọn
+                  </button>
+                ) : null}
+              </div>
+            </section>
+
+            <section className="import-card">
+              <div className="import-card-title">Tùy chọn xử lý</div>
+              <div className="import-card-desc import-card-desc-spaced">
+                Cấu hình đồng bộ dữ liệu phụ trợ trước khi chạy import.
+              </div>
+
+              <label className={`import-toggle ${sync ? "is-on" : ""}`}>
+                <span className="import-toggle-copy">
+                  <strong>Sync PostgreSQL + Neo4j</strong>
+                  <small>{sync ? "Đồng bộ ngay sau khi import" : "Chỉ import MongoDB"}</small>
+                </span>
+                <span className="import-toggle-switch" aria-hidden="true">
+                  <span className="import-toggle-knob" />
+                </span>
+                <input type="checkbox" checked={sync} onChange={(e) => setSync(e.target.checked)} />
+              </label>
+
+              <div className="field import-field-compact">
+                <label htmlFor="import-category">Category</label>
+                <select
+                  id="import-category"
+                  className="kv-input"
+                  value={category}
+                  onChange={(e) => setCategory(e.target.value)}
+                >
+                  <option value="document">document</option>
+                  <option value="image">image</option>
+                  <option value="video">video</option>
+                </select>
+              </div>
+
+              <div className="import-badges">
+                <span className="import-badge">MongoDB</span>
+                <span className="import-badge">PostgreSQL</span>
+                <span className="import-badge">Neo4j</span>
+              </div>
+            </section>
           </div>
 
           {error ? (
-            <div className="empty-state" style={{ marginBottom: 12 }}>
-              <div className="empty-state-icon">⚠️</div>
-              <p style={{ whiteSpace: "pre-wrap" }}>{error}</p>
+            <div className="import-status import-status-error">
+              <div className="import-status-icon">⚠️</div>
+              <div>
+                <div className="import-status-title">Import thất bại</div>
+                <div className="import-status-text" style={{ whiteSpace: "pre-wrap" }}>{error}</div>
+              </div>
             </div>
           ) : null}
 
           {result ? (
-            <div className="empty-state" style={{ marginBottom: 12 }}>
-              <div className="empty-state-icon">✅</div>
-              <p style={{ whiteSpace: "pre-wrap" }}>
-                Mongo: classes(+{result?.mongo?.classes?.inserted}/~{result?.mongo?.classes?.updated}),
-                subjects(+{result?.mongo?.subjects?.inserted}/~{result?.mongo?.subjects?.updated}),
-                topics(+{result?.mongo?.topics?.inserted}/~{result?.mongo?.topics?.updated}),
-                lessons(+{result?.mongo?.lessons?.inserted}/~{result?.mongo?.lessons?.updated}),
-                chunks(+{result?.mongo?.chunks?.inserted}/~{result?.mongo?.chunks?.updated})\n
-                Sync: ok={result?.sync?.ok}, failed={result?.sync?.failed}\n
-                Errors: {Array.isArray(result?.errors) ? result.errors.length : 0}
-              </p>
+            <div className="import-status import-status-success">
+              <div className="import-status-icon">✅</div>
+              <div className="import-status-content">
+                <div className="import-status-title">Import thành công</div>
+                <div className="import-result-grid">
+                  {mongoSummary.map((item) => {
+                    const row = result?.mongo?.[item.key] || {};
+                    return (
+                      <div key={item.key} className="import-result-card">
+                        <div className="import-result-label">{item.label}</div>
+                        <div className="import-result-values">
+                          <span>+{row.inserted || 0} inserted</span>
+                          <span>~{row.updated || 0} updated</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="import-result-summary">
+                  <span>Sync OK: <strong>{result?.sync?.ok || 0}</strong></span>
+                  <span>Sync lỗi: <strong>{result?.sync?.failed || 0}</strong></span>
+                  <span>Tổng lỗi: <strong>{Array.isArray(result?.errors) ? result.errors.length : 0}</strong></span>
+                </div>
+              </div>
             </div>
           ) : null}
 
           {result?.errors?.length ? (
-            <details>
-              <summary>Xem lỗi</summary>
-              <pre style={{ maxHeight: 220, overflow: "auto" }}>{JSON.stringify(result.errors.slice(0, 50), null, 2)}</pre>
+            <details className="import-errors">
+              <summary>Xem chi tiết lỗi</summary>
+              <pre>{JSON.stringify(result.errors.slice(0, 50), null, 2)}</pre>
             </details>
           ) : null}
         </div>
@@ -442,7 +564,7 @@ function ImportXlsxModal({ open, onClose, onImported }) {
             Đóng
           </button>
           <button className="btn btn-primary" onClick={runImport} disabled={loading}>
-            {loading ? "Đang import..." : "Import"}
+            {loading ? "Đang import..." : "Import ngay"}
           </button>
         </div>
       </div>
