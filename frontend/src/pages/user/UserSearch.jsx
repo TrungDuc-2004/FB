@@ -40,6 +40,14 @@ function Select({ label, value, onChange, options, disabled }) {
   );
 }
 
+function normalizeSearchResponse(res) {
+  const rawItems = Array.isArray(res?.items) ? res.items : Array.isArray(res?.results) ? res.results : [];
+  const chunkItems = rawItems.filter((x) => x && ((x.type || "chunk") === "chunk" || x.chunkID || x.id));
+  const items = chunkItems.length > 0 ? chunkItems : rawItems;
+  const total = typeof res?.total === "number" ? res.total : items.length;
+  return { total, items, rawCount: rawItems.length };
+}
+
 export default function Search() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -58,9 +66,8 @@ export default function Search() {
   const [topicID, setTopicID] = useState("");
   const [lessonID, setLessonID] = useState("");
 
-  const [result, setResult] = useState({ total: 0, items: [] });
+  const [result, setResult] = useState({ total: 0, items: [], rawCount: 0 });
 
-  // tránh race condition: chỉ nhận kết quả của request mới nhất
   const reqSeqRef = useRef(0);
 
   useEffect(() => {
@@ -78,7 +85,6 @@ export default function Search() {
     })();
   }, []);
 
-  // URL -> state + auto search
   useEffect(() => {
     const sp = new URLSearchParams(location.search || "");
     const urlQ = (sp.get("q") || "").trim();
@@ -87,16 +93,14 @@ export default function Search() {
     const urlTopicID = (sp.get("topicID") || "").trim();
     const urlLessonID = (sp.get("lessonID") || "").trim();
 
-    // set state (tránh loop)
     if (urlQ !== q) setQ(urlQ);
     if (urlClassID !== classID) setClassID(urlClassID);
     if (urlSubjectID !== subjectID) setSubjectID(urlSubjectID);
     if (urlTopicID !== topicID) setTopicID(urlTopicID);
     if (urlLessonID !== lessonID) setLessonID(urlLessonID);
 
-    // nếu không có query thì reset kết quả
     if (!urlQ) {
-      setResult({ total: 0, items: [] });
+      setResult({ total: 0, items: [], rawCount: 0 });
       return;
     }
 
@@ -106,8 +110,7 @@ export default function Search() {
       try {
         setLoading(true);
         setErr("");
-        // reset kết quả để tránh “dính” item cũ
-        setResult({ total: 0, items: [] });
+        setResult({ total: 0, items: [], rawCount: 0 });
 
         const res = await searchDocs({
           q: urlQ,
@@ -119,26 +122,21 @@ export default function Search() {
           offset: 0,
         });
 
-        // nếu request này không còn là mới nhất thì bỏ
         if (myReq !== reqSeqRef.current) return;
 
-        const items = res?.items || res?.results || [];
-        const total = typeof res?.total === "number" ? res.total : items.length;
-
-        // safety: chỉ hiển thị chunk
-        const chunkItems = (items || []).filter((x) => (x?.type || "chunk") === "chunk" || x?.chunkID);
-
-        setResult({ total, items: chunkItems });
+        const normalized = normalizeSearchResponse(res);
+        console.log("[USER SEARCH] raw response", res);
+        console.log("[USER SEARCH] normalized", normalized);
+        setResult(normalized);
       } catch (e) {
         if (myReq !== reqSeqRef.current) return;
         setErr(String(e?.message || e));
-        setResult({ total: 0, items: [] });
+        setResult({ total: 0, items: [], rawCount: 0 });
       } finally {
         if (myReq !== reqSeqRef.current) return;
         setLoading(false);
       }
     })();
-
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.search]);
 
@@ -219,7 +217,6 @@ export default function Search() {
   function onSubmit(e) {
     e?.preventDefault?.();
 
-    // chỉ update URL. Auto-search sẽ chạy trong useEffect
     const sp = new URLSearchParams();
     if (q?.trim()) sp.set("q", q.trim());
     if (classID) sp.set("classID", classID);
@@ -247,8 +244,6 @@ export default function Search() {
   }
 
   const shown = (result.items || []).length;
-  // hiển thị count theo items thật (tránh lệch total)
-  const totalText = `${shown}`;
 
   return (
     <div>
@@ -313,7 +308,14 @@ export default function Search() {
       {err ? <div style={{ marginBottom: 12, color: "#b91c1c", fontWeight: 700 }}>Lỗi: {err}</div> : null}
       {loading ? <div style={{ color: "#475569" }}>Đang tải…</div> : null}
 
-      <div style={{ margin: "10px 0", color: "#0f172a", fontWeight: 800 }}>Kết quả: {totalText}</div>
+      <div style={{ margin: "10px 0", color: "#0f172a", fontWeight: 800 }}>
+        Kết quả: {shown}
+        {result.total !== shown ? (
+          <span style={{ marginLeft: 8, color: "#64748b", fontWeight: 600 }}>
+            (backend báo {result.total}, FE nhận {result.rawCount}, đang hiển thị {shown})
+          </span>
+        ) : null}
+      </div>
 
       {!loading && !err && shown === 0 ? (
         <div className="empty-state">
@@ -324,7 +326,7 @@ export default function Search() {
 
       <div style={{ display: "grid", gap: 12 }}>
         {(result.items || []).map((d, idx) => (
-          <DocumentCard key={d.chunkID || `${idx}`} doc={d} onToggleSave={onToggleSave} />
+          <DocumentCard key={d.chunkID || d.id || `${idx}`} doc={d} onToggleSave={onToggleSave} />
         ))}
       </div>
     </div>

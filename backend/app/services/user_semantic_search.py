@@ -10,13 +10,14 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from ..models.model_postgre import Chunk, Class, Keyword, Lesson, Subject, Topic
+from ..models.model_postgre import Chunk, Class, Image, Keyword, Lesson, Subject, Topic, Video
 from .keyword_embedding import embed_keyword_cached
+from .gemini_topic_expander import expand_topic_keywords_debug
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
 
 # bump this when you replace the file so you can confirm the running code
-_SERVICE_VERSION = "search_chunk_only_phrase_strict_v3"
+_SERVICE_VERSION = "search_chunk_with_media_v6_topic_children_env_debug"
 
 
 # Vietnamese-ish stop words + a few generic fillers. Keep it small; we just want to avoid
@@ -44,7 +45,6 @@ _STOP = {
     "to",
     "in",
 }
-
 
 
 def _norm_spaces(s: str) -> str:
@@ -105,26 +105,29 @@ def _pg_term_has_hit(*, pg: Session, term: str, cand_chunks: Optional[list[str]]
     return False
 
 
-def _segment_concepts_strict(*, pg: Session, tokens: list[str], cand_chunks: Optional[list[str]]) -> list[str]:
-    """Greedy longest-match segmentation into phrases that actually exist in data.
+def _segment_concepts_partial(*, pg: Session, tokens: list[str], cand_chunks: Optional[list[str]]) -> tuple[list[str], int]:
+    """Greedy longest-match segmentation into phrases/unigrams that exist in data.
 
-    Goal: multi-word queries behave like AND (no fallback to single-word OR).
-    We only accept a segmentation if it *covers all tokens* (each token is part of
-    a chosen phrase/unigram that has a hit). Otherwise we return [].
+    Returns:
+      - concepts found in order
+      - number of covered tokens
+
+    Unlike strict mode, this does not require full coverage. This lets us keep the
+    strongest phrase as an anchor when the full query is too restrictive, e.g.
+    'phần cứng máy tính' where the chunk has 'phần cứng' but not the extra context.
     """
 
     if not tokens:
-        return []
+        return [], 0
 
     n = len(tokens)
-    max_ngram = 5  # up to 5-gram to catch phrases like 'hệ điều hành linux'
+    max_ngram = 5
     out: list[str] = []
     i = 0
     covered = 0
 
     while i < n:
         found = None
-        # try longest phrase starting at i
         for L in range(min(max_ngram, n - i), 1, -1):
             phrase = " ".join(tokens[i : i + L])
             if _pg_term_has_hit(pg=pg, term=phrase, cand_chunks=cand_chunks):
@@ -137,18 +140,12 @@ def _segment_concepts_strict(*, pg: Session, tokens: list[str], cand_chunks: Opt
         if found:
             continue
 
-        # unigram fallback (still strict, because we must cover all tokens)
         t = tokens[i]
         if _pg_term_has_hit(pg=pg, term=t, cand_chunks=cand_chunks):
             out.append(t)
             covered += 1
         i += 1
 
-    # must cover all tokens (otherwise we'd broaden too much)
-    if covered < n:
-        return []
-
-    # de-dup preserve order
     seen = set()
     dedup = []
     for c in out:
@@ -156,7 +153,14 @@ def _segment_concepts_strict(*, pg: Session, tokens: list[str], cand_chunks: Opt
             seen.add(c)
             dedup.append(c)
 
-    return dedup[:8]
+    return dedup[:8], covered
+
+
+def _segment_concepts_strict(*, pg: Session, tokens: list[str], cand_chunks: Optional[list[str]]) -> list[str]:
+    concepts, covered = _segment_concepts_partial(pg=pg, tokens=tokens, cand_chunks=cand_chunks)
+    return concepts if covered >= len(tokens) else []
+
+
 def _extract_keywords(q: str) -> List[str]:
     s = (q or "").strip()
     if not s:
@@ -375,6 +379,98 @@ def _load_by_oids(mongo_db, col: str, oid_hex_list: List[str]) -> Dict[str, dict
 
 
 
+def _media_sort_key(x: dict) -> tuple:
+    priority = {"chunk": 0, "lesson": 1, "topic": 2, "subject": 3}
+    return (priority.get((x or {}).get("followType"), 99), ((x or {}).get("name") or "").lower())
+
+
+def _build_media_item(doc: Optional[dict], *, media_type: str, follow_type: str, follow_id: str, pg_id: str) -> Optional[dict]:
+    if not doc or not _status_visible(doc):
+        return None
+
+    if media_type == "image":
+        name = doc.get("imgName") or doc.get("mapID") or pg_id
+        desc = doc.get("imgDescription") or ""
+        url = doc.get("imgUrl") or ""
+    else:
+        name = doc.get("videoName") or doc.get("mapID") or pg_id
+        desc = doc.get("videoDescription") or ""
+        url = doc.get("videoUrl") or ""
+
+    return {
+        "type": media_type,
+        "id": pg_id,
+        "name": name,
+        "description": desc,
+        "url": url,
+        "mapID": doc.get("mapID") or "",
+        "mongoID": str(doc.get("_id")) if doc.get("_id") is not None else "",
+        "followType": follow_type,
+        "followID": follow_id,
+    }
+
+
+def _load_media_map_for_targets(*, pg: Session, mongo_db, targets: List[tuple[str, str]]) -> Dict[tuple[str, str], dict]:
+    out: Dict[tuple[str, str], dict] = {}
+    uniq_targets = []
+    seen_targets = set()
+    for ft, fid in targets:
+        key = ((ft or "").strip(), (fid or "").strip())
+        if not key[0] or not key[1] or key in seen_targets:
+            continue
+        seen_targets.add(key)
+        uniq_targets.append(key)
+
+    if not uniq_targets:
+        return out
+
+    image_rows = []
+    video_rows = []
+    try:
+        conds = [((Image.follow_type == ft) & (Image.follow_id == fid)) for ft, fid in uniq_targets]
+        if conds:
+            image_rows = list(pg.execute(select(Image.img_id, Image.mongo_id, Image.follow_type, Image.follow_id).where(or_(*conds))).all())
+    except Exception:
+        image_rows = []
+
+    try:
+        conds = [((Video.follow_type == ft) & (Video.follow_id == fid)) for ft, fid in uniq_targets]
+        if conds:
+            video_rows = list(pg.execute(select(Video.video_id, Video.mongo_id, Video.follow_type, Video.follow_id).where(or_(*conds))).all())
+    except Exception:
+        video_rows = []
+
+    image_oids = [mongo_id for _pgid, mongo_id, _ft, _fid in image_rows if _valid_object_id_hex(mongo_id or "")]
+    video_oids = [mongo_id for _pgid, mongo_id, _ft, _fid in video_rows if _valid_object_id_hex(mongo_id or "")]
+
+    images_by_oid = _load_by_oids(mongo_db, "images", image_oids)
+    videos_by_oid = _load_by_oids(mongo_db, "videos", video_oids)
+
+    for img_id, mongo_id, follow_type, follow_id in image_rows:
+        doc = images_by_oid.get(mongo_id or "")
+        item = _build_media_item(doc, media_type="image", follow_type=follow_type, follow_id=follow_id, pg_id=img_id)
+        if not item:
+            continue
+        key = (follow_type, follow_id)
+        bucket = out.setdefault(key, {"images": [], "videos": []})
+        bucket["images"].append(item)
+
+    for video_id, mongo_id, follow_type, follow_id in video_rows:
+        doc = videos_by_oid.get(mongo_id or "")
+        item = _build_media_item(doc, media_type="video", follow_type=follow_type, follow_id=follow_id, pg_id=video_id)
+        if not item:
+            continue
+        key = (follow_type, follow_id)
+        bucket = out.setdefault(key, {"images": [], "videos": []})
+        bucket["videos"].append(item)
+
+    for bucket in out.values():
+        bucket["images"].sort(key=_media_sort_key)
+        bucket["videos"].sort(key=_media_sort_key)
+
+    return out
+
+
 
 def _pg_chunks_matching_terms(
     *,
@@ -486,6 +582,34 @@ def _pg_chunks_matching_terms_min_hits(
         return []
 
 
+def _pick_anchor_concepts(*, pg: Session, concepts: List[str], cand_chunks: Optional[List[str]]) -> List[str]:
+    """Pick the strongest single anchor concept when full strict coverage fails.
+
+    Heuristic:
+      - prefer longer phrases (more tokens)
+      - among same length, prefer the one with fewer hits (more specific)
+      - preserve query order as final tie-breaker
+
+    This avoids broad OR behavior while still letting queries like
+    'phần cứng máy tính' return CPU chunks through the strongest anchor phrase.
+    """
+
+    scored: List[tuple[int, int, int, str]] = []
+    for idx, concept in enumerate(concepts):
+        if not concept:
+            continue
+        hit_ids = _pg_chunks_matching_terms(pg=pg, terms=[concept], cand_chunks=cand_chunks)
+        if not hit_ids:
+            continue
+        token_len = len([t for t in concept.split(" ") if t])
+        scored.append((-token_len, len(hit_ids), idx, concept))
+
+    if not scored:
+        return []
+
+    scored.sort()
+    return [scored[0][3]]
+
 
 
 def semantic_search(
@@ -504,18 +628,13 @@ def semantic_search(
     mongo_db,
     debug: bool = False,
 ) -> dict:
-    """Semantic search (chunk-only), with **strict AND for multi-word queries**.
+    """Semantic search (chunk-only), with phrase-aware lexical gating + media hydrate.
 
-    Requirement (from your report):
-      - Query like "phần cứng máy tính" must NOT return docs about "phần cứng" OR "máy tính" alone.
-      - If we can't satisfy the phrase/AND intent, return empty (no broad fallback).
-
-    Strategy:
-      - If query has >=2 meaningful tokens: strict mode
-          * segment the query into phrases/unigrams that actually exist in PG data
-          * require ALL concepts to match (keyword_name OR chunk_name)
-          * do NOT fallback to looser semantic OR
-      - Otherwise: keep the previous behavior (coverage-aware semantic ranking).
+    Behavior:
+      - Try strict coverage first for multi-word queries.
+      - If strict coverage fails, fall back to the strongest matching anchor phrase
+        instead of returning empty immediately. This keeps results useful for
+        queries like 'phần cứng máy tính' -> CPU chunk.
     """
 
     query = (q or "").strip()
@@ -531,6 +650,7 @@ def semantic_search(
 
     tokens = _tokens_no_stop(query)
     strict_mode = len(tokens) >= 2
+    fallback_anchor_used = False
 
     # 1) Build concepts
     if strict_mode:
@@ -539,33 +659,64 @@ def semantic_search(
         dbg["query_tokens"] = tokens
         dbg["query_concepts"] = concepts[:]
 
-        if not concepts:
-            res = {"total": 0, "items": []}
-            if debug:
-                dbg["reason"] = "strict_mode_no_full_coverage"
-                res["debug"] = dbg
-            return res
+        if concepts:
+            must_coverage = len(concepts)
+            lex_terms = concepts
+            lex_chunk_ids = _pg_chunks_matching_terms_min_hits(
+                pg=pg, terms=lex_terms, cand_chunks=cand_chunks, min_hits=must_coverage
+            )
+            dbg["lex_terms"] = lex_terms
+            dbg["must_coverage"] = must_coverage
+            dbg["lex_chunk_hits"] = len(lex_chunk_ids)
 
-        # strict: must match ALL concepts
-        must_coverage = len(concepts)
-        lex_terms = concepts
+            if lex_chunk_ids:
+                restrict_chunk_ids = lex_chunk_ids
+            else:
+                concepts_partial, covered = _segment_concepts_partial(pg=pg, tokens=tokens, cand_chunks=cand_chunks)
+                anchor_concepts = _pick_anchor_concepts(pg=pg, concepts=concepts_partial, cand_chunks=cand_chunks)
+                dbg["query_concepts_partial"] = concepts_partial
+                dbg["covered_tokens_partial"] = covered
+                dbg["anchor_concepts"] = anchor_concepts
+                if not anchor_concepts:
+                    res = {"total": 0, "items": []}
+                    if debug:
+                        dbg["reason"] = "strict_mode_no_anchor_hits"
+                        res["debug"] = dbg
+                    return res
+                concepts = anchor_concepts
+                restrict_chunk_ids = _pg_chunks_matching_terms_min_hits(
+                    pg=pg, terms=anchor_concepts, cand_chunks=cand_chunks, min_hits=1
+                )
+                fallback_anchor_used = True
+        else:
+            concepts_partial, covered = _segment_concepts_partial(pg=pg, tokens=tokens, cand_chunks=cand_chunks)
+            anchor_concepts = _pick_anchor_concepts(pg=pg, concepts=concepts_partial, cand_chunks=cand_chunks)
+            dbg["query_concepts_partial"] = concepts_partial
+            dbg["covered_tokens_partial"] = covered
+            dbg["anchor_concepts"] = anchor_concepts
 
-        lex_chunk_ids = _pg_chunks_matching_terms_min_hits(
-            pg=pg, terms=lex_terms, cand_chunks=cand_chunks, min_hits=must_coverage
-        )
+            if not anchor_concepts:
+                res = {"total": 0, "items": []}
+                if debug:
+                    dbg["reason"] = "strict_mode_no_full_coverage_or_anchor"
+                    res["debug"] = dbg
+                return res
 
-        dbg["lex_terms"] = lex_terms
-        dbg["must_coverage"] = must_coverage
-        dbg["lex_chunk_hits"] = len(lex_chunk_ids)
+            concepts = anchor_concepts
+            restrict_chunk_ids = _pg_chunks_matching_terms_min_hits(
+                pg=pg, terms=anchor_concepts, cand_chunks=cand_chunks, min_hits=1
+            )
+            dbg["lex_terms"] = anchor_concepts
+            dbg["must_coverage"] = 1
+            dbg["lex_chunk_hits"] = len(restrict_chunk_ids)
+            fallback_anchor_used = True
 
-        if not lex_chunk_ids:
+        if not restrict_chunk_ids:
             res = {"total": 0, "items": []}
             if debug:
                 dbg["reason"] = "strict_mode_no_lex_hits"
                 res["debug"] = dbg
             return res
-
-        restrict_chunk_ids = lex_chunk_ids
 
     else:
         concepts = _concepts_from_query(query)
@@ -588,6 +739,83 @@ def semantic_search(
         dbg["must_coverage"] = must_coverage
 
         restrict_chunk_ids = lex_chunk_ids if lex_chunk_ids else cand_chunks
+
+    dbg["fallback_anchor_used"] = fallback_anchor_used
+
+    seed_chunk_ids = list(restrict_chunk_ids or [])
+    dbg["seed_chunk_ids"] = seed_chunk_ids[:]
+
+    # Only expand with Gemini when the query looks like a fairly specific parent topic.
+    # Broad/common concepts like "thông tin" or "dữ liệu" should NOT fan out to many
+    # sibling chunks, otherwise results become noisy.
+    exact_hit_count = len(seed_chunk_ids)
+    query_norm = _norm_spaces(query).lower()
+    generic_query_blocklist = {
+        "thông tin",
+        "dữ liệu",
+        "máy tính",
+        "tin học",
+        "thiết bị số",
+        "xử lí thông tin",
+        "xử lý thông tin",
+    }
+    allow_gemini_expand = (
+        len(tokens) >= 2
+        and bool(query_norm)
+        and query_norm not in generic_query_blocklist
+        and exact_hit_count <= 2
+    )
+    dbg["allow_gemini_expand"] = allow_gemini_expand
+    dbg["gemini_expand_reason"] = (
+        "specific_parent_topic" if allow_gemini_expand else f"blocked_exact_hits_{exact_hit_count}" if exact_hit_count > 2 else "blocked_generic_query"
+    )
+
+    gemini_terms: List[str] = []
+    gemini_hit_ids: List[str] = []
+    gem_dbg = {}
+    if allow_gemini_expand:
+        try:
+            gemini_terms, gem_dbg = expand_topic_keywords_debug(query, None)
+        except Exception as e:
+            gemini_terms = []
+            gem_dbg = {"error": f"unexpected:{e}"}
+
+    if gemini_terms:
+        gemini_hit_ids = _pg_chunks_matching_terms(pg=pg, terms=gemini_terms, cand_chunks=cand_chunks)
+        if gemini_hit_ids:
+            merged = []
+            seen = set()
+            for cid in list(seed_chunk_ids) + list(gemini_hit_ids):
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    merged.append(cid)
+            restrict_chunk_ids = merged
+        else:
+            restrict_chunk_ids = seed_chunk_ids
+
+        for term in gemini_terms:
+            if term and term not in concepts:
+                concepts.append(term)
+
+    dbg["gemini_terms"] = gemini_terms
+    dbg["gemini_hit_ids"] = len(gemini_hit_ids)
+    if gem_dbg:
+        if gem_dbg.get("model"):
+            dbg["gemini_model"] = gem_dbg.get("model")
+        if gem_dbg.get("error"):
+            dbg["gemini_error"] = gem_dbg.get("error")
+        if gem_dbg.get("raw_text"):
+            dbg["gemini_raw_text"] = gem_dbg.get("raw_text")
+        if "key_count" in gem_dbg:
+            dbg["gemini_key_count"] = gem_dbg.get("key_count")
+        if "key_slot" in gem_dbg:
+            dbg["gemini_key_slot"] = gem_dbg.get("key_slot")
+        if "attempt" in gem_dbg:
+            dbg["gemini_attempt"] = gem_dbg.get("attempt")
+        if gem_dbg.get("mode"):
+            dbg["gemini_mode"] = gem_dbg.get("mode")
+
+    dbg["ranking_concepts"] = concepts[:]
 
     # 2) Embed concepts (for ranking)
     q_embs = [embed_keyword_cached(c) for c in concepts]
@@ -619,8 +847,8 @@ def semantic_search(
     chunk_top_kw: Dict[str, List[Tuple[float, str]]] = {}
 
     if strict_mode:
-        # Strict mode: lexical filtering already ensures AND.
-        # We use embedding only for ranking; we do NOT drop chunks based on cosine thresholds.
+        # Strict/anchor mode: lexical filtering already narrows candidates.
+        # Use embedding only for ranking; do not drop chunks on cosine thresholds.
         chunk_concept_best: Dict[str, List[float]] = defaultdict(lambda: [0.0] * len(q_embs))
 
         for emb, chunk_id, kw_name in rows:
@@ -644,16 +872,25 @@ def semantic_search(
                 chunk_top_kw[chunk_id] = arr[:5]
 
         chunk_score: Dict[str, float] = {}
+        seed_set = set(seed_chunk_ids)
+        gemini_set = set(gemini_hit_ids)
         for cid in restrict_chunk_ids or []:
             bests = chunk_concept_best.get(cid, [0.0] * len(q_embs))
             coverage = sum(1 for s in bests if s > 0.0)
             score = float(sum(bests)) + 0.05 * float(coverage)
+            if cid in gemini_set:
+                score += 0.30
+                if cid not in seed_set:
+                    score += 0.25
+            if cid in seed_set:
+                score += 0.05
             chunk_score[cid] = score
 
         ranked: List[Tuple[str, float]] = sorted(chunk_score.items(), key=lambda x: x[1], reverse=True)
         dbg["ranked_chunks"] = len(ranked)
         dbg["lex_mode"] = True
-        dbg["sim_th"] = "disabled_in_strict_mode"
+        dbg["sim_th"] = "disabled_in_strict_or_anchor_mode"
+        dbg["child_boost_hits"] = len(gemini_set)
 
     else:
         # Non-strict: keep coverage + threshold to avoid OR behavior.
@@ -795,6 +1032,27 @@ def semantic_search(
 
     dbg["mongo_chunks_raw"] = len(mongo_chunks_by_oid)
 
+    # 6.5) Load media linked to the hierarchy of each page chunk
+    media_targets: List[tuple[str, str]] = []
+    chunk_targets_by_chunk: Dict[str, List[tuple[str, str]]] = {}
+    for cid in page_chunk_ids:
+        base = pg_map.get(cid)
+        if not base:
+            continue
+        targets = [
+            ("chunk", base.get("chunkID") or ""),
+            ("lesson", (base.get("lesson") or {}).get("lessonID") or ""),
+            ("topic", (base.get("topic") or {}).get("topicID") or ""),
+            ("subject", (base.get("subject") or {}).get("subjectID") or ""),
+        ]
+        norm_targets = [(ft, fid) for ft, fid in targets if ft and fid]
+        chunk_targets_by_chunk[cid] = norm_targets
+        media_targets.extend(norm_targets)
+
+    media_map = _load_media_map_for_targets(pg=pg, mongo_db=mongo_db, targets=media_targets)
+    dbg["media_target_count"] = len(media_targets)
+    dbg["media_hit_groups"] = len(media_map)
+
     # 7) Build items
     items: List[dict] = []
     dropped_hidden = 0
@@ -838,6 +1096,21 @@ def semantic_search(
 
         matched_kw = [name for _, name in chunk_top_kw.get(cid, [])]
 
+        images = []
+        videos = []
+        media_sources = {"chunk": 0, "lesson": 0, "topic": 0, "subject": 0}
+        for ft, fid in chunk_targets_by_chunk.get(cid, []):
+            bucket = media_map.get((ft, fid)) or {}
+            part_images = bucket.get("images") or []
+            part_videos = bucket.get("videos") or []
+            if part_images or part_videos:
+                media_sources[ft] = len(part_images) + len(part_videos)
+            images.extend(part_images)
+            videos.extend(part_videos)
+
+        images.sort(key=_media_sort_key)
+        videos.sort(key=_media_sort_key)
+
         item = {
             "type": "chunk",
             "id": cid,
@@ -850,6 +1123,13 @@ def semantic_search(
             "chunkDescription": (chunk_doc.get("chunkDescription") if chunk_doc else None),
             "keywords": _read_keywords_from_chunk_doc(chunk_doc),
             "matchedKeywords": matched_kw,
+            "images": images,
+            "videos": videos,
+            "mediaSummary": {
+                "totalImages": len(images),
+                "totalVideos": len(videos),
+                "byFollowType": media_sources,
+            },
             "isSaved": False,
             "class": {"classID": base["class"]["classID"], "className": base["class"]["className"]},
             "subject": {

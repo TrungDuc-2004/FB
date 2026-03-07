@@ -1,9 +1,18 @@
+import { useState } from "react";
 import { Link } from "react-router-dom";
 
 function shortText(s, n = 120) {
   const t = (s || "").trim();
   if (!t) return "";
   return t.length > n ? t.slice(0, n - 1) + "…" : t;
+}
+
+function mediaTagLabel(kind) {
+  if (kind === "chunk") return "chunk";
+  if (kind === "lesson") return "bài";
+  if (kind === "topic") return "chủ đề";
+  if (kind === "subject") return "môn";
+  return kind || "media";
 }
 
 function metaLine(doc) {
@@ -15,7 +24,50 @@ function metaLine(doc) {
   return parts.join(" • ");
 }
 
+function MediaPanel({ title, items, icon }) {
+  if (!items?.length) return null;
+  return (
+    <div
+      style={{
+        border: "1px solid #e2e8f0",
+        borderRadius: 12,
+        background: "#fff",
+        padding: 10,
+        minWidth: 0,
+      }}
+    >
+      <div style={{ fontSize: 12.5, fontWeight: 800, color: "#0f172a", marginBottom: 8 }}>
+        {icon} {title} ({items.length})
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {items.map((m) => (
+          <a
+            key={m.id || `${m.type}-${m.url}`}
+            href={m.url || "#"}
+            target="_blank"
+            rel="noreferrer"
+            title={m.description || m.name}
+            style={{
+              border: "1px solid #e2e8f0",
+              borderRadius: 10,
+              padding: "8px 10px",
+              textDecoration: "none",
+              color: "#334155",
+              background: "#f8fafc",
+            }}
+          >
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#0f172a" }}>{m.name || m.id}</div>
+            <div style={{ fontSize: 12, color: "#64748b", marginTop: 4 }}>Thuộc {mediaTagLabel(m.followType)}</div>
+          </a>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function DocumentCard({ doc, onToggleSave }) {
+  const [showMedia, setShowMedia] = useState(false);
+
   const name = doc?.chunkName || doc?.chunkID;
   const type = doc?.chunkType || doc?.lesson?.lessonType || "";
   const desc = doc?.chunkDescription || "";
@@ -23,6 +75,9 @@ export default function DocumentCard({ doc, onToggleSave }) {
   const lessonUrl = doc?.lesson?.lessonUrl || "";
   const topicUrl = doc?.topic?.topicUrl || "";
   const subjectUrl = doc?.subject?.subjectUrl || "";
+  const images = Array.isArray(doc?.images) ? doc.images : [];
+  const videos = Array.isArray(doc?.videos) ? doc.videos : [];
+  const totalMedia = images.length + videos.length;
 
   return (
     <div
@@ -60,6 +115,21 @@ export default function DocumentCard({ doc, onToggleSave }) {
         <div style={{ display: "flex", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
           <div style={{ fontSize: 15, fontWeight: 800, color: "#0f172a" }}>{name}</div>
           {doc?.chunkID ? <div style={{ fontSize: 12, color: "#64748b" }}>{doc.chunkID}</div> : null}
+          {totalMedia ? (
+            <div
+              style={{
+                fontSize: 12,
+                color: "#0f172a",
+                background: "#eef6ff",
+                border: "1px solid #bfdbfe",
+                borderRadius: 999,
+                padding: "4px 8px",
+                fontWeight: 700,
+              }}
+            >
+              {images.length} ảnh • {videos.length} video
+            </div>
+          ) : null}
         </div>
 
         <div style={{ marginTop: 4, fontSize: 12.5, color: "#475569" }}>{metaLine(doc)}</div>
@@ -90,7 +160,6 @@ export default function DocumentCard({ doc, onToggleSave }) {
             </a>
           ) : null}
 
-          {/* Link suy ra từ chunk -> lesson/topic/subject (nếu có file riêng) */}
           {lessonUrl ? (
             <a className="btn" href={lessonUrl} target="_blank" rel="noreferrer" title="File của bài học">
               Mở bài
@@ -106,7 +175,29 @@ export default function DocumentCard({ doc, onToggleSave }) {
               Mở môn
             </a>
           ) : null}
+
+          {totalMedia ? (
+            <button className="btn" type="button" onClick={() => setShowMedia((v) => !v)}>
+              {showMedia ? "Ẩn media" : "Xem media"}
+            </button>
+          ) : null}
         </div>
+
+        {showMedia && totalMedia ? (
+          <div
+            style={{
+              marginTop: 12,
+              paddingTop: 12,
+              borderTop: "1px solid #e2e8f0",
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
+              gap: 12,
+            }}
+          >
+            <MediaPanel title="Ảnh liên quan" items={images} icon="🖼" />
+            <MediaPanel title="Video liên quan" items={videos} icon="🎬" />
+          </div>
+        ) : null}
       </div>
     </div>
   );

@@ -76,6 +76,25 @@ class Keyword(Base):
     chunk_id = Column(String, ForeignKey("chunk.chunk_id", ondelete="CASCADE"), nullable=False)
 
 
+# ===== MEDIA =====
+class Image(Base):
+    __tablename__ = "image"
+    img_id = Column(String, primary_key=True)
+    img_name = Column(Text, nullable=False)
+    mongo_id = Column(String(24), unique=True, nullable=False)
+    follow_id = Column(String, nullable=False)
+    follow_type = Column(String(16), nullable=False)
+
+
+class Video(Base):
+    __tablename__ = "video"
+    video_id = Column(String, primary_key=True)
+    video_name = Column(Text, nullable=False)
+    mongo_id = Column(String(24), unique=True, nullable=False)
+    follow_id = Column(String, nullable=False)
+    follow_type = Column(String(16), nullable=False)
+
+
 # ===== USER (login) =====
 class User(Base):
     __tablename__ = "user"

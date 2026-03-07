@@ -9,8 +9,12 @@ function getActor() {
 
 async function httpJson(url, options = {}) {
   const res = await fetch(url, {
+    cache: "no-store",
     ...options,
     headers: {
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      Pragma: "no-cache",
+      Expires: "0",
       ...(options.headers || {}),
       "Content-Type": "application/json",
       "x-user": getActor(),
@@ -52,6 +56,7 @@ export function listChunks({ lessonID, category = "document", limit = 50, offset
   url.searchParams.set("category", category);
   url.searchParams.set("limit", String(limit));
   url.searchParams.set("offset", String(offset));
+  url.searchParams.set("_ts", String(Date.now()));
   return httpJson(url.toString(), { method: "GET" });
 }
 
@@ -74,23 +79,24 @@ export function searchDocs({
   url.searchParams.set("category", category);
   url.searchParams.set("limit", String(limit));
   url.searchParams.set("offset", String(offset));
+  url.searchParams.set("_ts", String(Date.now()));
   return httpJson(url.toString(), { method: "GET" });
 }
 
 export function getDocDetail(chunkID, { category = "document" } = {}) {
   const url = new URL(`${API_BASE}/user/docs/${encodeURIComponent(chunkID)}`);
   url.searchParams.set("category", category);
+  url.searchParams.set("_ts", String(Date.now()));
   return httpJson(url.toString(), { method: "GET" });
 }
 
 export function getViewUrl(chunkID, { category = "document" } = {}) {
   const url = new URL(`${API_BASE}/user/docs/${encodeURIComponent(chunkID)}/view`);
   url.searchParams.set("category", category);
+  url.searchParams.set("_ts", String(Date.now()));
   return httpJson(url.toString(), { method: "GET" });
 }
 
-// Backward-compat: DocumentView.jsx (bản cũ) đang import getDocViewUrl.
-// Giữ alias để không bị lỗi trắng trang.
 export function getDocViewUrl(chunkID, opts = {}) {
   return getViewUrl(chunkID, opts);
 }
@@ -104,5 +110,6 @@ export function listSaved({ category = "document", limit = 50, offset = 0 } = {}
   url.searchParams.set("category", category);
   url.searchParams.set("limit", String(limit));
   url.searchParams.set("offset", String(offset));
+  url.searchParams.set("_ts", String(Date.now()));
   return httpJson(url.toString(), { method: "GET" });
 }
