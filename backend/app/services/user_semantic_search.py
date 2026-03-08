@@ -17,33 +17,16 @@ from .gemini_topic_expander import expand_topic_keywords_debug
 _TOKEN_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
 
 # bump this when you replace the file so you can confirm the running code
-_SERVICE_VERSION = "search_chunk_with_media_v6_topic_children_env_debug"
+_SERVICE_VERSION = "search_chunk_with_media_v8_parent_priority"
 
 
 # Vietnamese-ish stop words + a few generic fillers. Keep it small; we just want to avoid
 # building concepts from "tài liệu", "về", ... which makes lexical matching too broad.
 _STOP = {
-    "tài",
-    "liệu",
-    "về",
-    "của",
-    "cho",
-    "là",
-    "các",
-    "những",
-    "một",
-    "này",
-    "đó",
-    "ở",
-    "trong",
-    "và",
-    "hoặc",
-    "the",
-    "a",
-    "an",
-    "of",
-    "to",
-    "in",
+    "tài", "liệu", "về", "của", "cho", "là", "các", "những", "một", "này", "đó",
+    "ở", "trong", "và", "hoặc", "the", "a", "an", "of", "to", "in",
+    "tìm", "kiếm", "cho", "tôi", "xin", "hãy", "cần", "muốn", "liên", "quan",
+    "đến", "cái", "nào", "có", "không", "với", "giúp", "dạng",
 }
 
 
@@ -72,6 +55,67 @@ def _tokens_no_stop(q: str) -> list[str]:
     raw = [t for t in _TOKEN_RE.findall(s) if t]
     toks = [t for t in raw if t not in _STOP and len(t) >= 2]
     return toks
+
+def _core_query_text(q: str) -> str:
+    return _norm_spaces(" ".join(_tokens_no_stop(q)))
+
+
+def _is_generic_query(core_query: str, tokens: list[str]) -> bool:
+    q = _norm_spaces((core_query or '').lower())
+    generic_phrases = {
+        "thông tin", "dữ liệu", "máy tính", "tin học", "thiết bị số",
+        "xử lí thông tin", "xử lý thông tin", "công nghệ", "internet",
+    }
+    if q in generic_phrases:
+        return True
+    return len(tokens) <= 1
+
+
+def _max_expand_terms(core_query: str, tokens: list[str], exact_hit_count: int) -> int:
+    if _is_generic_query(core_query, tokens):
+        return 0
+    if exact_hit_count >= 4:
+        return 0
+    if exact_hit_count >= 3:
+        return 2
+    if len(tokens) >= 4:
+        return 6
+    if len(tokens) == 3:
+        return 5
+    return 4
+
+
+def _filter_terms_with_db_hits(*, pg: Session, terms: List[str], cand_chunks: Optional[List[str]], limit: int) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        t = _norm_spaces((term or '').lower())
+        if not t or t in seen:
+            continue
+        if _pg_term_has_hit(pg=pg, term=t, cand_chunks=cand_chunks):
+            seen.add(t)
+            out.append(t)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _merge_seed_and_expanded(seed_ids: List[str], expanded_ids: List[str], max_extra: int = 4) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for cid in seed_ids:
+        if cid and cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+    added = 0
+    for cid in expanded_ids:
+        if cid and cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+            added += 1
+        if added >= max_extra:
+            break
+    return out
 
 
 def _pg_term_has_hit(*, pg: Session, term: str, cand_chunks: Optional[list[str]]) -> bool:
@@ -745,51 +789,46 @@ def semantic_search(
     seed_chunk_ids = list(restrict_chunk_ids or [])
     dbg["seed_chunk_ids"] = seed_chunk_ids[:]
 
-    # Only expand with Gemini when the query looks like a fairly specific parent topic.
-    # Broad/common concepts like "thông tin" or "dữ liệu" should NOT fan out to many
-    # sibling chunks, otherwise results become noisy.
     exact_hit_count = len(seed_chunk_ids)
-    query_norm = _norm_spaces(query).lower()
-    generic_query_blocklist = {
-        "thông tin",
-        "dữ liệu",
-        "máy tính",
-        "tin học",
-        "thiết bị số",
-        "xử lí thông tin",
-        "xử lý thông tin",
-    }
-    allow_gemini_expand = (
-        len(tokens) >= 2
-        and bool(query_norm)
-        and query_norm not in generic_query_blocklist
-        and exact_hit_count <= 2
-    )
+    core_query = _core_query_text(query)
+    max_expand_terms = _max_expand_terms(core_query, tokens, exact_hit_count)
+    allow_gemini_expand = bool(core_query) and max_expand_terms > 0
+    if not core_query:
+        expand_reason = "blocked_empty_core_query"
+    elif max_expand_terms <= 0:
+        if _is_generic_query(core_query, tokens):
+            expand_reason = "blocked_generic_query"
+        else:
+            expand_reason = f"blocked_exact_hits_{exact_hit_count}"
+    else:
+        expand_reason = "specific_parent_topic"
+    dbg["core_query"] = core_query
     dbg["allow_gemini_expand"] = allow_gemini_expand
-    dbg["gemini_expand_reason"] = (
-        "specific_parent_topic" if allow_gemini_expand else f"blocked_exact_hits_{exact_hit_count}" if exact_hit_count > 2 else "blocked_generic_query"
-    )
+    dbg["gemini_expand_reason"] = expand_reason
+    dbg["max_expand_terms"] = max_expand_terms
 
     gemini_terms: List[str] = []
     gemini_hit_ids: List[str] = []
     gem_dbg = {}
     if allow_gemini_expand:
         try:
-            gemini_terms, gem_dbg = expand_topic_keywords_debug(query, None)
+            gemini_terms, gem_dbg = expand_topic_keywords_debug(core_query, None)
         except Exception as e:
             gemini_terms = []
             gem_dbg = {"error": f"unexpected:{e}"}
 
     if gemini_terms:
+        gemini_terms = _filter_terms_with_db_hits(
+            pg=pg,
+            terms=gemini_terms,
+            cand_chunks=cand_chunks,
+            limit=max_expand_terms,
+        )
+
+    if gemini_terms:
         gemini_hit_ids = _pg_chunks_matching_terms(pg=pg, terms=gemini_terms, cand_chunks=cand_chunks)
         if gemini_hit_ids:
-            merged = []
-            seen = set()
-            for cid in list(seed_chunk_ids) + list(gemini_hit_ids):
-                if cid and cid not in seen:
-                    seen.add(cid)
-                    merged.append(cid)
-            restrict_chunk_ids = merged
+            restrict_chunk_ids = _merge_seed_and_expanded(seed_chunk_ids, gemini_hit_ids, max_extra=4)
         else:
             restrict_chunk_ids = seed_chunk_ids
 
@@ -814,6 +853,18 @@ def semantic_search(
             dbg["gemini_attempt"] = gem_dbg.get("attempt")
         if gem_dbg.get("mode"):
             dbg["gemini_mode"] = gem_dbg.get("mode")
+
+    parent_phrase_ids: List[str] = []
+    if core_query:
+        try:
+            parent_phrase_ids = _pg_chunks_matching_terms(
+                pg=pg,
+                terms=[core_query],
+                cand_chunks=restrict_chunk_ids if restrict_chunk_ids is not None else cand_chunks,
+            )
+        except Exception:
+            parent_phrase_ids = []
+    dbg["parent_phrase_hits"] = len(parent_phrase_ids)
 
     dbg["ranking_concepts"] = concepts[:]
 
@@ -874,16 +925,32 @@ def semantic_search(
         chunk_score: Dict[str, float] = {}
         seed_set = set(seed_chunk_ids)
         gemini_set = set(gemini_hit_ids)
+        parent_phrase_set = set(parent_phrase_ids)
+        parent_phrase_boost = 1.25 if allow_gemini_expand and parent_phrase_set else 0.0
+        child_hit_boost = 0.18
+        child_nonseed_boost = 0.10
+
         for cid in restrict_chunk_ids or []:
             bests = chunk_concept_best.get(cid, [0.0] * len(q_embs))
             coverage = sum(1 for s in bests if s > 0.0)
             score = float(sum(bests)) + 0.05 * float(coverage)
+
+            # Prefer the exact/phrase parent document over expanded child documents.
+            # This keeps topic queries stable in the future: overview doc first,
+            # child docs like CPU/RAM/GPU right below it.
+            if cid in parent_phrase_set:
+                score += parent_phrase_boost
+                if cid in seed_set:
+                    score += 0.20
+
             if cid in gemini_set:
-                score += 0.30
+                score += child_hit_boost
                 if cid not in seed_set:
-                    score += 0.25
+                    score += child_nonseed_boost
+
             if cid in seed_set:
                 score += 0.05
+
             chunk_score[cid] = score
 
         ranked: List[Tuple[str, float]] = sorted(chunk_score.items(), key=lambda x: x[1], reverse=True)
@@ -891,6 +958,7 @@ def semantic_search(
         dbg["lex_mode"] = True
         dbg["sim_th"] = "disabled_in_strict_or_anchor_mode"
         dbg["child_boost_hits"] = len(gemini_set)
+        dbg["parent_phrase_boost"] = parent_phrase_boost
 
     else:
         # Non-strict: keep coverage + threshold to avoid OR behavior.
