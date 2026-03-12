@@ -688,8 +688,8 @@ export default function MongoDB() {
   }, [isRoot, currentCollection]);
 
   const breadcrumbParts = useMemo(() => {
-    if (isRoot) return [];
-    return ["mongo", currentCollection];
+    if (isRoot) return ["Admin", "MongoDB"];
+    return ["Admin", "MongoDB", currentCollection];
   }, [isRoot, currentCollection]);
 
   function goBack() {
@@ -1037,16 +1037,14 @@ export default function MongoDB() {
             )}
           </div>
 
-          {!isRoot && (
-            <div className="breadcrumb">
-              {breadcrumbParts.map((p, idx, arr) => (
-                <span key={idx} className="crumb">
-                  {p}
-                  {idx < arr.length - 1 ? <span className="sep">/</span> : null}
-                </span>
-              ))}
-            </div>
-          )}
+          <div className="breadcrumb">
+            {breadcrumbParts.map((p, idx, arr) => (
+              <span key={idx} className="crumb">
+                {p}
+                {idx < arr.length - 1 ? <span className="sep">/</span> : null}
+              </span>
+            ))}
+          </div>
         </div>
 
         <div className="page-header-bottom">
@@ -1082,7 +1080,7 @@ export default function MongoDB() {
         </div>
       ) : null}
 
-      <div className="table-wrapper">
+      <div className={`table-wrapper mongo-table-wrapper ${isDocDetail ? "mongo-table-wrapper--detail" : ""}`}>
         {isRoot ? (
           <DataTable
             columns={collectionColumns}

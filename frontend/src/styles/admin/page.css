@@ -33,6 +33,11 @@
   margin-bottom: 8px;
 }
 
+/* back nằm bên phải */
+.title-row {
+  justify-content: space-between;
+}
+
 .page-title {
   font-size: 20px;
   font-weight: 700;
@@ -130,11 +135,6 @@
   background: #f1f5f9;
 }
 
-/* back nằm bên phải */
-.title-row {
-  justify-content: space-between;
-}
-
 /* back style khác */
 .back-btn-right {
   background: #0ea5e9;
@@ -196,6 +196,7 @@
   text-align: center;
   color: #64748b;
 }
+
 .empty-state-icon {
   font-size: 36px;
   margin-bottom: 8px;
@@ -219,9 +220,8 @@
   align-items: center;
   justify-content: flex-end;
   gap: 10px;
-
-  flex-wrap: nowrap; /* ✅ không cho xuống hàng */
-  white-space: nowrap; /* ✅ chữ không xuống dòng */
+  flex-wrap: nowrap;
+  white-space: nowrap;
 }
 
 /* Nút khi nằm trong table-actions thì nhỏ lại cho đồng bộ */
@@ -231,7 +231,7 @@
   font-size: 13px;
   border-radius: 10px;
   line-height: 1;
-  white-space: nowrap; /* ✅ chữ không xuống dòng */
+  white-space: nowrap;
 }
 
 /* ===== Button variants (Users) ===== */
@@ -274,9 +274,6 @@
   font-size: 13px;
 }
 
-/* (Nếu bạn muốn cả 2 nút đều nhỏ y chang nhau thì bỏ đoạn trên,
-   và chỉ dùng .table-actions .btn font-size: 13px;) */
-
 /* Status badge riêng cho Users */
 .status-badge {
   display: inline-flex;
@@ -284,7 +281,7 @@
   height: 26px;
   padding: 0 10px;
   border-radius: 999px;
-  font-size: 12px; /* nhỏ lại */
+  font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.2px;
   border: 1px solid transparent;
@@ -317,16 +314,106 @@
   border: 1px solid transparent;
 }
 
-/* admin: tím/xanh đậm (KHÔNG đỏ) */
+/* admin: tím/xanh đậm */
 .role-badge.is-admin {
   background: #eef2ff;
   color: #4338ca;
   border-color: #c7d2fe;
 }
 
-/* user: xám/ xanh nhạt */
+/* user: xám/xanh nhạt */
 .role-badge.is-user {
   background: #f1f5f9;
   color: #334155;
   border-color: #e2e8f0;
+}
+
+/* ===== Chỉ áp dụng cho USER, không đụng ADMIN ===== */
+body.user-shell-clean .breadcrumb,
+body.user-shell-clean .crumb,
+body.user-shell-clean .sep {
+  display: none !important;
+}
+
+body.user-shell-clean .user-search-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-self: end;
+  margin-top: 8px;
+}
+
+body.user-shell-clean .user-doc-card-actions,
+body.user-shell-clean .user-doc-view-toolbar-left,
+body.user-shell-clean .user-doc-view-toolbar-right,
+body.user-shell-clean .header-actions {
+  gap: 12px;
+}
+
+body.user-shell-clean .user-doc-card-actions .btn,
+body.user-shell-clean .user-doc-view-toolbar .btn,
+body.user-shell-clean .header-actions .btn {
+  min-width: 128px;
+  min-height: 44px;
+  padding: 0 18px;
+  border-radius: 14px;
+}
+
+@media (max-width: 768px) {
+  body.user-shell-clean .user-doc-card-actions .btn,
+  body.user-shell-clean .user-doc-view-toolbar .btn,
+  body.user-shell-clean .header-actions .btn {
+    min-width: unset;
+    width: 100%;
+  }
+
+  body.user-shell-clean .user-search-actions {
+    width: 100%;
+    margin-top: 6px;
+  }
+}
+.mongo-table-wrapper {
+  height: calc(100vh - 280px);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.mongo-table-wrapper--detail {
+  height: calc(100vh - 340px);
+}
+
+.mongo-table-wrapper > .table-container {
+  flex: 1;
+  min-height: 0;
+}
+.neo4j-table-wrapper {
+  height: calc(100vh - 280px);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.neo4j-table-wrapper--detail {
+  height: calc(100vh - 340px);
+}
+
+.neo4j-table-wrapper > .table-container {
+  flex: 1;
+  min-height: 0;
+}
+.postgres-table-wrapper {
+  height: calc(100vh - 280px);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.postgres-table-wrapper--detail {
+  height: calc(100vh - 340px);
+}
+
+.postgres-table-wrapper > .table-container {
+  flex: 1;
+  min-height: 0;
 }

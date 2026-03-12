@@ -58,6 +58,7 @@ export default function App() {
           <Route index element={<UserHome />} />
           <Route path="search" element={<Search />} />
           <Route path="library" element={<Library />} />
+          <Route path="list" element={<Navigate to="/user/library" replace />} />
           <Route path="user-library" element={<Library />} />
           <Route path="saved" element={<Saved />} />
           <Route path="docs/:chunkID" element={<DocumentDetail />} />

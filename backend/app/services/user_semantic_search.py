@@ -1226,6 +1226,11 @@ def semantic_search(
             dropped_hidden += 1
             continue
 
+        if category and category != "all":
+            chunk_category = (chunk_doc or {}).get("chunkCategory") or ""
+            if chunk_category and chunk_category != category:
+                continue
+
         lesson_doc = None
         topic_doc = None
         subject_doc = None
@@ -1286,18 +1291,38 @@ def semantic_search(
             "subject": {
                 "subjectID": base["subject"]["subjectID"],
                 "subjectName": base["subject"]["subjectName"],
+                "subjectDescription": (
+                    (subject_doc.get("subjectTitle") if subject_doc else None)
+                    or (subject_doc.get("description") if subject_doc else None)
+                    or ""
+                ),
                 "subjectUrl": subject_url,
             },
             "topic": {
                 "topicID": base["topic"]["topicID"],
                 "topicName": base["topic"]["topicName"],
+                "topicDescription": (
+                    (topic_doc.get("topicDescription") if topic_doc else None)
+                    or (topic_doc.get("topic_description") if topic_doc else None)
+                    or (topic_doc.get("description") if topic_doc else None)
+                    or ""
+                ),
                 "topicUrl": topic_url,
             },
             "lesson": {
                 "lessonID": base["lesson"]["lessonID"],
                 "lessonName": base["lesson"]["lessonName"],
+                "lessonDescription": (
+                    (lesson_doc.get("lessonDescription") if lesson_doc else None)
+                    or (lesson_doc.get("lesson_description") if lesson_doc else None)
+                    or (lesson_doc.get("description") if lesson_doc else None)
+                    or (lesson_doc.get("lessonType") if lesson_doc else None)
+                    or ""
+                ),
                 "lessonUrl": lesson_url,
+                "lessonType": (lesson_doc.get("lessonType") if lesson_doc else None) or "",
             },
+            "category": (chunk_doc.get("chunkCategory") if chunk_doc else None) or category or "document",
         }
 
         try:

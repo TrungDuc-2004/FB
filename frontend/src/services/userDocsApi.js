@@ -1,61 +1,132 @@
-// src/services/userDocsApi.js
-// User UI: browse/search/save/view documents
+const RAW_API_BASE = (import.meta.env.VITE_API_BASE || "").trim();
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
+const API_BASE = RAW_API_BASE
+  ? RAW_API_BASE.replace(/\/+$/, "")
+  : `${window.location.protocol}//${window.location.hostname}:8000`;
 
 function getActor() {
-  return localStorage.getItem("username") || "user-ui";
+  return (localStorage.getItem("username") || "user-ui").trim() || "user-ui";
+}
+
+function normalizeErrorMessage(data) {
+  if (!data) return "Request failed";
+
+  if (typeof data === "string") return data;
+  if (typeof data?.detail === "string") return data.detail;
+
+  if (Array.isArray(data?.detail)) {
+    return data.detail
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item?.msg) return item.msg;
+        return JSON.stringify(item);
+      })
+      .join(" | ");
+  }
+
+  if (data?.detail && typeof data.detail === "object") {
+    if (data.detail.msg) return data.detail.msg;
+    return JSON.stringify(data.detail);
+  }
+
+  if (typeof data?.message === "string") return data.message;
+
+  try {
+    return JSON.stringify(data);
+  } catch {
+    return "Request failed";
+  }
 }
 
 async function httpJson(url, options = {}) {
-  const res = await fetch(url, {
-    cache: "no-store",
-    ...options,
-    headers: {
-      "Cache-Control": "no-cache, no-store, must-revalidate",
-      Pragma: "no-cache",
-      Expires: "0",
-      ...(options.headers || {}),
-      "Content-Type": "application/json",
-      "x-user": getActor(),
-    },
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.detail || JSON.stringify(data) || "Request failed");
-  return data;
+  try {
+    const res = await fetch(url, {
+      cache: "no-store",
+      ...options,
+      headers: {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        Pragma: "no-cache",
+        Expires: "0",
+        "Content-Type": "application/json",
+        "x-username": getActor(),
+        ...(options.headers || {}),
+      },
+    });
+
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      throw new Error(normalizeErrorMessage(data));
+    }
+
+    return data;
+  } catch (err) {
+    if (err instanceof Error) {
+      throw new Error(err.message || `Không gọi được API: ${url}`);
+    }
+    throw new Error(`Không gọi được API: ${url}`);
+  }
 }
 
-export function listClasses() {
-  return httpJson(`${API_BASE}/user/docs/classes`, { method: "GET" });
+export function normalizeSearchResponse(payload) {
+  const items = Array.isArray(payload?.items)
+    ? payload.items
+    : Array.isArray(payload)
+    ? payload
+    : [];
+
+  const total =
+    typeof payload?.total === "number"
+      ? payload.total
+      : items.length;
+
+  return { total, items };
 }
 
-export function listSubjects({ classID = "", category = "document" } = {}) {
+export function listClasses({ category = "all" } = {}) {
+  const url = new URL(`${API_BASE}/user/docs/classes`);
+  url.searchParams.set("category", category);
+  url.searchParams.set("_ts", String(Date.now()));
+  return httpJson(url.toString(), { method: "GET" });
+}
+
+export function listSubjects({ classID = "", category = "all" } = {}) {
   const url = new URL(`${API_BASE}/user/docs/subjects`);
   if (classID) url.searchParams.set("classID", classID);
   url.searchParams.set("category", category);
+  url.searchParams.set("_ts", String(Date.now()));
   return httpJson(url.toString(), { method: "GET" });
 }
 
-export function listTopics({ subjectID, category = "document" } = {}) {
+export function listTopics({ subjectID = "", category = "all" } = {}) {
   const url = new URL(`${API_BASE}/user/docs/topics`);
-  url.searchParams.set("subjectID", subjectID);
+  if (subjectID) url.searchParams.set("subjectID", subjectID);
   url.searchParams.set("category", category);
+  url.searchParams.set("_ts", String(Date.now()));
   return httpJson(url.toString(), { method: "GET" });
 }
 
-export function listLessons({ topicID, category = "document" } = {}) {
+export function listLessons({ topicID = "", category = "all" } = {}) {
   const url = new URL(`${API_BASE}/user/docs/lessons`);
-  url.searchParams.set("topicID", topicID);
+  if (topicID) url.searchParams.set("topicID", topicID);
   url.searchParams.set("category", category);
+  url.searchParams.set("_ts", String(Date.now()));
   return httpJson(url.toString(), { method: "GET" });
 }
 
-export function listChunks({ lessonID, category = "document", limit = 50, offset = 0 } = {}) {
-  const url = new URL(`${API_BASE}/user/docs/chunks`);
-  url.searchParams.set("lessonID", lessonID);
+export function listChunks({
+  lessonID = "",
+  category = "document",
+  limit = 50,
+  offset = 0,
+  sort = "name",
+} = {}) {
+  const url = new URL(`${API_BASE}/user/docs`);
+  if (lessonID) url.searchParams.set("lessonID", lessonID);
   url.searchParams.set("category", category);
   url.searchParams.set("limit", String(limit));
   url.searchParams.set("offset", String(offset));
+  url.searchParams.set("sort", sort);
   url.searchParams.set("_ts", String(Date.now()));
   return httpJson(url.toString(), { method: "GET" });
 }
@@ -90,19 +161,25 @@ export function getDocDetail(chunkID, { category = "document" } = {}) {
   return httpJson(url.toString(), { method: "GET" });
 }
 
-export function getViewUrl(chunkID, { category = "document" } = {}) {
+export function getDocView(chunkID, { category = "document" } = {}) {
   const url = new URL(`${API_BASE}/user/docs/${encodeURIComponent(chunkID)}/view`);
   url.searchParams.set("category", category);
   url.searchParams.set("_ts", String(Date.now()));
   return httpJson(url.toString(), { method: "GET" });
 }
 
-export function getDocViewUrl(chunkID, opts = {}) {
-  return getViewUrl(chunkID, opts);
+export function getViewUrl(chunkID, opts = {}) {
+  return getDocView(chunkID, opts);
 }
 
-export function toggleSave(chunkID) {
-  return httpJson(`${API_BASE}/user/docs/${encodeURIComponent(chunkID)}/save`, { method: "POST" });
+export function getDocViewUrl(chunkID, opts = {}) {
+  return getDocView(chunkID, opts);
+}
+
+export function toggleSave(chunkID, category = "document") {
+  const url = new URL(`${API_BASE}/user/docs/saved/${encodeURIComponent(chunkID)}/toggle`);
+  url.searchParams.set("category", category);
+  return httpJson(url.toString(), { method: "POST" });
 }
 
 export function listSaved({ category = "document", limit = 50, offset = 0 } = {}) {

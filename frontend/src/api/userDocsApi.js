@@ -1,70 +1,128 @@
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 
-function actorHeaders() {
-  const username = (localStorage.getItem("username") || "anonymous").trim();
-  return { "x-user": username };
+function getActor() {
+  return (localStorage.getItem("username") || "user-ui").trim() || "user-ui";
 }
 
-async function apiGet(path, params = {}) {
-  const u = new URL(API_BASE + path);
-  Object.entries(params || {}).forEach(([k, v]) => {
-    if (v === undefined || v === null || v === "") return;
-    u.searchParams.set(k, String(v));
+function buildUrl(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === "") return;
+    url.searchParams.set(key, String(value));
   });
+  return url.toString();
+}
 
-  const res = await fetch(u.toString(), { headers: { ...actorHeaders() } });
+async function httpJson(pathOrUrl, options = {}) {
+  const isAbsolute = /^https?:\/\//i.test(pathOrUrl);
+  const url = isAbsolute ? pathOrUrl : `${API_BASE}${pathOrUrl}`;
+  const headers = {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    Pragma: "no-cache",
+    Expires: "0",
+    "x-user": getActor(),
+    ...(options.headers || {}),
+  };
+
+  if (options.body !== undefined && !headers["Content-Type"]) {
+    headers["Content-Type"] = "application/json";
+  }
+
+  const res = await fetch(url, {
+    cache: "no-store",
+    ...options,
+    headers,
+  });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.detail || "API error");
+  if (!res.ok) throw new Error(data?.detail || JSON.stringify(data) || "Request failed");
   return data;
 }
 
-async function apiPost(path, body) {
-  const res = await fetch(API_BASE + path, {
+export function listClasses({ category = "document" } = {}) {
+  return httpJson(buildUrl("/user/docs/classes", { category }), { method: "GET" });
+}
+
+export function listSubjects({ classID = "", category = "document" } = {}) {
+  return httpJson(buildUrl("/user/docs/subjects", { classID, category }), { method: "GET" });
+}
+
+export function listTopics({ subjectID = "", category = "document" } = {}) {
+  return httpJson(buildUrl("/user/docs/topics", { subjectID, category }), { method: "GET" });
+}
+
+export function listLessons({ topicID = "", category = "document" } = {}) {
+  return httpJson(buildUrl("/user/docs/lessons", { topicID, category }), { method: "GET" });
+}
+
+export function listChunks({ lessonID = "", category = "document", limit = 50, offset = 0, sort = "name" } = {}) {
+  return httpJson(buildUrl("/user/docs/chunks", { lessonID, category, limit, offset, sort, _ts: Date.now() }), {
+    method: "GET",
+  });
+}
+
+export function searchDocs({
+  q = "",
+  classID = "",
+  subjectID = "",
+  topicID = "",
+  lessonID = "",
+  category = "document",
+  limit = 20,
+  offset = 0,
+} = {}) {
+  return httpJson(
+    buildUrl("/user/docs/search", {
+      q,
+      classID,
+      subjectID,
+      topicID,
+      lessonID,
+      category,
+      limit,
+      offset,
+      _ts: Date.now(),
+    }),
+    { method: "GET" }
+  );
+}
+
+export function getDocDetail(chunkID, { category = "document" } = {}) {
+  return httpJson(buildUrl(`/user/docs/${encodeURIComponent(chunkID)}`, { category, _ts: Date.now() }), {
+    method: "GET",
+  });
+}
+
+export function getChunkDetail(chunkID, category = "document") {
+  return getDocDetail(chunkID, { category });
+}
+
+export function getViewUrl(chunkID, { category = "document" } = {}) {
+  return httpJson(buildUrl(`/user/docs/${encodeURIComponent(chunkID)}/view`, { category, _ts: Date.now() }), {
+    method: "GET",
+  });
+}
+
+export function getDocViewUrl(chunkID, opts = {}) {
+  return getViewUrl(chunkID, opts);
+}
+
+export function getChunkViewUrl(chunkID, category = "document") {
+  return getViewUrl(chunkID, { category });
+}
+
+export function toggleSave(chunkID, { category = "document" } = {}) {
+  return httpJson(buildUrl(`/user/docs/${encodeURIComponent(chunkID)}/save`, { category }), {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...actorHeaders() },
-    body: body ? JSON.stringify(body) : "{}",
+    body: JSON.stringify({}),
   });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.detail || "API error");
-  return data;
 }
 
-export function getClasses(category = "document") {
-  return apiGet("/user/docs/classes", { category });
-}
-
-export function getSubjects(classID, category = "document") {
-  return apiGet("/user/docs/subjects", { classID, category });
-}
-
-export function getTopics(subjectID, category = "document") {
-  return apiGet("/user/docs/topics", { subjectID, category });
-}
-
-export function getLessons(topicID, category = "document") {
-  return apiGet("/user/docs/lessons", { topicID, category });
-}
-
-export function getChunks(lessonID, category = "document") {
-  return apiGet("/user/docs/chunks", { lessonID, category });
-}
-
-export function searchDocs(q, top_k = 25, category = "document") {
-  return apiGet("/user/docs/search", { q, top_k, category });
-}
-
-export function getChunkDetail(chunkId, category = "document") {
-  return apiGet(`/user/docs/${encodeURIComponent(chunkId)}`, { category });
-}
-
-export function getChunkViewUrl(chunkId, category = "document") {
-  return apiGet(`/user/docs/${encodeURIComponent(chunkId)}/view-url`, { category });
-}
-
-export function toggleSave(chunkId, category = "document") {
-  return apiPost(`/user/docs/${encodeURIComponent(chunkId)}/save?category=${encodeURIComponent(category)}`);
+export function listSaved({ category = "document", limit = 50, offset = 0 } = {}) {
+  return httpJson(buildUrl("/user/docs/saved/list", { category, limit, offset, _ts: Date.now() }), {
+    method: "GET",
+  });
 }
 
 export function getSaved(category = "document") {
-  return apiGet("/user/docs/saved/list", { category });
+  return listSaved({ category });
 }

@@ -83,7 +83,7 @@ export default function DataTable({
                 </th>
               ))}
               {renderActions ? (
-                <th style={{ textAlign: "right", width: "150px" }}>THAO TÁC</th>
+                <th style={{ textAlign: "right", width: "180px" }}>THAO TÁC</th>
               ) : null}
             </tr>
           </thead>

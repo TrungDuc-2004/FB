@@ -306,7 +306,7 @@ export default function PostgreSQL() {
         </div>
       ) : null}
 
-      <div className="table-wrapper">
+      <div className={`table-wrapper postgres-table-wrapper ${isRowDetail ? "postgres-table-wrapper--detail" : ""}`}>
         {isRoot ? (
           <DataTable
             columns={tableColumns}

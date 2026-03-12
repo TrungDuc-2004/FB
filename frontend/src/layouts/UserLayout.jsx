@@ -1,16 +1,31 @@
+import { useEffect } from "react";
 import DashboardShell, { DashboardIcons } from "./DashboardShell";
 
 export default function UserLayout() {
   const { IHome, IBook, ISearch, IStar, IUser } = DashboardIcons;
 
-  // User UI: chỉ giữ các chức năng tra cứu/tài liệu
+  useEffect(() => {
+    document.body.classList.add("user-shell-clean");
+    return () => {
+      document.body.classList.remove("user-shell-clean");
+    };
+  }, []);
+
   const navItems = [
     { to: "/user", label: "Trang chủ", icon: IHome, end: true },
     { to: "/user/library", label: "Danh sách", icon: IBook },
     { to: "/user/search", label: "Tìm kiếm", icon: ISearch },
     { to: "/user/saved", label: "Đã lưu", icon: IStar },
-    { to: "/user/profile", label: "User", icon: IUser },
+    { to: "/user/profile", label: "Tài khoản", icon: IUser },
   ];
 
-  return <DashboardShell basePath="/user" navItems={navItems} />;
+  return (
+    <DashboardShell
+      navItems={navItems}
+      brandTitle="Dashboard"
+      brandSubtitle="Tra cứu tài liệu"
+      topbarTitle="HỆ THỐNG QUẢN LÝ"
+      accountInfoTitle="Thông tin tài khoản"
+    />
+  );
 }

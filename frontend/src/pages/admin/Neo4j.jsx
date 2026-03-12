@@ -240,7 +240,7 @@ export default function Neo4j() {
         </div>
       </div>
 
-      <div className="table-wrapper">
+      <div className={`table-wrapper neo4j-table-wrapper ${isNodeDetail ? "neo4j-table-wrapper--detail" : ""}`}>
         {isRoot ? (
           <DataTable
             pageSize={7}

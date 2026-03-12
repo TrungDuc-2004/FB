@@ -1,16 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-
 import "../../styles/admin/page.css";
-import DataTable from "../../components/DataTable";
-import * as api from "../../api/userDocsApi";
-
-function extFromUrl(u = "") {
-  const s = String(u || "");
-  const noQ = s.split("?")[0];
-  const i = noQ.lastIndexOf(".");
-  return i >= 0 ? noQ.slice(i + 1).toLowerCase() : "";
-}
+import DocumentCard from "../../components/DocumentCard";
+import { listSaved, toggleSave } from "../../services/userDocsApi";
 
 export default function UserSaved() {
   const navigate = useNavigate();
@@ -22,7 +14,7 @@ export default function UserSaved() {
     setLoading(true);
     setErr("");
     try {
-      const data = await api.getSaved();
+      const data = await listSaved({ category: "all", limit: 100, offset: 0 });
       setItems(data.items || []);
     } catch (e) {
       setErr(String(e?.message || e));
@@ -35,25 +27,21 @@ export default function UserSaved() {
     load();
   }, []);
 
-  const rows = useMemo(
-    () =>
-      (items || []).map((x, idx) => ({
-        id: x.chunkID || String(idx),
-        ...x,
-        fileExt: extFromUrl(x.chunkUrl),
-      })),
-    [items]
-  );
-
-  const cols = [
-    { key: "chunkID", label: "Mã", width: "220px" },
-    { key: "chunkName", label: "Tên" },
-    { key: "fileExt", label: "File", width: "90px" },
-    { key: "lessonID", label: "Bài", width: "170px" },
-  ];
+  async function onToggleSave(doc) {
+    try {
+      const r = await toggleSave(doc.chunkID, doc?.category || "document");
+      if (!r.saved) {
+        setItems((prev) => (prev || []).filter((item) => !(item.chunkID === doc.chunkID && (item.category || "document") === (doc.category || "document"))));
+        return;
+      }
+      setItems((prev) => (prev || []).map((item) => (item.chunkID === doc.chunkID && (item.category || "document") === (doc.category || "document") ? { ...item, isSaved: true } : item)));
+    } catch (e) {
+      alert(String(e?.message || e));
+    }
+  }
 
   return (
-    <div>
+    <div style={{ display: "grid", gap: 16 }}>
       <div className="page-header">
         <div className="page-header-top">
           <div className="title-row">
@@ -62,47 +50,50 @@ export default function UserSaved() {
               <div className="breadcrumb">
                 <span className="crumb">User</span>
                 <span className="crumb">Đã lưu</span>
+                <span className="crumb">{items.length} tài liệu</span>
               </div>
             </div>
           </div>
         </div>
 
-        <div className="page-header-bottom">
-          <div className="header-actions">
-            <button className="btn" type="button" onClick={load} disabled={loading}>
-              Tải lại
-            </button>
-            <button className="btn" type="button" onClick={() => navigate("/user/search")}
-            >
-              Tìm kiếm
-            </button>
+        <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.5fr) minmax(280px, 1fr)", gap: 16, alignItems: "stretch" }}>
+          <div style={{ border: "1px solid #fcd34d", borderRadius: 18, padding: 18, background: "linear-gradient(180deg, #fffdf5 0%, #ffffff 100%)" }}>
+            <div style={{ fontSize: 13, fontWeight: 800, color: "#b45309", marginBottom: 8 }}>KHU VỰC XEM LẠI</div>
+            <div style={{ fontSize: 24, fontWeight: 800, color: "#0f172a", marginBottom: 8 }}>Những tài liệu quan trọng bạn đã đánh dấu sẽ nằm ở đây.</div>
+            <div style={{ color: "#475569", lineHeight: 1.7 }}>
+              Bạn có thể mở lại chi tiết, xem trực tiếp tài liệu hoặc bấm bỏ lưu ngay trên từng thẻ để dọn danh sách.
+            </div>
+          </div>
+
+          <div style={{ border: "1px solid #e2e8f0", borderRadius: 18, padding: 18, background: "#fff", display: "grid", gap: 12 }}>
+            <div>
+              <div style={{ fontSize: 13, color: "#475569", fontWeight: 700, marginBottom: 6 }}>Tổng quan</div>
+              <div style={{ fontSize: 30, fontWeight: 800, color: "#0f172a" }}>{items.length}</div>
+              <div style={{ color: "#64748b" }}>mục đang được lưu</div>
+            </div>
+            <div className="header-actions">
+              <button className="btn" type="button" onClick={load} disabled={loading}>
+                Tải lại
+              </button>
+              <button className="btn" type="button" onClick={() => navigate("/user/library")}>
+                Mở thư viện
+              </button>
+              <button className="btn btn-primary" type="button" onClick={() => navigate("/user/search")}>
+                Tìm tài liệu khác
+              </button>
+            </div>
           </div>
         </div>
       </div>
 
-      <div className="table-wrapper">
-        {err ? <div style={{ padding: 14, color: "#b91c1c" }}>Lỗi: {err}</div> : null}
-        {loading && rows.length === 0 ? (
-          <div className="empty-state">Đang tải...</div>
-        ) : rows.length === 0 ? (
-          <div className="empty-state">Chưa có tài liệu nào được lưu.</div>
-        ) : (
-          <DataTable
-            columns={cols}
-            rows={rows}
-            onRowDoubleClick={(r) => navigate(`/user/docs/${encodeURIComponent(r.chunkID)}`)}
-            renderActions={(r) => (
-              <div className="table-actions">
-                <button className="btn" type="button" onClick={() => navigate(`/user/docs/${encodeURIComponent(r.chunkID)}`)}>
-                  Chi tiết
-                </button>
-                <button className="btn btn-primary" type="button" onClick={() => navigate(`/user/view/${encodeURIComponent(r.chunkID)}`)}>
-                  Xem
-                </button>
-              </div>
-            )}
-          />
-        )}
+      {err ? <div style={{ color: "#b91c1c", fontWeight: 700 }}>Lỗi: {err}</div> : null}
+      {loading && items.length === 0 ? <div className="empty-state">Đang tải...</div> : null}
+      {!loading && items.length === 0 ? <div className="empty-state">Chưa có tài liệu nào được lưu.</div> : null}
+
+      <div style={{ display: "grid", gap: 12 }}>
+        {(items || []).map((doc) => (
+          <DocumentCard key={`${doc.chunkID}-${doc.category || "document"}`} doc={doc} onToggleSave={onToggleSave} />
+        ))}
       </div>
     </div>
   );

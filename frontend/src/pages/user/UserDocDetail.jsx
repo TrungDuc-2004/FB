@@ -1,189 +1,225 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
+import { getDocDetail, toggleSave } from "../../services/userDocsApi";
+import DocumentCard from "../../components/DocumentCard";
 
-import "../../styles/admin/page.css";
-import DataTable from "../../components/DataTable";
-import * as api from "../../api/userDocsApi";
+function getTypeLabel(kind) {
+  return (
+    {
+      document: "Chunk",
+      chunk: "Chunk",
+      class: "Lớp",
+      subject: "Môn học",
+      topic: "Chủ đề",
+      lesson: "Bài học",
+      image: "Hình ảnh",
+      video: "Video",
+    }[kind] || "Tài liệu"
+  );
+}
 
-function extFromUrl(u = "") {
-  const s = String(u || "");
-  const noQ = s.split("?")[0];
-  const i = noQ.lastIndexOf(".");
-  return i >= 0 ? noQ.slice(i + 1).toLowerCase() : "";
+function detailHref(id, type) {
+  return `/user/docs/${encodeURIComponent(id)}?type=${encodeURIComponent(type || "document")}`;
+}
+
+function viewHref(id, type) {
+  return `/user/view/${encodeURIComponent(id)}?type=${encodeURIComponent(type || "document")}`;
+}
+
+function canOpenFile(doc, currentType) {
+  const type = String(doc?.itemType || currentType || "document").toLowerCase();
+  if (type === "class") return false;
+  if (doc?.chunkUrl) return true;
+  return Array.isArray(doc?.mappedDocuments) && doc.mappedDocuments.some((item) => item?.chunkUrl);
 }
 
 export default function UserDocDetail() {
-  const navigate = useNavigate();
-  // Route đang dùng :chunkID nên lấy đúng tên param
   const { chunkID } = useParams();
-
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState("");
-  const [data, setData] = useState(null);
-  const [saving, setSaving] = useState(false);
-
-  async function load() {
-    if (!chunkID) return;
-    setLoading(true);
-    setErr("");
-    try {
-      const d = await api.getChunkDetail(chunkID);
-      setData(d);
-    } catch (e) {
-      setErr(String(e?.message || e));
-    } finally {
-      setLoading(false);
-    }
-  }
+  const [searchParams] = useSearchParams();
+  const currentType = (searchParams.get("type") || "document").trim() || "document";
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [doc, setDoc] = useState(null);
 
   useEffect(() => {
-    load();
-  }, [chunkID]);
+    (async () => {
+      try {
+        setLoading(true);
+        setError("");
+        const detail = await getDocDetail(chunkID, { category: currentType });
+        setDoc(detail);
+      } catch (e) {
+        setError(String(e?.message || e));
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [chunkID, currentType]);
 
-  const chunk = data?.chunk;
-  const keywords = data?.keywords || [];
-  const related = data?.related || [];
-
-  const relatedRows = useMemo(
-    () =>
-      related.map((x, idx) => ({
-        id: x.chunkID || String(idx),
-        ...x,
-        fileExt: extFromUrl(x.chunkUrl),
-      })),
-    [related]
-  );
-
-  const relatedCols = [
-    { key: "chunkID", label: "Mã", width: "220px" },
-    { key: "chunkName", label: "Tên" },
-    { key: "fileExt", label: "File", width: "90px" },
-  ];
-
-  async function toggleSave() {
-    if (!chunkID) return;
-    setSaving(true);
+  async function onToggleSave(currentDoc) {
     try {
-      await api.toggleSave(chunkID);
+      const category = currentDoc?.category || currentType || "document";
+      const res = await toggleSave(currentDoc.chunkID, category);
+      setDoc((prev) => (prev ? { ...prev, isSaved: !!res.saved } : prev));
     } catch (e) {
-      alert(String(e?.message || e));
-    } finally {
-      setSaving(false);
+      setError(String(e?.message || e));
     }
   }
 
+  const kindLabel = useMemo(() => getTypeLabel(doc?.itemType || currentType), [doc, currentType]);
+  const hierarchy = [
+    doc?.class?.classID
+      ? { type: "class", id: doc.class.classID, label: doc.class.className || doc.class.classID }
+      : null,
+    doc?.subject?.subjectID
+      ? {
+          type: "subject",
+          id: doc.subject.subjectID,
+          label: doc.subject.subjectName || doc.subject.subjectID,
+        }
+      : null,
+    doc?.topic?.topicID
+      ? { type: "topic", id: doc.topic.topicID, label: doc.topic.topicName || doc.topic.topicID }
+      : null,
+    doc?.lesson?.lessonID
+      ? { type: "lesson", id: doc.lesson.lessonID, label: doc.lesson.lessonName || doc.lesson.lessonID }
+      : null,
+  ].filter(Boolean);
+
+  const openable = canOpenFile(doc, currentType);
+
+  if (loading) return <div className="user-doc-empty">Đang tải chi tiết tài liệu...</div>;
+  if (error) return <div className="user-doc-empty">{error}</div>;
+  if (!doc) return <div className="user-doc-empty">Không có dữ liệu tài liệu.</div>;
+
   return (
-    <div>
+    <div className="user-doc-view-shell">
       <div className="page-header">
         <div className="page-header-top">
           <div className="title-row">
-            <div>
-              <div className="page-title">Chi tiết tài liệu</div>
-              <div className="breadcrumb">
-                <span className="crumb">User</span>
-                <span className="crumb">Tài liệu</span>
-                <span className="crumb">Chi tiết</span>
-              </div>
-            </div>
-            <button className="back-btn back-btn-right" onClick={() => navigate(-1)} type="button">
-              ← Quay lại
-            </button>
+            <div className="page-title">Chi tiết {kindLabel.toLowerCase()}</div>
           </div>
-        </div>
-
-        <div className="page-header-bottom">
-          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", width: "100%" }}>
-            <div style={{ fontWeight: 800, color: "#0f172a" }}>{chunkID}</div>
-            <button className="btn" type="button" onClick={() => navigate(`/user/view/${encodeURIComponent(chunkID)}`)}>
-              Xem
-            </button>
-            <button className="btn" type="button" onClick={toggleSave} disabled={saving}>
-              ★ Lưu
-            </button>
+          <div className="breadcrumb">
+            <div className="crumb">User</div>
+            <div className="crumb">Chi tiết</div>
+            <div className="crumb active">{kindLabel}</div>
           </div>
         </div>
       </div>
 
-      <div className="table-wrapper" style={{ padding: 18, marginBottom: 16 }}>
-        {err ? <div style={{ color: "#b91c1c" }}>Lỗi: {err}</div> : null}
-        {loading && !chunk ? <div className="empty-state">Đang tải...</div> : null}
-
-        {chunk ? (
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-            <div>
-              <div style={{ fontWeight: 800, marginBottom: 6, color: "#0f172a" }}>Thông tin</div>
-              <div style={{ color: "#334155", lineHeight: 1.7 }}>
-                <div>
-                  <b>Tên:</b> {chunk.chunkName || "(không có)"}
-                </div>
-                <div>
-                  <b>Loại:</b> {chunk.chunkType || "-"}
-                </div>
-                <div>
-                  <b>Bài:</b> {chunk.lessonID || "-"}
-                </div>
-                <div>
-                  <b>URL:</b> {chunk.chunkUrl ? (
-                    <a href={chunk.chunkUrl} target="_blank" rel="noreferrer">
-                      Mở file
-                    </a>
-                  ) : (
-                    "-"
-                  )}
-                </div>
-                <div>
-                  <b>Mô tả:</b> {chunk.chunkDescription || "-"}
-                </div>
-              </div>
-            </div>
-
-            <div>
-              <div style={{ fontWeight: 800, marginBottom: 6, color: "#0f172a" }}>Keyword</div>
-              {keywords.length === 0 ? (
-                <div style={{ color: "#64748b" }}>Chưa có keyword.</div>
-              ) : (
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                  {keywords.map((k) => (
-                    <span
-                      key={k.keywordID}
-                      className="crumb"
-                      title={k.keywordID}
-                      style={{ cursor: "default" }}
-                    >
-                      {k.keywordName}
-                    </span>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-        ) : null}
+      <div className="user-doc-view-toolbar">
+        <div className="user-doc-view-toolbar-left">
+          <Link className="btn" to="/user/search">
+            Quay lại tìm kiếm
+          </Link>
+          <Link className="btn btn-primary" to={detailHref(doc.chunkID, doc.category || currentType)}>
+            Đang xem chi tiết
+          </Link>
+          {openable ? (
+            <Link className="btn" to={viewHref(doc.chunkID, doc.category || currentType)}>
+              Mở file
+            </Link>
+          ) : null}
+          {doc?.chunkUrl && String(doc?.itemType || currentType).toLowerCase() !== "class" ? (
+            <a className="btn" href={doc.chunkUrl} target="_blank" rel="noreferrer">
+              Tải tài liệu
+            </a>
+          ) : null}
+        </div>
       </div>
 
-      <div className="table-wrapper">
-        <div style={{ padding: "14px 16px", borderBottom: "1px solid #f1f5f9", fontWeight: 800 }}>
-          Tài liệu liên quan (cùng bài)
-        </div>
+      <DocumentCard doc={doc} onToggleSave={onToggleSave} />
 
-        {relatedRows.length === 0 ? (
-          <div className="empty-state">Không có tài liệu liên quan.</div>
-        ) : (
-          <DataTable
-            columns={relatedCols}
-            rows={relatedRows}
-            onRowDoubleClick={(r) => navigate(`/user/docs/${encodeURIComponent(r.chunkID)}`)}
-            renderActions={(r) => (
-              <div className="table-actions">
-                <button className="btn" type="button" onClick={() => navigate(`/user/docs/${encodeURIComponent(r.chunkID)}`)}>
-                  Chi tiết
-                </button>
-                <button className="btn btn-primary" type="button" onClick={() => navigate(`/user/view/${encodeURIComponent(r.chunkID)}`)}>
-                  Xem
-                </button>
+      <div className="user-doc-detail-grid">
+        <section className="user-doc-detail-panel">
+          <h3>Cấu trúc được map</h3>
+          {hierarchy.length ? (
+            <div className="user-doc-related-list">
+              {hierarchy.map((item) => (
+                <Link
+                  key={`${item.type}-${item.id}`}
+                  to={detailHref(item.id, item.type)}
+                  className="user-doc-related-link"
+                >
+                  <strong>{item.label}</strong>
+                  <span>{getTypeLabel(item.type)}</span>
+                </Link>
+              ))}
+            </div>
+          ) : (
+            <div className="user-doc-empty">Không có thông tin cấu trúc.</div>
+          )}
+        </section>
+
+        <aside className="user-doc-detail-panel">
+          <h3>Loại kết quả</h3>
+          <div className="user-doc-keyword-list">
+            <div className="user-doc-keyword-item">
+              <strong>Kiểu:</strong> {kindLabel}
+            </div>
+            <div className="user-doc-keyword-item">
+              <strong>ID:</strong> {doc.chunkID}
+            </div>
+            {doc?.chunkType ? (
+              <div className="user-doc-keyword-item">
+                <strong>Loại con:</strong> {doc.chunkType}
               </div>
-            )}
-          />
-        )}
+            ) : null}
+          </div>
+        </aside>
+      </div>
+
+      <div className="user-doc-detail-grid">
+        <section className="user-doc-detail-panel">
+          <h3>Danh sách chunk được map</h3>
+          {doc?.mappedDocuments?.length ? (
+            <div className="user-doc-related-list">
+              {doc.mappedDocuments.map((item) => (
+                <div key={item.chunkID} className="user-doc-related-link">
+                  <Link to={detailHref(item.chunkID, "document")}>
+                    <strong>{item.chunkName || item.chunkID}</strong>
+                  </Link>
+                  <span>{item.lesson?.lessonName || item.lesson?.lessonID || ""}</span>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                    <Link className="btn" to={detailHref(item.chunkID, "document")}>
+                      Chi tiết
+                    </Link>
+                    {item?.chunkUrl ? (
+                      <>
+                        <Link className="btn btn-primary" to={viewHref(item.chunkID, "document")}>
+                          Mở file
+                        </Link>
+                        <a className="btn" href={item.chunkUrl} target="_blank" rel="noreferrer">
+                          Tải tài liệu
+                        </a>
+                      </>
+                    ) : null}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="user-doc-empty">Không có chunk nào được map.</div>
+          )}
+        </section>
+
+        <aside className="user-doc-detail-panel">
+          <h3>Từ khóa</h3>
+          {doc?.keywordItems?.length ? (
+            <div className="user-doc-keyword-list">
+              {doc.keywordItems.map((item, index) => (
+                <div
+                  className="user-doc-keyword-item"
+                  key={`${item.keyword || item.keywordName || index}-${index}`}
+                >
+                  <strong>{item.keywordName || item.keyword || "Từ khóa"}</strong>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="user-doc-empty">Mục này chưa có danh sách từ khóa riêng.</div>
+          )}
+        </aside>
       </div>
     </div>
   );

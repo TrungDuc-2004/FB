@@ -1,124 +1,118 @@
 import { useEffect, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
+import { getDocDetail, getDocView, toggleSave } from "../../services/userDocsApi";
 
-import "../../styles/admin/page.css";
-import * as api from "../../api/userDocsApi";
-
-function extFromUrl(u = "") {
-  const s = String(u || "");
-  const noQ = s.split("?")[0];
-  const i = noQ.lastIndexOf(".");
-  return i >= 0 ? noQ.slice(i + 1).toLowerCase() : "";
-}
-
-export default function UserDocView() {
-  const navigate = useNavigate();
-  const { chunkId } = useParams();
-
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState("");
-  const [view, setView] = useState(null);
+export default function DocumentView() {
+  const { chunkID } = useParams();
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [doc, setDoc] = useState(null);
+  const [viewUrl, setViewUrl] = useState("");
 
   useEffect(() => {
-    let alive = true;
-    async function load() {
-      if (!chunkId) return;
-      setLoading(true);
-      setErr("");
+    (async () => {
       try {
-        const d = await api.getChunkViewUrl(chunkId);
-        if (!alive) return;
-        setView(d);
+        setLoading(true);
+        setError("");
+        const [detail, view] = await Promise.all([getDocDetail(chunkID), getDocView(chunkID)]);
+        setDoc(detail);
+        setViewUrl(view.viewUrl || view.rawUrl || "");
       } catch (e) {
-        if (!alive) return;
-        setErr(String(e?.message || e));
+        setError(String(e?.message || e));
       } finally {
-        alive && setLoading(false);
+        setLoading(false);
       }
+    })();
+  }, [chunkID]);
+
+  async function onToggleSave() {
+    if (!doc?.chunkID) return;
+
+    try {
+      const res = await toggleSave(doc.chunkID, doc.chunkType || "document");
+      setDoc((prev) => (prev ? { ...prev, isSaved: !!res.saved } : prev));
+    } catch (e) {
+      setError(String(e?.message || e));
     }
-    load();
-    return () => {
-      alive = false;
-    };
-  }, [chunkId]);
+  }
 
-  const viewUrl = view?.view_url || view?.viewUrl || "";
-  const originalUrl = view?.original_url || view?.originalUrl || "";
-  const mode = view?.mode || "";
-  const ext = (view?.ext || extFromUrl(viewUrl) || extFromUrl(originalUrl)).toLowerCase();
-
-  const isPdf = extFromUrl(viewUrl) === "pdf" || ext === "pdf" || mode === "pdf_preview";
-  const isImage = ["png", "jpg", "jpeg", "gif", "webp"].includes(extFromUrl(viewUrl) || ext);
-  const isVideo = ["mp4", "webm", "mkv", "avi", "mov"].includes(extFromUrl(viewUrl) || ext);
+  if (loading) return <div className="user-doc-empty">Đang tải tài liệu...</div>;
+  if (error) return <div className="user-doc-empty">{error}</div>;
+  if (!doc) return <div className="user-doc-empty">Không có dữ liệu tài liệu.</div>;
 
   return (
-    <div>
+    <div className="user-doc-view-shell">
       <div className="page-header">
         <div className="page-header-top">
           <div className="title-row">
-            <div>
-              <div className="page-title">Xem tài liệu</div>
-              <div className="breadcrumb">
-                <span className="crumb">User</span>
-                <span className="crumb">Tài liệu</span>
-                <span className="crumb">Xem</span>
-              </div>
-            </div>
-            <button className="back-btn back-btn-right" onClick={() => navigate(-1)} type="button">
-              ← Quay lại
-            </button>
+            <div className="page-title">Xem tài liệu</div>
           </div>
-        </div>
-
-        <div className="page-header-bottom">
-          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", width: "100%" }}>
-            <div style={{ fontWeight: 800, color: "#0f172a" }}>{chunkId}</div>
-            <button className="btn" type="button" onClick={() => navigate(`/user/docs/${encodeURIComponent(chunkId)}`)}>
-              Chi tiết
-            </button>
-            {originalUrl ? (
-              <a className="btn" href={originalUrl} target="_blank" rel="noreferrer">
-                Tải file gốc
-              </a>
-            ) : null}
-            {viewUrl && viewUrl !== originalUrl ? (
-              <a className="btn btn-primary" href={viewUrl} target="_blank" rel="noreferrer">
-                Mở PDF preview
-              </a>
-            ) : null}
+          <div className="breadcrumb">
+            <div className="crumb">User</div>
+            <div className="crumb active">Xem tài liệu</div>
           </div>
         </div>
       </div>
 
-      <div className="table-wrapper" style={{ height: "74vh" }}>
-        {err ? <div style={{ padding: 14, color: "#b91c1c" }}>Lỗi: {err}</div> : null}
-        {loading && !view ? <div className="empty-state">Đang tải...</div> : null}
+      <div className="user-doc-view-toolbar">
+        <div className="user-doc-view-toolbar-left">
+          <Link className="btn" to="/user/library">
+            Quay lại thư viện
+          </Link>
+          <Link className="btn" to={`/user/docs/${encodeURIComponent(doc.chunkID)}`}>
+            Xem thông tin
+          </Link>
+        </div>
 
-        {!loading && view && !viewUrl ? (
-          <div className="empty-state">Không có URL để xem.</div>
-        ) : null}
+        <div className="user-doc-view-toolbar-right">
+          {doc?.chunkUrl ? (
+            <a className="btn" href={doc.chunkUrl} target="_blank" rel="noreferrer">
+              Tải tài liệu
+            </a>
+          ) : null}
+          <button className="btn btn-primary" type="button" onClick={onToggleSave}>
+            {doc?.isSaved ? "Bỏ lưu" : "Lưu tài liệu"}
+          </button>
+        </div>
+      </div>
 
-        {!loading && viewUrl ? (
-          <div style={{ width: "100%", height: "100%" }}>
-            {isPdf ? (
-              <iframe
-                title="pdf"
-                src={viewUrl}
-                style={{ width: "100%", height: "100%", border: 0 }}
-              />
-            ) : isImage ? (
-              <div style={{ width: "100%", height: "100%", overflow: "auto", padding: 12 }}>
-                <img src={viewUrl} alt="preview" style={{ maxWidth: "100%" }} />
-              </div>
-            ) : isVideo ? (
-              <video src={viewUrl} controls style={{ width: "100%", height: "100%" }} />
-            ) : (
-              <div className="empty-state">
-                Không preview được định dạng này. Hãy bấm "Tải file gốc".
-              </div>
-            )}
+      <div className="user-doc-detail-panel">
+        <div className="user-doc-card-structure">
+          <div className="user-doc-inline-meta">
+            <span className="user-doc-inline-meta-label">Tên file</span>
+            <span className="user-doc-inline-meta-value">{doc?.chunkName || doc?.chunkID}</span>
           </div>
-        ) : null}
+          <div className="user-doc-inline-meta">
+            <span className="user-doc-inline-meta-label">Môn</span>
+            <span className="user-doc-inline-meta-value">
+              {doc?.subject?.subjectName || doc?.subject?.subjectID || "—"}
+            </span>
+          </div>
+          <div className="user-doc-inline-meta">
+            <span className="user-doc-inline-meta-label">Chủ đề</span>
+            <span className="user-doc-inline-meta-value">
+              {doc?.topic?.topicName || doc?.topic?.topicID || "—"}
+            </span>
+          </div>
+          <div className="user-doc-inline-meta">
+            <span className="user-doc-inline-meta-label">Bài</span>
+            <span className="user-doc-inline-meta-value">
+              {doc?.lesson?.lessonName || doc?.lesson?.lessonID || "—"}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className="user-doc-view-frame">
+        {viewUrl ? (
+          <iframe
+            src={viewUrl}
+            title={doc?.chunkName || doc?.chunkID || "Xem tài liệu"}
+            allow="autoplay"
+          />
+        ) : (
+          <div className="user-doc-empty">Không tìm thấy đường dẫn xem trực tiếp cho tài liệu này.</div>
+        )}
       </div>
     </div>
   );

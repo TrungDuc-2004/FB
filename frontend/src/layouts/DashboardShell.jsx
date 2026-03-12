@@ -684,7 +684,9 @@ export default function DashboardShell({
   showSidebarUser = true,
   topbarTitle = "HỆ THỐNG QUẢN LÝ",
   accountInfoTitle = "Thông tin tài khoản",
+  shellClassName = "",
 }) {
+
   const navigate = useNavigate();
   const location = useLocation();
   const [accountOpen, setAccountOpen] = useState(false);
@@ -716,7 +718,7 @@ export default function DashboardShell({
   }
 
   return (
-    <div className="dash-shell">
+    <div className={`dash-shell ${shellClassName}`.trim()}>
       <aside className="dash-sidebar">
         <div className="dash-brand">
           {brandLogoSrc ? (
