@@ -627,17 +627,22 @@ body.user-shell-clean .topbar-subtitle {
 }
 /* ===== User: chỉ cuộn nội dung, không cuộn menu chức năng ===== */
 /* ===== User: chỉ cuộn nội dung, không cuộn menu chức năng ===== */
+body.user-shell-clean {
+  overflow-y: auto;
+}
+
 body.user-shell-clean .dash-main {
-  height: 100vh;
-  overflow: hidden;
+  min-height: 100vh;
+  height: auto;
+  overflow: visible;
 }
 
 body.user-shell-clean .dash-content {
-  height: calc(100vh - var(--topbar-h));
-  margin-top: var(--topbar-h);
-  padding: 20px;
-  overflow-y: auto;
-  overflow-x: hidden;
+  min-height: calc(100vh - var(--topbar-h));
+  height: auto;
+  margin-top: 0;
+  padding: calc(var(--topbar-h) + 20px) 20px 20px;
+  overflow: visible;
   box-sizing: border-box;
 }
 

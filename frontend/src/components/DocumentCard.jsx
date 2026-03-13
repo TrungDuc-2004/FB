@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 import { Link } from "react-router-dom";
 
 function safeText(...values) {
@@ -8,7 +9,7 @@ function safeText(...values) {
   return "";
 }
 
-function shortText(value, maxLength = 180) {
+function shortText(value, maxLength = 220) {
   const text = safeText(value);
   if (!text) return "";
   return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
@@ -26,34 +27,6 @@ function getItemType(doc) {
 function getSaveCategory(doc) {
   const kind = getItemType(doc);
   return kind === "chunk" ? "document" : kind;
-}
-
-function getTypeLabel(kind) {
-  return (
-    {
-      chunk: "CHUNK",
-      class: "CLASS",
-      subject: "SUBJECT",
-      topic: "TOPIC",
-      lesson: "LESSON",
-      image: "IMAGE",
-      video: "VIDEO",
-    }[kind] || "TÀI LIỆU"
-  );
-}
-
-function getAvatarLabel(kind) {
-  return (
-    {
-      chunk: "CK",
-      class: "CLA",
-      subject: "MH",
-      topic: "CD",
-      lesson: "B",
-      image: "Ả",
-      video: "VD",
-    }[kind] || "TL"
-  );
 }
 
 function getDocId(doc) {
@@ -81,169 +54,150 @@ function getResolvedFileUrl(doc) {
   return safeText(firstWithUrl?.chunkUrl);
 }
 
-function toneByKind(kind) {
-  switch (String(kind || "").toLowerCase()) {
-    case "class":
-      return "blue";
-    case "subject":
-      return "indigo";
-    case "topic":
-      return "violet";
-    case "lesson":
-      return "green";
-    case "image":
-      return "amber";
-    case "video":
-      return "orange";
-    default:
-      return "slate";
-  }
+function getTypeLabel(kind) {
+  return (
+    {
+      chunk: "PDF",
+      class: "CLASS",
+      subject: "SUBJECT",
+      topic: "TOPIC",
+      lesson: "LESSON",
+      image: "IMAGE",
+      video: "VIDEO",
+    }[kind] || "FILE"
+  );
 }
 
-function kindMeta(kind) {
-  switch (String(kind || "").toLowerCase()) {
-    case "class":
-      return { label: "Lớp", avatar: "L" };
-    case "subject":
-      return { label: "Môn học", avatar: "MH" };
-    case "topic":
-      return { label: "Chủ đề", avatar: "CD" };
-    case "lesson":
-      return { label: "Bài học", avatar: "B" };
-    case "image":
-      return { label: "Hình ảnh", avatar: "Ả" };
-    case "video":
-      return { label: "Video", avatar: "VD" };
-    default:
-      return { label: "Tài liệu", avatar: "TL" };
-  }
+function getTypeTitle(kind) {
+  return (
+    {
+      chunk: "Tài liệu",
+      class: "Lớp",
+      subject: "Môn học",
+      topic: "Chủ đề",
+      lesson: "Bài học",
+      image: "Hình ảnh",
+      video: "Video",
+    }[kind] || "Tài liệu"
+  );
+}
+
+function getCoverText(kind) {
+  return (
+    {
+      chunk: "PDF",
+      class: "LỚP",
+      subject: "MH",
+      topic: "CD",
+      lesson: "BÀI",
+      image: "IMG",
+      video: "VID",
+    }[kind] || "FILE"
+  );
+}
+
+function getPreviewImage(doc) {
+  const kind = getItemType(doc);
+  if (kind === "image" && safeText(doc?.chunkUrl)) return safeText(doc.chunkUrl);
+  const firstImage = safeArray(doc?.images).find((item) => safeText(item?.url));
+  if (firstImage?.url) return firstImage.url;
+  return "";
 }
 
 function MetaGroup({ title, value, to }) {
   if (!value) return null;
-
   return (
-    <div className={`user-doc-inline-meta${to ? " is-link" : ""}`}>
-      <span className="user-doc-inline-meta-label">{title}</span>
-      {to ? (
-        <Link className="user-doc-inline-meta-value user-doc-inline-meta-value-link" to={to}>
-          {value}
-        </Link>
-      ) : (
-        <span className="user-doc-inline-meta-value">{value}</span>
-      )}
+    <div className="user-doc-meta-chip">
+      <span>{title}</span>
+      {to ? <Link to={to}>{value}</Link> : <strong>{value}</strong>}
     </div>
   );
+}
+
+function buildStructureItems(doc) {
+  const items = [];
+
+  const subjectId = safeText(doc?.subject?.subjectID);
+  const subjectName = safeText(doc?.subject?.subjectName, subjectId);
+  if (subjectName) items.push({ kind: "subject", id: subjectId || subjectName, title: subjectName });
+
+  const topicId = safeText(doc?.topic?.topicID);
+  const topicName = safeText(doc?.topic?.topicName, topicId);
+  if (topicName) items.push({ kind: "topic", id: topicId || topicName, title: topicName });
+
+  const lessonId = safeText(doc?.lesson?.lessonID);
+  const lessonName = safeText(doc?.lesson?.lessonName, lessonId);
+  if (lessonName) items.push({ kind: "lesson", id: lessonId || lessonName, title: lessonName });
+
+  return items;
 }
 
 export function normalizeRelatedItems(doc) {
   const safeDoc = doc && typeof doc === "object" ? doc : {};
   const items = [];
 
-  const classId = safeText(safeDoc?.class?.classID);
-  const className = safeText(safeDoc?.class?.className, classId);
-  if (className) {
+  for (const entry of buildStructureItems(safeDoc)) {
     items.push({
-      key: `class-${classId || className}`,
-      id: classId || className,
-      kind: "class",
-      title: className,
-      subtitle: classId && classId !== className ? classId : "",
-      description: shortText(
-        safeDoc?.class?.classDescription || "Thông tin lớp được gắn với tài liệu này.",
-        90
-      ),
+      key: `${entry.kind}-${entry.id}`,
+      id: entry.id,
+      kind: entry.kind,
+      title: entry.title,
+      description: `${getTypeTitle(entry.kind)} liên quan tới nội dung hiện tại.`,
       href: "",
-    });
-  }
-
-  const subjectId = safeText(safeDoc?.subject?.subjectID);
-  const subjectName = safeText(safeDoc?.subject?.subjectName, subjectId);
-  if (subjectName) {
-    items.push({
-      key: `subject-${subjectId || subjectName}`,
-      id: subjectId || subjectName,
-      kind: "subject",
-      title: subjectName,
-      subtitle: subjectId && subjectId !== subjectName ? subjectId : "",
-      description: shortText(
-        safeDoc?.subject?.subjectDescription || "Môn học được map theo chunk này.",
-        90
-      ),
-      href: safeText(safeDoc?.subject?.subjectUrl),
+      chunkID: entry.id,
+      itemType: entry.kind,
+      category: entry.kind,
+      class: safeDoc?.class || { classID: "", className: "" },
+      subject: safeDoc?.subject || { subjectID: "", subjectName: "", subjectUrl: "" },
+      topic: safeDoc?.topic || { topicID: "", topicName: "", topicUrl: "" },
+      lesson: safeDoc?.lesson || { lessonID: "", lessonName: "", lessonType: "", lessonUrl: "" },
       mappedDocuments: safeArray(safeDoc?.mappedDocuments),
     });
   }
 
-  const topicId = safeText(safeDoc?.topic?.topicID);
-  const topicName = safeText(safeDoc?.topic?.topicName, topicId);
-  if (topicName) {
+  for (const item of safeArray(safeDoc?.images).slice(0, 6)) {
+    const imageId = safeText(item?.id, item?.url, item?.name);
+    if (!imageId) continue;
     items.push({
-      key: `topic-${topicId || topicName}`,
-      id: topicId || topicName,
-      kind: "topic",
-      title: topicName,
-      subtitle: topicId && topicId !== topicName ? topicId : "",
-      description: shortText(
-        safeDoc?.topic?.topicDescription || "Chủ đề được map theo chunk này.",
-        90
-      ),
-      href: safeText(safeDoc?.topic?.topicUrl),
-      mappedDocuments: safeArray(safeDoc?.mappedDocuments),
-    });
-  }
-
-  const lessonId = safeText(safeDoc?.lesson?.lessonID);
-  const lessonName = safeText(safeDoc?.lesson?.lessonName, lessonId);
-  if (lessonName) {
-    items.push({
-      key: `lesson-${lessonId || lessonName}`,
-      id: lessonId || lessonName,
-      kind: "lesson",
-      title: lessonName,
-      subtitle: lessonId && lessonId !== lessonName ? lessonId : "",
-      description: shortText(
-        safeDoc?.lesson?.lessonDescription || "Bài học được map theo chunk này.",
-        90
-      ),
-      href: safeText(safeDoc?.lesson?.lessonUrl),
-      mappedDocuments: safeArray(safeDoc?.mappedDocuments),
-    });
-  }
-
-  for (const item of safeArray(safeDoc?.images)) {
-    const imageId = safeText(item?.id);
-    const title = safeText(item?.name, imageId, item?.url);
-    if (!title) continue;
-
-    items.push({
-      key: `image-${imageId || item?.url || title}`,
-      id: imageId || title,
+      key: `image-${imageId}`,
+      id: imageId,
       kind: "image",
-      title,
-      subtitle: imageId && imageId !== title ? imageId : "",
-      description: shortText(item?.description || "Hình ảnh liên quan tới chunk này.", 90),
+      title: safeText(item?.name, imageId),
+      description: shortText(item?.description || "Hình ảnh liên quan."),
       href: safeText(item?.url),
-      mappedDocuments: safeArray(safeDoc?.mappedDocuments),
+      chunkID: imageId,
+      chunkName: safeText(item?.name, imageId),
       chunkUrl: safeText(item?.url),
+      itemType: "image",
+      category: "image",
+      class: safeDoc?.class || { classID: "", className: "" },
+      subject: safeDoc?.subject || { subjectID: "", subjectName: "", subjectUrl: "" },
+      topic: safeDoc?.topic || { topicID: "", topicName: "", topicUrl: "" },
+      lesson: safeDoc?.lesson || { lessonID: "", lessonName: "", lessonType: "", lessonUrl: "" },
+      mappedDocuments: safeArray(safeDoc?.mappedDocuments),
     });
   }
 
-  for (const item of safeArray(safeDoc?.videos)) {
-    const videoId = safeText(item?.id);
-    const title = safeText(item?.name, videoId, item?.url);
-    if (!title) continue;
-
+  for (const item of safeArray(safeDoc?.videos).slice(0, 6)) {
+    const videoId = safeText(item?.id, item?.url, item?.name);
+    if (!videoId) continue;
     items.push({
-      key: `video-${videoId || item?.url || title}`,
-      id: videoId || title,
+      key: `video-${videoId}`,
+      id: videoId,
       kind: "video",
-      title,
-      subtitle: videoId && videoId !== title ? videoId : "",
-      description: shortText(item?.description || "Video liên quan tới chunk này.", 90),
+      title: safeText(item?.name, videoId),
+      description: shortText(item?.description || "Video liên quan."),
       href: safeText(item?.url),
-      mappedDocuments: safeArray(safeDoc?.mappedDocuments),
+      chunkID: videoId,
+      chunkName: safeText(item?.name, videoId),
       chunkUrl: safeText(item?.url),
+      itemType: "video",
+      category: "video",
+      class: safeDoc?.class || { classID: "", className: "" },
+      subject: safeDoc?.subject || { subjectID: "", subjectName: "", subjectUrl: "" },
+      topic: safeDoc?.topic || { topicID: "", topicName: "", topicUrl: "" },
+      lesson: safeDoc?.lesson || { lessonID: "", lessonName: "", lessonType: "", lessonUrl: "" },
+      mappedDocuments: safeArray(safeDoc?.mappedDocuments),
     });
   }
 
@@ -252,103 +206,33 @@ export function normalizeRelatedItems(doc) {
 
 export function RelatedEntityCard({ item, onToggleSave }) {
   const safeItem = item && typeof item === "object" ? item : {};
-  const kind = safeText(safeItem?.kind, "chunk").toLowerCase();
-  const meta = kindMeta(kind);
+  const kind = getItemType(safeItem);
   const detailTo = getDetailTo(safeItem);
   const viewTo = getViewTo(safeItem);
   const resolvedFileUrl = getResolvedFileUrl(safeItem);
-  const isSaved = Boolean(safeItem?.isSaved);
-
-  const showOpen = kind !== "class" && Boolean(viewTo && resolvedFileUrl);
-  const showDownload = kind !== "class" && Boolean(resolvedFileUrl);
 
   return (
-    <article className="user-doc-card user-doc-card-clean">
+    <article className="related-entity-card">
+      <div className="related-entity-badge">{getTypeTitle(kind)}</div>
       {detailTo ? (
-        <Link className="user-doc-preview-link" to={detailTo}>
-          <div className={`user-doc-file-avatar user-doc-file-avatar-${kind}`}>{meta.avatar}</div>
+        <Link className="related-entity-title" to={detailTo}>
+          {safeText(safeItem?.title, safeItem?.chunkName, safeItem?.chunkID, "Chưa có tên")}
         </Link>
       ) : (
-        <div className="user-doc-preview-link">
-          <div className={`user-doc-file-avatar user-doc-file-avatar-${kind}`}>{meta.avatar}</div>
-        </div>
+        <div className="related-entity-title">{safeText(safeItem?.title, safeItem?.chunkName, safeItem?.chunkID, "Chưa có tên")}</div>
       )}
-
-      <div className="user-doc-card-main">
-        <div className="user-doc-card-head compact">
-          <div className="user-doc-card-title-wrap">
-            {detailTo ? (
-              <Link className="user-doc-card-title link" to={detailTo}>
-                {safeText(safeItem?.title, "Chưa có tên")}
-              </Link>
-            ) : (
-              <div className="user-doc-card-title">{safeText(safeItem?.title, "Chưa có tên")}</div>
-            )}
-
-            <div className="user-doc-card-badges">
-              <span className="user-doc-badge">{meta.label}</span>
-              {safeItem?.subtitle ? (
-                <span className="user-doc-badge user-doc-badge-subtle">{safeText(safeItem.subtitle)}</span>
-              ) : null}
-            </div>
-          </div>
-
-          <div className="user-doc-card-actions user-doc-card-actions-desktop compact">
-            {detailTo ? (
-              <Link className="btn btn-primary" to={detailTo}>
-                Chi tiết
-              </Link>
-            ) : null}
-
-            {showOpen ? (
-              <Link className="btn" to={viewTo}>
-                Mở file
-              </Link>
-            ) : null}
-
-            {showDownload ? (
-              <a className="btn" href={resolvedFileUrl} target="_blank" rel="noreferrer">
-                Tải tài liệu
-              </a>
-            ) : null}
-
-            {typeof onToggleSave === "function" ? (
-              <button className="btn" type="button" onClick={() => onToggleSave(safeItem)}>
-                {isSaved ? "Bỏ lưu" : "Lưu"}
-              </button>
-            ) : null}
-          </div>
-        </div>
-
-        {safeItem?.description ? (
-          <p className="user-doc-card-desc">{safeText(safeItem.description)}</p>
+      {safeItem?.description ? <p>{shortText(safeItem.description, 90)}</p> : null}
+      <div className="related-entity-actions">
+        {detailTo ? <Link to={detailTo}>Chi tiết</Link> : null}
+        {viewTo && resolvedFileUrl ? <Link to={viewTo}>Mở</Link> : null}
+        {!viewTo && safeItem?.href ? (
+          <a href={safeItem.href} target="_blank" rel="noreferrer">Xem</a>
         ) : null}
-
-        <div className="user-doc-card-actions user-doc-card-actions-mobile compact">
-          {detailTo ? (
-            <Link className="btn btn-primary" to={detailTo}>
-              Chi tiết
-            </Link>
-          ) : null}
-
-          {showOpen ? (
-            <Link className="btn" to={viewTo}>
-              Mở file
-            </Link>
-          ) : null}
-
-          {showDownload ? (
-            <a className="btn" href={resolvedFileUrl} target="_blank" rel="noreferrer">
-              Tải tài liệu
-            </a>
-          ) : null}
-
-          {typeof onToggleSave === "function" ? (
-            <button className="btn" type="button" onClick={() => onToggleSave(safeItem)}>
-              {isSaved ? "Bỏ lưu" : "Lưu"}
-            </button>
-          ) : null}
-        </div>
+        {typeof onToggleSave === "function" ? (
+          <button type="button" onClick={() => onToggleSave(safeItem)}>
+            {safeItem?.isSaved ? "Bỏ lưu" : "Lưu"}
+          </button>
+        ) : null}
       </div>
     </article>
   );
@@ -367,57 +251,75 @@ export function DocumentMappedItems({ doc, onToggleSave }) {
   );
 }
 
-export default function DocumentCard({ doc, onToggleSave }) {
+export default function DocumentCard({ doc, onToggleSave, variant = "default" }) {
   const safeDoc = doc && typeof doc === "object" ? doc : {};
   const kind = getItemType(safeDoc);
-
-  const name = safeText(
-    safeDoc?.chunkName,
-    safeDoc?.name,
-    safeDoc?.chunkID,
-    "Tài liệu chưa đặt tên"
+  const name = safeText(safeDoc?.chunkName, safeDoc?.name, safeDoc?.chunkID, "Tài liệu chưa đặt tên");
+  const desc = shortText(
+    safeDoc?.chunkDescription ||
+      safeDoc?.description ||
+      safeDoc?.topic?.topicDescription ||
+      safeDoc?.subject?.subjectDescription ||
+      safeDoc?.lesson?.lessonDescription,
+    260
   );
-  const desc = safeText(safeDoc?.chunkDescription, safeDoc?.description);
-  const typeLabel = getTypeLabel(kind);
-  const avatarLabel = getAvatarLabel(kind);
   const detailTo = getDetailTo(safeDoc);
   const viewTo = getViewTo(safeDoc);
   const resolvedFileUrl = getResolvedFileUrl(safeDoc);
+  const previewImage = getPreviewImage(safeDoc);
   const saveCategory = getSaveCategory(safeDoc);
+  const showOpen = kind !== "class" && Boolean(viewTo && resolvedFileUrl);
+  const showDownload = kind !== "class" && Boolean(resolvedFileUrl);
 
-  const classId = safeText(safeDoc?.class?.classID);
   const subjectId = safeText(safeDoc?.subject?.subjectID);
   const topicId = safeText(safeDoc?.topic?.topicID);
   const lessonId = safeText(safeDoc?.lesson?.lessonID);
 
-  const className = safeText(safeDoc?.class?.className, classId);
   const subjectName = safeText(safeDoc?.subject?.subjectName, subjectId);
   const topicName = safeText(safeDoc?.topic?.topicName, topicId);
   const lessonName = safeText(safeDoc?.lesson?.lessonName, lessonId);
 
-  const classTo = kind === "chunk" && classId ? `/user/docs/${encodeURIComponent(classId)}?type=class` : null;
-  const subjectTo = kind === "chunk" && subjectId ? `/user/docs/${encodeURIComponent(subjectId)}?type=subject` : null;
-  const topicTo = kind === "chunk" && topicId ? `/user/docs/${encodeURIComponent(topicId)}?type=topic` : null;
-  const lessonTo = kind === "chunk" && lessonId ? `/user/docs/${encodeURIComponent(lessonId)}?type=lesson` : null;
+  const subjectTo = subjectId ? `/user/docs/${encodeURIComponent(subjectId)}?type=subject` : null;
+  const topicTo = topicId ? `/user/docs/${encodeURIComponent(topicId)}?type=topic` : null;
+  const lessonTo = lessonId ? `/user/docs/${encodeURIComponent(lessonId)}?type=lesson` : null;
 
-  const showOpen = kind !== "class" && Boolean(viewTo && resolvedFileUrl);
-  const showDownload = kind !== "class" && Boolean(resolvedFileUrl);
+  const relatedImageCount = safeArray(safeDoc?.images).length;
+  const relatedVideoCount = safeArray(safeDoc?.videos).length;
+  const mappedCount = safeArray(safeDoc?.mappedDocuments).length;
 
   return (
-    <article className="user-doc-card user-doc-card-clean">
-      {detailTo ? (
-        <Link className="user-doc-preview-link" to={detailTo}>
-          <div className={`user-doc-file-avatar user-doc-file-avatar-${kind}`}>{avatarLabel}</div>
-        </Link>
-      ) : (
-        <div className="user-doc-preview-link">
-          <div className={`user-doc-file-avatar user-doc-file-avatar-${kind}`}>{avatarLabel}</div>
-        </div>
-      )}
+    <article className="user-doc-card user-doc-card-scribd">
+      <div className="user-doc-thumb-col">
+        {detailTo ? (
+          <Link className="user-doc-preview-link" to={detailTo}>
+            <div
+              className={`user-doc-thumb user-doc-thumb-${kind}${previewImage ? " has-image" : ""}`}
+              style={previewImage ? { backgroundImage: `url(${previewImage})` } : undefined}
+            >
+              <span className="user-doc-thumb-type">{getTypeLabel(kind)}</span>
+              {!previewImage ? <span className="user-doc-thumb-text">{getCoverText(kind)}</span> : null}
+            </div>
+          </Link>
+        ) : (
+          <div
+            className={`user-doc-thumb user-doc-thumb-${kind}${previewImage ? " has-image" : ""}`}
+            style={previewImage ? { backgroundImage: `url(${previewImage})` } : undefined}
+          >
+            <span className="user-doc-thumb-type">{getTypeLabel(kind)}</span>
+            {!previewImage ? <span className="user-doc-thumb-text">{getCoverText(kind)}</span> : null}
+          </div>
+        )}
+      </div>
 
       <div className="user-doc-card-main">
-        <div className="user-doc-card-head compact">
+        <div className="user-doc-card-head compact scribd-head">
           <div className="user-doc-card-title-wrap">
+            <div className="user-doc-top-metrics">
+              <span>{getTypeTitle(kind)}</span>
+              {safeDoc?.score ? <span>{Math.round(Number(safeDoc.score) * 100)}%</span> : null}
+              {safeDoc?.chunkType ? <span>{safeDoc.chunkType}</span> : null}
+            </div>
+
             {detailTo ? (
               <Link className="user-doc-card-title link" to={detailTo}>
                 {name}
@@ -426,83 +328,45 @@ export default function DocumentCard({ doc, onToggleSave }) {
               <div className="user-doc-card-title">{name}</div>
             )}
 
-            <div className="user-doc-card-badges">
-              <span className="user-doc-badge">{typeLabel}</span>
-              {safeDoc?.chunkID ? (
-                <span className="user-doc-badge user-doc-badge-subtle">{safeDoc.chunkID}</span>
-              ) : null}
-            </div>
+            {desc ? <p className="user-doc-card-desc">{desc}</p> : null}
           </div>
 
-          <div className="user-doc-card-actions user-doc-card-actions-desktop compact">
-            {detailTo ? (
-              <Link className="btn btn-primary" to={detailTo}>
-                Chi tiết
-              </Link>
-            ) : null}
-
-            {showOpen ? (
-              <Link className="btn" to={viewTo}>
-                Mở file
-              </Link>
-            ) : null}
-
-            {showDownload ? (
-              <a className="btn" href={resolvedFileUrl} target="_blank" rel="noreferrer">
-                Tải tài liệu
-              </a>
-            ) : null}
-
+          <div className="user-doc-card-actions user-doc-card-actions-desktop compact scribd-actions">
+            {showOpen ? <Link className="btn btn-ghost" to={viewTo}>Mở</Link> : null}
+            {showDownload ? <a className="btn btn-ghost" href={resolvedFileUrl} target="_blank" rel="noreferrer">Tải</a> : null}
             {typeof onToggleSave === "function" ? (
-              <button
-                className="btn"
-                type="button"
-                onClick={() => onToggleSave({ ...safeDoc, category: saveCategory })}
-              >
+              <button className="btn btn-ghost" type="button" onClick={() => onToggleSave({ ...safeDoc, category: saveCategory })}>
                 {safeDoc?.isSaved ? "Bỏ lưu" : "Lưu"}
               </button>
             ) : null}
           </div>
         </div>
 
-        <div className="user-doc-card-structure user-doc-card-structure-compact">
-          <MetaGroup title="Lớp" value={className} to={classTo} />
-          <MetaGroup title="Môn" value={subjectName} to={subjectTo} />
-          <MetaGroup title="Chủ đề" value={topicName} to={topicTo} />
-          <MetaGroup title="Bài" value={lessonName} to={lessonTo} />
-        </div>
+        {variant !== "search" ? (
+          <div className="user-doc-card-structure user-doc-card-structure-compact user-doc-card-structure-list">
+            <MetaGroup title="Môn" value={subjectName} to={subjectTo} />
+            <MetaGroup title="Chủ đề" value={topicName} to={topicTo} />
+            <MetaGroup title="Bài" value={lessonName} to={lessonTo} />
+          </div>
+        ) : null}
 
-        {desc ? <p className="user-doc-card-desc">{shortText(desc)}</p> : null}
-        {kind !== "chunk" ? <div className="user-doc-card-desc">{safeText(safeDoc?.description)}</div> : null}
+        <div className="user-doc-bottom-row">
+          <div className="user-doc-bottom-tags">
+            {relatedImageCount ? <span>{relatedImageCount} ảnh liên quan</span> : null}
+            {relatedVideoCount ? <span>{relatedVideoCount} video liên quan</span> : null}
+            {mappedCount && kind !== "chunk" ? <span>{mappedCount} tài liệu map</span> : null}
+            {!relatedImageCount && !relatedVideoCount && mappedCount && kind === "chunk" ? <span>{mappedCount} nội dung liên kết</span> : null}
+          </div>
 
-        <div className="user-doc-card-actions user-doc-card-actions-mobile compact">
-          {detailTo ? (
-            <Link className="btn btn-primary" to={detailTo}>
-              Chi tiết
-            </Link>
-          ) : null}
-
-          {showOpen ? (
-            <Link className="btn" to={viewTo}>
-              Mở file
-            </Link>
-          ) : null}
-
-          {showDownload ? (
-            <a className="btn" href={resolvedFileUrl} target="_blank" rel="noreferrer">
-              Tải tài liệu
-            </a>
-          ) : null}
-
-          {typeof onToggleSave === "function" ? (
-            <button
-              className="btn"
-              type="button"
-              onClick={() => onToggleSave({ ...safeDoc, category: saveCategory })}
-            >
-              {safeDoc?.isSaved ? "Bỏ lưu" : "Lưu"}
-            </button>
-          ) : null}
+          <div className="user-doc-card-actions user-doc-card-actions-mobile compact scribd-actions-mobile">
+            {showOpen ? <Link className="btn btn-ghost" to={viewTo}>Mở</Link> : null}
+            {showDownload ? <a className="btn btn-ghost" href={resolvedFileUrl} target="_blank" rel="noreferrer">Tải</a> : null}
+            {typeof onToggleSave === "function" ? (
+              <button className="btn btn-ghost" type="button" onClick={() => onToggleSave({ ...safeDoc, category: saveCategory })}>
+                {safeDoc?.isSaved ? "Bỏ lưu" : "Lưu"}
+              </button>
+            ) : null}
+          </div>
         </div>
       </div>
     </article>

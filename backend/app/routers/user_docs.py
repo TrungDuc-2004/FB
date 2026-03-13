@@ -632,6 +632,122 @@ def _resolve_entity_doc(entity_id: str, *, category: str, username: str, pg: Opt
     return None
 
 
+
+def _load_media_bucket_from_pg(row: Any, collection: str, *, media_type: str, follow_type: str, follow_id: str) -> Optional[dict]:
+    mongo_doc = {}
+    mongo_id = getattr(row, "mongo_id", None)
+    if mongo_id:
+        try:
+            mongo_doc = db_mongo[collection].find_one({"_id": ObjectId(str(mongo_id)), "status": _not_hidden_q()}, {"_id": 0}) or {}
+        except Exception:
+            mongo_doc = db_mongo[collection].find_one({"mongo_id": str(mongo_id), "status": _not_hidden_q()}, {"_id": 0}) or {}
+
+    if not mongo_doc:
+        return None
+
+    if media_type == "image":
+        name = _get_any(mongo_doc, ["imgName", "name", "title"], "") or getattr(row, "img_name", None) or getattr(row, "img_id", None) or ""
+        desc = _get_any(mongo_doc, ["imgDescription", "description"], "") or ""
+        url = _get_any(mongo_doc, ["imgUrl", "url"], "") or ""
+        media_id = getattr(row, "img_id", None) or name
+    else:
+        name = _get_any(mongo_doc, ["videoName", "name", "title"], "") or getattr(row, "video_name", None) or getattr(row, "video_id", None) or ""
+        desc = _get_any(mongo_doc, ["videoDescription", "description"], "") or ""
+        url = _get_any(mongo_doc, ["videoUrl", "url"], "") or ""
+        media_id = getattr(row, "video_id", None) or name
+
+    if not media_id:
+        return None
+
+    return {
+        "type": media_type,
+        "id": str(media_id),
+        "name": str(name or media_id),
+        "description": desc,
+        "url": url,
+        "followType": follow_type,
+        "followID": follow_id,
+    }
+
+
+def _attach_related_media(doc: dict, *, pg: Optional[Session]) -> dict:
+    if not doc or pg is None:
+        return doc
+
+    targets = []
+    item_type = str(doc.get("itemType") or doc.get("category") or "").strip().lower()
+    item_id = str(doc.get("chunkID") or "").strip()
+    if item_type in {"chunk", "document", "class", "subject", "topic", "lesson"} and item_id:
+        targets.append(("chunk" if item_type in {"chunk", "document"} else item_type, item_id))
+
+    lesson_id = _get_any(doc.get("lesson") or {}, ["lessonID", "lessonId", "lesson_id"], "")
+    topic_id = _get_any(doc.get("topic") or {}, ["topicID", "topicId", "topic_id"], "")
+    subject_id = _get_any(doc.get("subject") or {}, ["subjectID", "subjectId", "subject_id"], "")
+
+    if lesson_id:
+        targets.append(("lesson", lesson_id))
+    if topic_id:
+        targets.append(("topic", topic_id))
+    if subject_id:
+        targets.append(("subject", subject_id))
+
+    uniq_targets = []
+    seen = set()
+    for ft, fid in targets:
+        key = (str(ft or "").strip(), str(fid or "").strip())
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        uniq_targets.append(key)
+
+    images = []
+    videos = []
+    for ft, fid in uniq_targets:
+        try:
+            image_rows = pg.query(PgImage).filter(PgImage.follow_type == ft, PgImage.follow_id == fid).all()
+        except Exception:
+            image_rows = []
+        for row in image_rows:
+            item = _load_media_bucket_from_pg(row, COL_IMAGES, media_type="image", follow_type=ft, follow_id=fid)
+            if item:
+                images.append(item)
+
+        try:
+            video_rows = pg.query(PgVideo).filter(PgVideo.follow_type == ft, PgVideo.follow_id == fid).all()
+        except Exception:
+            video_rows = []
+        for row in video_rows:
+            item = _load_media_bucket_from_pg(row, COL_VIDEOS, media_type="video", follow_type=ft, follow_id=fid)
+            if item:
+                videos.append(item)
+
+    def _sort_key(item: dict):
+        priority = {"chunk": 0, "lesson": 1, "topic": 2, "subject": 3}
+        return (priority.get(item.get("followType"), 99), str(item.get("name") or "").lower())
+
+    images.sort(key=_sort_key)
+    videos.sort(key=_sort_key)
+
+    def _uniq_media(items: list[dict]) -> list[dict]:
+        out = []
+        used = set()
+        for item in items:
+            key = str(item.get("id") or item.get("url") or item.get("name") or "").strip()
+            if not key or key in used:
+                continue
+            used.add(key)
+            out.append(item)
+        return out
+
+    images = _uniq_media(images)
+    videos = _uniq_media(videos)
+
+    doc["images"] = images
+    doc["videos"] = videos
+    doc["mediaStats"] = {"totalImages": len(images), "totalVideos": len(videos)}
+    return doc
+
+
 @router.get("/classes")
 def list_classes(category: str = Query("all")):
     ids: set[str] = set()
@@ -837,6 +953,8 @@ def get_doc_detail(
     doc = _resolve_entity_doc(chunkID, category=category, username=username, pg=pg)
     if not doc:
         raise HTTPException(status_code=404, detail="Không tìm thấy tài liệu")
+
+    doc = _attach_related_media(doc, pg=pg)
 
     if doc.get("itemType") == "chunk":
         keyword_items = []
