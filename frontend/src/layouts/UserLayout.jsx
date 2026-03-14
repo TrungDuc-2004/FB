@@ -1,40 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { DashboardIcons } from "./DashboardShell";
+import {
+  clearSearchHistory,
+  listSearchHistory,
+  removeSearchHistory,
+  saveSearchHistory,
+} from "../services/userDocsApi";
 import "../styles/user/layout.css";
 
 const AVATAR_STORAGE_KEY = "account_avatar";
-const RECENT_SEARCHES_KEY = "user_recent_searches_v1";
 const MAX_RECENT = 5;
-
-function readRecentSearches() {
-  try {
-    const raw = localStorage.getItem(RECENT_SEARCHES_KEY);
-    const parsed = JSON.parse(raw || "[]");
-    return Array.isArray(parsed) ? parsed.filter(Boolean).slice(0, MAX_RECENT) : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveRecentSearch(keyword) {
-  const text = String(keyword || "").trim();
-  if (!text) return;
-
-  const current = readRecentSearches();
-  const next = [text, ...current.filter((item) => item !== text)].slice(0, MAX_RECENT);
-  localStorage.setItem(RECENT_SEARCHES_KEY, JSON.stringify(next));
-}
-
-function removeRecentSearch(keyword) {
-  const next = readRecentSearches().filter((item) => item !== keyword);
-  localStorage.setItem(RECENT_SEARCHES_KEY, JSON.stringify(next));
-  return next;
-}
-
-function clearRecentSearches() {
-  localStorage.removeItem(RECENT_SEARCHES_KEY);
-}
 
 function SearchIcon({ size = 18 }) {
   return (
@@ -54,6 +30,16 @@ function CloseIcon({ size = 18 }) {
   );
 }
 
+function HistoryIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <path d="M3.4 9.2A6.6 6.6 0 1 1 5 13.8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+      <path d="M3.6 4.8v4h4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M10 6.6v3.6l2.3 1.6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 function UserAvatar({ avatar, letter, large = false }) {
   return (
     <div className={`user-site-avatar${large ? " large" : ""}`}>
@@ -62,7 +48,18 @@ function UserAvatar({ avatar, letter, large = false }) {
   );
 }
 
-function HeaderSearch({ value, onChange, onSubmit, recentSearches, showRecent, onFocus, recentBoxRef, onClickRecent, onRemoveRecent, onClearRecentAll }) {
+function HeaderSearch({
+  value,
+  onChange,
+  onSubmit,
+  recentSearches,
+  showRecent,
+  onFocus,
+  recentBoxRef,
+  onClickRecent,
+  onRemoveRecent,
+  onClearRecentAll,
+}) {
   return (
     <div className="user-site-search-shell" ref={recentBoxRef}>
       <form className="user-site-search" onSubmit={onSubmit}>
@@ -102,12 +99,17 @@ function HeaderSearch({ value, onChange, onSubmit, recentSearches, showRecent, o
 
           <div className="user-site-search-recent-list">
             {recentSearches.map((item) => (
-              <div key={item} className="user-site-search-recent-item">
-                <button type="button" className="main" onClick={() => onClickRecent(item)}>
+              <div key={item.keyword} className="user-site-search-recent-item">
+                <button type="button" className="main" onClick={() => onClickRecent(item.keyword)}>
                   <span>🕘</span>
-                  <span>{item}</span>
+                  <span>{item.keyword}</span>
                 </button>
-                <button type="button" className="remove" onClick={() => onRemoveRecent(item)} aria-label={`Xóa ${item}`}>
+                <button
+                  type="button"
+                  className="remove"
+                  onClick={() => onRemoveRecent(item.keyword)}
+                  aria-label={`Xóa ${item.keyword}`}
+                >
                   ×
                 </button>
               </div>
@@ -138,7 +140,7 @@ export default function UserLayout() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [globalQuery, setGlobalQuery] = useState("");
   const [showRecent, setShowRecent] = useState(false);
-  const [recentSearches, setRecentSearches] = useState(() => readRecentSearches());
+  const [recentSearches, setRecentSearches] = useState([]);
 
   const username = (localStorage.getItem("username") || "Người dùng").trim() || "Người dùng";
   const role = (localStorage.getItem("role") || "user").toLowerCase();
@@ -146,10 +148,21 @@ export default function UserLayout() {
   const avatarLetter = (username[0] || "U").toUpperCase();
   const roleLabel = role === "admin" ? "Quản trị viên" : "Sinh viên";
 
+  async function refreshRecentSearches() {
+    try {
+      const response = await listSearchHistory({ limit: MAX_RECENT });
+      setRecentSearches(Array.isArray(response?.items) ? response.items : []);
+    } catch (error) {
+      console.error(error);
+      setRecentSearches([]);
+    }
+  }
+
   const navItems = useMemo(
     () => [
       { to: "/user", label: "Khám phá", icon: IHome, end: true },
       { to: "/user/search", label: "Tìm kiếm", icon: ISearch },
+      { to: "/user/history", label: "Lịch sử", icon: <HistoryIcon /> },
       { to: "/user/library", label: "Thư viện", icon: IBook },
       { to: "/user/saved", label: "Đã lưu", icon: IStar },
       { to: "/user/profile", label: "Hồ sơ", icon: IUser },
@@ -164,12 +177,18 @@ export default function UserLayout() {
     };
   }, []);
 
-    useEffect(() => {
+  useEffect(() => {
     const params = new URLSearchParams(location.search || "");
     const nextQuery = params.get("q") || "";
     const frame = window.requestAnimationFrame(() => setGlobalQuery(nextQuery));
     return () => window.cancelAnimationFrame(frame);
   }, [location.pathname, location.search]);
+
+  useEffect(() => {
+    (async () => {
+      await refreshRecentSearches();
+    })();
+  }, [username]);
 
   useEffect(() => {
     function handleClickOutside(event) {
@@ -194,30 +213,52 @@ export default function UserLayout() {
     setMenuOpen(false);
   }
 
-  function handleSearchSubmit(event) {
+  async function handleSearchSubmit(event) {
     event.preventDefault();
     const keyword = globalQuery.trim();
     if (keyword) {
-      saveRecentSearch(keyword);
-      setRecentSearches(readRecentSearches());
+      try {
+        await saveSearchHistory(keyword);
+      } catch (error) {
+        console.error(error);
+      }
+      await refreshRecentSearches();
     }
     goToSearch(keyword);
   }
 
-  function handleClickRecent(keyword) {
+  async function handleClickRecent(keyword) {
     setGlobalQuery(keyword);
-    saveRecentSearch(keyword);
-    setRecentSearches(readRecentSearches());
+    try {
+      await saveSearchHistory(keyword);
+    } catch (error) {
+        console.error(error);
+      }
+    await refreshRecentSearches();
     goToSearch(keyword);
   }
 
-  function handleRemoveRecent(keyword) {
-    setRecentSearches(removeRecentSearch(keyword));
+  async function handleRemoveRecent(keyword) {
+    try {
+      await removeSearchHistory(keyword);
+      await refreshRecentSearches();
+    } catch (error) {
+        console.error(error);
+      }
   }
 
-  function handleClearRecentAll() {
-    clearRecentSearches();
+  async function handleClearRecentAll() {
+    try {
+      await clearSearchHistory();
+    } catch (error) {
+        console.error(error);
+      }
     setRecentSearches([]);
+  }
+
+  async function handleSearchFocus() {
+    setShowRecent(true);
+    await refreshRecentSearches();
   }
 
   function logout() {
@@ -246,7 +287,7 @@ export default function UserLayout() {
             onSubmit={handleSearchSubmit}
             recentSearches={recentSearches}
             showRecent={showRecent}
-            onFocus={() => setShowRecent(true)}
+            onFocus={handleSearchFocus}
             recentBoxRef={recentBoxRef}
             onClickRecent={handleClickRecent}
             onRemoveRecent={handleRemoveRecent}
@@ -290,6 +331,9 @@ export default function UserLayout() {
                   <div className="user-site-user-dropdown-actions">
                     <button type="button" onClick={() => { navigate("/user/profile"); setMenuOpen(false); }}>
                       Mở hồ sơ
+                    </button>
+                    <button type="button" onClick={() => { navigate("/user/history"); setMenuOpen(false); }}>
+                      Xem lịch sử xem
                     </button>
                     <button type="button" onClick={() => { navigate("/user/saved"); setMenuOpen(false); }}>
                       Xem tài liệu đã lưu

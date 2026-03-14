@@ -18,6 +18,7 @@ import UserHome from "./pages/user/UserHome";
 import Search from "./pages/user/UserSearch";
 import Library from "./pages/user/UserLibrary";
 import Saved from "./pages/user/UserSaved";
+import History from "./pages/user/UserHistory";
 import DocumentDetail from "./pages/user/UserDocDetail";
 import DocumentView from "./pages/user/DocumentView";
 import Profile from "./pages/user/UserProfile";
@@ -61,6 +62,7 @@ export default function App() {
           <Route path="list" element={<Navigate to="/user/library" replace />} />
           <Route path="user-library" element={<Library />} />
           <Route path="saved" element={<Saved />} />
+          <Route path="history" element={<History />} />
           <Route path="docs/:chunkID" element={<DocumentDetail />} />
           <Route path="view/:chunkID" element={<DocumentView />} />
           <Route path="profile" element={<Profile />} />

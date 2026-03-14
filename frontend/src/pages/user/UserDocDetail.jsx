@@ -131,11 +131,12 @@ export default function UserDocDetail() {
     }
   }
 
-  const mappedFallbackUrl = Array.isArray(doc?.mappedDocuments)
+  const itemType = String(doc?.itemType || currentType || "document").toLowerCase();
+  const mappedFallbackUrl = Array.isArray(doc?.mappedDocuments) && ["chunk", "document", "image", "video"].includes(itemType)
     ? doc.mappedDocuments.find((item) => item?.chunkUrl)?.chunkUrl || ""
     : "";
 
-  const originalUrl = currentType === "class" ? "" : doc?.chunkUrl || mappedFallbackUrl || "";
+  const originalUrl = itemType === "class" ? "" : doc?.chunkUrl || mappedFallbackUrl || "";
   const viewUrl = view?.viewUrl || originalUrl;
   const ext = useMemo(() => getExt(viewUrl || originalUrl), [viewUrl, originalUrl]);
   const kindLabel = useMemo(() => getTypeLabel(doc?.itemType || currentType), [doc, currentType]);
@@ -151,7 +152,7 @@ export default function UserDocDetail() {
   const canIframe = ["pdf"].includes(ext);
   const canImage = ["png", "jpg", "jpeg", "webp", "gif"].includes(ext);
   const canVideo = ["mp4", "webm", "ogg"].includes(ext);
-  const isClass = String(doc?.itemType || currentType).toLowerCase() === "class";
+  const isClass = itemType === "class";
 
   const hierarchyItems = buildHierarchy(doc || {});
   const mediaItems = buildMedia(doc || {});

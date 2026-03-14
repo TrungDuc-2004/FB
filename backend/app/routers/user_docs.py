@@ -36,6 +36,8 @@ COL_LESSONS = "lessons"
 COL_CHUNKS = "chunks"
 COL_KEYWORDS = "keywords"
 COL_SAVED = "user_saved_chunks"
+COL_VIEW_HISTORY = "user_view_history"
+COL_SEARCH_HISTORY = "user_search_history"
 COL_IMAGES = "images"
 COL_VIDEOS = "videos"
 
@@ -93,18 +95,112 @@ def _sort_key_by_number(s: str):
     return (int(m.group(1)) if m else 999, str(s or ""))
 
 
-def _ensure_saved_index():
+def _ensure_user_indexes():
     try:
         db_mongo[COL_SAVED].create_index(
             [("username", 1), ("chunkID", 1), ("category", 1)],
             unique=True,
-            name="uniq_user_chunk",
+            name="uniq_user_saved_chunk",
+        )
+    except Exception:
+        pass
+
+    try:
+        db_mongo[COL_VIEW_HISTORY].create_index(
+            [("username", 1), ("chunkID", 1), ("category", 1)],
+            unique=True,
+            name="uniq_user_view_chunk",
+        )
+    except Exception:
+        pass
+
+    try:
+        db_mongo[COL_VIEW_HISTORY].create_index(
+            [("username", 1), ("viewedAt", -1)],
+            name="idx_user_viewed_at",
+        )
+    except Exception:
+        pass
+
+    try:
+        db_mongo[COL_SEARCH_HISTORY].create_index(
+            [("username", 1), ("keywordKey", 1)],
+            unique=True,
+            name="uniq_user_search_keyword",
+        )
+    except Exception:
+        pass
+
+    try:
+        db_mongo[COL_SEARCH_HISTORY].create_index(
+            [("username", 1), ("searchedAt", -1)],
+            name="idx_user_search_at",
         )
     except Exception:
         pass
 
 
-_ensure_saved_index()
+_ensure_user_indexes()
+
+
+def _clean_history_keyword(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _normalize_history_keyword_key(value: Any) -> str:
+    return _clean_history_keyword(value).casefold()
+
+
+def _record_search_history(username: str, keyword: str):
+    clean = _clean_history_keyword(keyword)
+    key = _normalize_history_keyword_key(clean)
+    if not username or not clean or not key:
+        return
+
+    now = _now()
+    db_mongo[COL_SEARCH_HISTORY].update_one(
+        {"username": username, "keywordKey": key},
+        {
+            "$set": {
+                "keyword": clean,
+                "keywordKey": key,
+                "searchedAt": now,
+                "updatedAt": now,
+            },
+            "$setOnInsert": {"createdAt": now},
+        },
+        upsert=True,
+    )
+
+
+def _record_view_history(username: str, chunk_id: str, category: str, pg: Optional[Session] = None):
+    if not username or not chunk_id:
+        return
+
+    doc = _resolve_entity_doc(chunk_id, category=category, username=username, pg=pg)
+    if not doc:
+        return
+
+    now = _now()
+    key = {
+        "username": username,
+        "chunkID": str(doc.get("chunkID") or chunk_id),
+        "category": str(doc.get("category") or category or "document"),
+    }
+    db_mongo[COL_VIEW_HISTORY].update_one(
+        key,
+        {
+            "$set": {
+                "chunkName": str(doc.get("chunkName") or "").strip(),
+                "chunkType": str(doc.get("chunkType") or "").strip(),
+                "itemType": str(doc.get("itemType") or key["category"] or "document").strip(),
+                "viewedAt": now,
+                "updatedAt": now,
+            },
+            "$setOnInsert": {"createdAt": now},
+        },
+        upsert=True,
+    )
 
 
 def _id_match(prefix: str, value: str) -> dict:
@@ -225,6 +321,78 @@ def _mongo_chunk_from_pg(bundle: Optional[dict]) -> dict:
 
     return patched
 
+
+
+
+def _mongo_doc_from_pg_row(collection: str, row: Any) -> dict:
+    mongo_id = getattr(row, "mongo_id", None)
+    if not mongo_id:
+        return {}
+
+    found = None
+    try:
+        found = db_mongo[collection].find_one(
+            {"_id": ObjectId(str(mongo_id)), "status": _not_hidden_q()},
+            {"_id": 0},
+        )
+    except Exception:
+        found = None
+
+    if not found:
+        found = (
+            db_mongo[collection].find_one(
+                {"mongo_id": str(mongo_id), "status": _not_hidden_q()},
+                {"_id": 0},
+            )
+            or {}
+        )
+
+    return found or {}
+
+
+def _pg_row_by_kind(pg: Optional[Session], kind: str, entity_id: str):
+    if pg is None or not entity_id:
+        return None
+
+    kind = str(kind or "").strip().lower()
+    if kind == "class":
+        return pg.query(PgClass).filter(PgClass.class_id == entity_id).first()
+    if kind == "subject":
+        return pg.query(PgSubject).filter(PgSubject.subject_id == entity_id).first()
+    if kind == "topic":
+        return pg.query(PgTopic).filter(PgTopic.topic_id == entity_id).first()
+    if kind == "lesson":
+        return pg.query(PgLesson).filter(PgLesson.lesson_id == entity_id).first()
+    return None
+
+
+def _resolve_hierarchy_docs_from_pg(pg: Optional[Session], *, class_id: str = "", subject_id: str = "", topic_id: str = "", lesson_id: str = "") -> dict:
+    out = {"class": {}, "subject": {}, "topic": {}, "lesson": {}}
+    if pg is None:
+        return out
+
+    pg_class = _pg_row_by_kind(pg, "class", class_id) if class_id else None
+    pg_subject = _pg_row_by_kind(pg, "subject", subject_id) if subject_id else None
+    pg_topic = _pg_row_by_kind(pg, "topic", topic_id) if topic_id else None
+    pg_lesson = _pg_row_by_kind(pg, "lesson", lesson_id) if lesson_id else None
+
+    if pg_lesson and not pg_topic:
+        pg_topic = _pg_row_by_kind(pg, "topic", getattr(pg_lesson, "topic_id", None) or "")
+    if pg_topic and not pg_subject:
+        pg_subject = _pg_row_by_kind(pg, "subject", getattr(pg_topic, "subject_id", None) or "")
+    if pg_subject and not pg_class:
+        pg_class = _pg_row_by_kind(pg, "class", getattr(pg_subject, "class_id", None) or "")
+
+    out["class"] = _mongo_doc_from_pg_row(COL_CLASSES, pg_class) if pg_class else {}
+    out["subject"] = _mongo_doc_from_pg_row(COL_SUBJECTS, pg_subject) if pg_subject else {}
+    out["topic"] = _mongo_doc_from_pg_row(COL_TOPICS, pg_topic) if pg_topic else {}
+    out["lesson"] = _mongo_doc_from_pg_row(COL_LESSONS, pg_lesson) if pg_lesson else {}
+
+    out["pg_class"] = pg_class
+    out["pg_subject"] = pg_subject
+    out["pg_topic"] = pg_topic
+    out["pg_lesson"] = pg_lesson
+    return out
 
 def _resolve_chunk(chunk_id: str, pg: Optional[Session]) -> tuple[dict, Optional[dict]]:
     mongo_chunk = _mongo_find_chunk_direct(chunk_id)
@@ -534,56 +702,130 @@ def _resolve_entity_doc(entity_id: str, *, category: str, username: str, pg: Opt
             return _build_doc_from_pg(pg_bundle, category="document", username=username)
         return None
 
-    if kind == "class":
-        cls = _mongo_find_one_by_id(COL_CLASSES, "class", entity_id)
-        class_info = {"classID": entity_id, "className": _pretty_class_name(cls) or _pretty_class_name_from_text(entity_id)}
-        doc = _build_generic_doc(item_id=entity_id, item_name=class_info["className"], item_type="class", username=username, item_url=_get_any(cls, ["classUrl", "class_url", "url"], "") or "", item_description=_get_any(cls, ["classDescription", "class_description", "description"], "") or "", class_info=class_info)
-        doc["mappedDocuments"] = _load_mapped_chunks_for_target("class", entity_id, username=username, pg=pg)
-        return doc
+    if kind in ("class", "subject", "topic", "lesson"):
+        mongo_doc = _mongo_find_one_by_id(
+            {"class": COL_CLASSES, "subject": COL_SUBJECTS, "topic": COL_TOPICS, "lesson": COL_LESSONS}[kind],
+            kind,
+            entity_id,
+        )
+        pg_row = _pg_row_by_kind(pg, kind, entity_id)
+        mongo_from_pg = _mongo_doc_from_pg_row(
+            {"class": COL_CLASSES, "subject": COL_SUBJECTS, "topic": COL_TOPICS, "lesson": COL_LESSONS}[kind],
+            pg_row,
+        ) if pg_row else {}
+        entity_doc = mongo_doc or mongo_from_pg or {}
 
-    if kind == "subject":
-        subject = _mongo_find_one_by_id(COL_SUBJECTS, "subject", entity_id)
-        class_id = _get_any(subject, ["classID", "classId", "class_id"], "")
-        cls = _mongo_find_one_by_id(COL_CLASSES, "class", class_id)
-        class_info = {"classID": class_id or "", "className": _pretty_class_name(cls) or _pretty_class_name_from_text(class_id or "")}
-        subject_info = {"subjectID": entity_id, "subjectName": _get_any(subject, ["subjectName", "subject_name", "name", "title"], "") or entity_id, "subjectUrl": _get_any(subject, ["subjectUrl", "subject_url", "url"], "") or ""}
-        doc = _build_generic_doc(item_id=entity_id, item_name=subject_info["subjectName"], item_type="subject", username=username, item_url=subject_info["subjectUrl"], item_description=_get_any(subject, ["subjectDescription", "subject_description", "description"], "") or "", class_info=class_info, subject_info=subject_info)
-        doc["mappedDocuments"] = _load_mapped_chunks_for_target("subject", entity_id, username=username, pg=pg)
-        if not doc.get("chunkUrl") and doc.get("mappedDocuments"):
-            doc["chunkUrl"] = _get_any(doc["mappedDocuments"][0], ["chunkUrl", "chunk_url", "url"], "") or ""
-        return doc
+        if not entity_doc and not pg_row:
+            return None
 
-    if kind == "topic":
-        topic = _mongo_find_one_by_id(COL_TOPICS, "topic", entity_id)
-        subject_id = _get_any(topic, ["subjectID", "subjectId", "subject_id"], "")
-        subject = _mongo_find_one_by_id(COL_SUBJECTS, "subject", subject_id)
-        class_id = _get_any(subject, ["classID", "classId", "class_id"], "")
-        cls = _mongo_find_one_by_id(COL_CLASSES, "class", class_id)
-        class_info = {"classID": class_id or "", "className": _pretty_class_name(cls) or _pretty_class_name_from_text(class_id or "")}
-        subject_info = {"subjectID": subject_id or "", "subjectName": _get_any(subject, ["subjectName", "subject_name", "name", "title"], "") or subject_id or "", "subjectUrl": _get_any(subject, ["subjectUrl", "subject_url", "url"], "") or ""}
-        topic_info = {"topicID": entity_id, "topicName": _get_any(topic, ["topicName", "topic_name", "name", "title"], "") or entity_id, "topicUrl": _get_any(topic, ["topicUrl", "topic_url", "url"], "") or ""}
-        doc = _build_generic_doc(item_id=entity_id, item_name=topic_info["topicName"], item_type="topic", username=username, item_url=topic_info["topicUrl"], item_description=_get_any(topic, ["topicDescription", "topic_description", "description"], "") or "", class_info=class_info, subject_info=subject_info, topic_info=topic_info)
-        doc["mappedDocuments"] = _load_mapped_chunks_for_target("topic", entity_id, username=username, pg=pg)
-        if not doc.get("chunkUrl") and doc.get("mappedDocuments"):
-            doc["chunkUrl"] = _get_any(doc["mappedDocuments"][0], ["chunkUrl", "chunk_url", "url"], "") or ""
-        return doc
+        # Resolve hierarchy from mongo first, then fallback to PostgreSQL->mongo_id.
+        class_id = ""
+        subject_id = ""
+        topic_id = ""
+        lesson_id = ""
 
-    if kind == "lesson":
-        lesson = _mongo_find_one_by_id(COL_LESSONS, "lesson", entity_id)
-        topic_id = _get_any(lesson, ["topicID", "topicId", "topic_id"], "")
-        topic = _mongo_find_one_by_id(COL_TOPICS, "topic", topic_id)
-        subject_id = _get_any(topic, ["subjectID", "subjectId", "subject_id"], "")
-        subject = _mongo_find_one_by_id(COL_SUBJECTS, "subject", subject_id)
-        class_id = _get_any(subject, ["classID", "classId", "class_id"], "")
-        cls = _mongo_find_one_by_id(COL_CLASSES, "class", class_id)
-        class_info = {"classID": class_id or "", "className": _pretty_class_name(cls) or _pretty_class_name_from_text(class_id or "")}
-        subject_info = {"subjectID": subject_id or "", "subjectName": _get_any(subject, ["subjectName", "subject_name", "name", "title"], "") or subject_id or "", "subjectUrl": _get_any(subject, ["subjectUrl", "subject_url", "url"], "") or ""}
-        topic_info = {"topicID": topic_id or "", "topicName": _get_any(topic, ["topicName", "topic_name", "name", "title"], "") or topic_id or "", "topicUrl": _get_any(topic, ["topicUrl", "topic_url", "url"], "") or ""}
-        lesson_info = {"lessonID": entity_id, "lessonName": _get_any(lesson, ["lessonName", "lesson_name", "name", "title"], "") or entity_id, "lessonType": _get_any(lesson, ["lessonType", "lesson_type", "type"], "") or "", "lessonUrl": _get_any(lesson, ["lessonUrl", "lesson_url", "url"], "") or ""}
-        doc = _build_generic_doc(item_id=entity_id, item_name=lesson_info["lessonName"], item_type="lesson", username=username, item_url=lesson_info["lessonUrl"], item_description=_get_any(lesson, ["lessonDescription", "lesson_description", "description"], "") or "", class_info=class_info, subject_info=subject_info, topic_info=topic_info, lesson_info=lesson_info, chunk_type=lesson_info["lessonType"])
-        doc["mappedDocuments"] = _load_mapped_chunks_for_target("lesson", entity_id, username=username, pg=pg)
-        if not doc.get("chunkUrl") and doc.get("mappedDocuments"):
-            doc["chunkUrl"] = _get_any(doc["mappedDocuments"][0], ["chunkUrl", "chunk_url", "url"], "") or ""
+        if kind == "class":
+            class_id = entity_id
+        elif kind == "subject":
+            subject_id = entity_id
+            class_id = _get_any(entity_doc, ["classID", "classId", "class_id"], "") or getattr(pg_row, "class_id", "") or ""
+        elif kind == "topic":
+            topic_id = entity_id
+            subject_id = _get_any(entity_doc, ["subjectID", "subjectId", "subject_id"], "") or getattr(pg_row, "subject_id", "") or ""
+            class_id = ""
+        elif kind == "lesson":
+            lesson_id = entity_id
+            topic_id = _get_any(entity_doc, ["topicID", "topicId", "topic_id"], "") or getattr(pg_row, "topic_id", "") or ""
+
+        hierarchy = _resolve_hierarchy_docs_from_pg(pg, class_id=class_id, subject_id=subject_id, topic_id=topic_id, lesson_id=lesson_id)
+
+        class_doc = _mongo_find_one_by_id(COL_CLASSES, "class", class_id) if class_id else {}
+        if not class_doc:
+            class_doc = hierarchy.get("class") or {}
+        pg_class = hierarchy.get("pg_class")
+
+        if not subject_id and kind in ("topic", "lesson"):
+            subject_id = getattr(hierarchy.get("pg_topic"), "subject_id", "") or getattr(hierarchy.get("pg_subject"), "subject_id", "") or ""
+        subject_doc = _mongo_find_one_by_id(COL_SUBJECTS, "subject", subject_id) if subject_id else {}
+        if not subject_doc:
+            subject_doc = hierarchy.get("subject") or {}
+        pg_subject = hierarchy.get("pg_subject")
+
+        if not topic_id and kind == "lesson":
+            topic_id = getattr(hierarchy.get("pg_lesson"), "topic_id", "") or ""
+        topic_doc = _mongo_find_one_by_id(COL_TOPICS, "topic", topic_id) if topic_id else {}
+        if not topic_doc:
+            topic_doc = hierarchy.get("topic") or {}
+        pg_topic = hierarchy.get("pg_topic")
+
+        lesson_doc = _mongo_find_one_by_id(COL_LESSONS, "lesson", lesson_id) if lesson_id else {}
+        if not lesson_doc:
+            lesson_doc = hierarchy.get("lesson") or {}
+        pg_lesson = hierarchy.get("pg_lesson")
+
+        if kind == "subject" and not class_id:
+            class_id = getattr(pg_subject, "class_id", "") or _get_any(subject_doc, ["classID", "classId", "class_id"], "") or ""
+        if kind == "topic" and not subject_id:
+            subject_id = getattr(pg_topic, "subject_id", "") or _get_any(topic_doc, ["subjectID", "subjectId", "subject_id"], "") or ""
+        if kind == "lesson" and not topic_id:
+            topic_id = getattr(pg_lesson, "topic_id", "") or _get_any(lesson_doc, ["topicID", "topicId", "topic_id"], "") or ""
+
+        class_info = {
+            "classID": class_id or getattr(pg_class, "class_id", "") or "",
+            "className": _pretty_class_name(class_doc) or _pretty_class_name_from_text(getattr(pg_class, "class_name", None) or class_id or ""),
+        }
+        subject_info = {
+            "subjectID": subject_id or getattr(pg_subject, "subject_id", "") or "",
+            "subjectName": _get_any(subject_doc, ["subjectName", "subject_name", "name", "title"], "") or getattr(pg_subject, "subject_name", None) or subject_id or "",
+            "subjectUrl": _get_any(subject_doc, ["subjectUrl", "subject_url", "url"], "") or "",
+        }
+        topic_info = {
+            "topicID": topic_id or getattr(pg_topic, "topic_id", "") or "",
+            "topicName": _get_any(topic_doc, ["topicName", "topic_name", "name", "title"], "") or getattr(pg_topic, "topic_name", None) or topic_id or "",
+            "topicUrl": _get_any(topic_doc, ["topicUrl", "topic_url", "url"], "") or "",
+        }
+        lesson_info = {
+            "lessonID": lesson_id or getattr(pg_lesson, "lesson_id", "") or "",
+            "lessonName": _get_any(lesson_doc, ["lessonName", "lesson_name", "name", "title"], "") or getattr(pg_lesson, "lesson_name", None) or lesson_id or "",
+            "lessonType": _get_any(lesson_doc, ["lessonType", "lesson_type", "type"], "") or "",
+            "lessonUrl": _get_any(lesson_doc, ["lessonUrl", "lesson_url", "url"], "") or "",
+        }
+
+        if kind == "class":
+            item_name = class_info["className"] or entity_id
+            item_url = _get_any(entity_doc, ["classUrl", "class_url", "url"], "") or ""
+            item_desc = _get_any(entity_doc, ["classDescription", "class_description", "description"], "") or ""
+            chunk_type = "class"
+        elif kind == "subject":
+            item_name = subject_info["subjectName"] or entity_id
+            item_url = subject_info["subjectUrl"] or ""
+            item_desc = _get_any(entity_doc, ["subjectDescription", "subject_description", "description"], "") or ""
+            chunk_type = "subject"
+        elif kind == "topic":
+            item_name = topic_info["topicName"] or entity_id
+            item_url = topic_info["topicUrl"] or ""
+            item_desc = _get_any(entity_doc, ["topicDescription", "topic_description", "description"], "") or ""
+            chunk_type = "topic"
+        else:
+            item_name = lesson_info["lessonName"] or entity_id
+            item_url = lesson_info["lessonUrl"] or ""
+            item_desc = _get_any(entity_doc, ["lessonDescription", "lesson_description", "description"], "") or ""
+            chunk_type = lesson_info["lessonType"] or "lesson"
+
+        doc = _build_generic_doc(
+            item_id=entity_id,
+            item_name=item_name,
+            item_type=kind,
+            username=username,
+            item_url=item_url,
+            item_description=item_desc,
+            class_info=class_info,
+            subject_info=subject_info,
+            topic_info=topic_info,
+            lesson_info=lesson_info,
+            chunk_type=chunk_type,
+        )
+        doc["mappedDocuments"] = _load_mapped_chunks_for_target(kind, entity_id, username=username, pg=pg)
         return doc
 
     if kind in ("image", "video") and pg is not None:
@@ -630,7 +872,6 @@ def _resolve_entity_doc(entity_id: str, *, category: str, username: str, pg: Opt
         return doc
 
     return None
-
 
 
 def _load_media_bucket_from_pg(row: Any, collection: str, *, media_type: str, follow_type: str, follow_id: str) -> Optional[dict]:
@@ -925,6 +1166,12 @@ def search(
     neo=Depends(get_neo4j_session),
 ):
     username = _actor(request)
+    if q and offset == 0:
+        try:
+            _record_search_history(username, q)
+        except Exception:
+            pass
+
     return semantic_search(
         q=q,
         category=category,
@@ -942,6 +1189,133 @@ def search(
     )
 
 
+@router.post("/history/search")
+def save_search_history(request: Request, q: str = Query("")):
+    username = _actor(request)
+    clean = _clean_history_keyword(q)
+    if not clean:
+        return {"saved": False, "items": []}
+
+    _record_search_history(username, clean)
+    items = list_search_history(request, limit=5).get("items", [])
+    return {"saved": True, "items": items}
+
+
+@router.get("/history/search/list")
+def list_search_history(
+    request: Request,
+    limit: int = Query(5, ge=1, le=500),
+):
+    username = _actor(request)
+    cur = (
+        db_mongo[COL_SEARCH_HISTORY]
+        .find({"username": username}, {"_id": 0, "keyword": 1, "searchedAt": 1, "updatedAt": 1})
+        .sort([("searchedAt", -1), ("updatedAt", -1)])
+        .limit(limit)
+    )
+
+    items = []
+    for row in cur:
+        keyword = _clean_history_keyword(row.get("keyword"))
+        if not keyword:
+            continue
+        items.append({
+            "keyword": keyword,
+            "searchedAt": row.get("searchedAt") or row.get("updatedAt"),
+        })
+    return {"total": len(items), "items": items}
+
+
+@router.delete("/history/search/item")
+def remove_search_history_item(request: Request, q: str = Query("")):
+    username = _actor(request)
+    key = _normalize_history_keyword_key(q)
+    if not key:
+        return {"removed": False}
+
+    res = db_mongo[COL_SEARCH_HISTORY].delete_one({"username": username, "keywordKey": key})
+    return {"removed": res.deleted_count > 0}
+
+
+@router.delete("/history/search/clear")
+def clear_search_history(request: Request):
+    username = _actor(request)
+    res = db_mongo[COL_SEARCH_HISTORY].delete_many({"username": username})
+    return {"cleared": True, "deleted": res.deleted_count}
+
+
+@router.post("/history/view/{chunkID}")
+def save_view_history(
+    request: Request,
+    chunkID: str,
+    category: str = Query("document"),
+    pg: Session = Depends(get_db),
+):
+    username = _actor(request)
+    _record_view_history(username, chunkID, category, pg=pg)
+    return {"saved": True}
+
+
+@router.get("/history/view/list")
+def list_view_history(
+    request: Request,
+    category: str = Query("all"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    pg: Session = Depends(get_db),
+):
+    username = _actor(request)
+
+    q: dict[str, Any] = {"username": username}
+    if category != "all":
+        q["category"] = category
+
+    cur = (
+        db_mongo[COL_VIEW_HISTORY]
+        .find(q, {"_id": 0, "chunkID": 1, "category": 1, "viewedAt": 1, "updatedAt": 1})
+        .sort([("viewedAt", -1), ("updatedAt", -1)])
+        .skip(offset)
+        .limit(limit)
+    )
+
+    rows = list(cur)
+    items = []
+    for row in rows:
+        cid = str(row.get("chunkID") or "").strip()
+        row_category = str(row.get("category") or "document").strip() or "document"
+        if not cid:
+            continue
+        doc = _resolve_entity_doc(cid, category=row_category, username=username, pg=pg)
+        if not doc:
+            continue
+        doc["historyViewedAt"] = row.get("viewedAt") or row.get("updatedAt")
+        items.append(doc)
+
+    total = db_mongo[COL_VIEW_HISTORY].count_documents(q)
+    return {"total": total, "items": items}
+
+
+@router.delete("/history/view/clear")
+def clear_view_history(request: Request, category: str = Query("all")):
+    username = _actor(request)
+    q: dict[str, Any] = {"username": username}
+    if category != "all":
+        q["category"] = category
+    res = db_mongo[COL_VIEW_HISTORY].delete_many(q)
+    return {"cleared": True, "deleted": res.deleted_count}
+
+
+@router.delete("/history/view/{chunkID}")
+def remove_view_history_item(request: Request, chunkID: str, category: str = Query("document")):
+    username = _actor(request)
+    res = db_mongo[COL_VIEW_HISTORY].delete_one({
+        "username": username,
+        "chunkID": chunkID,
+        "category": category,
+    })
+    return {"removed": res.deleted_count > 0}
+
+
 @router.get("/{chunkID}")
 def get_doc_detail(
     request: Request,
@@ -953,6 +1327,11 @@ def get_doc_detail(
     doc = _resolve_entity_doc(chunkID, category=category, username=username, pg=pg)
     if not doc:
         raise HTTPException(status_code=404, detail="Không tìm thấy tài liệu")
+
+    try:
+        _record_view_history(username, chunkID, category, pg=pg)
+    except Exception:
+        pass
 
     doc = _attach_related_media(doc, pg=pg)
 
@@ -1032,11 +1411,17 @@ def view_doc(
     if not doc:
         raise HTTPException(status_code=404, detail="Không tìm thấy URL xem tài liệu")
 
-    if str(doc.get("itemType") or category or "").lower() == "class":
+    try:
+        _record_view_history(username, chunkID, category, pg=pg)
+    except Exception:
+        pass
+
+    item_type = str(doc.get("itemType") or category or "").lower()
+    if item_type == "class":
         raise HTTPException(status_code=404, detail="Lớp không có file trực tiếp")
 
     original_url = doc.get("chunkUrl") or ""
-    if not original_url:
+    if not original_url and item_type in ("chunk", "document", "image", "video"):
         for item in doc.get("mappedDocuments") or []:
             if item.get("chunkUrl"):
                 original_url = item.get("chunkUrl")

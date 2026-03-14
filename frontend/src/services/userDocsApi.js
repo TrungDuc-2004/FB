@@ -190,3 +190,54 @@ export function listSaved({ category = "document", limit = 50, offset = 0 } = {}
   url.searchParams.set("_ts", String(Date.now()));
   return httpJson(url.toString(), { method: "GET" });
 }
+
+export function saveSearchHistory(q = "") {
+  const url = new URL(`${API_BASE}/user/docs/history/search`);
+  if (q) url.searchParams.set("q", q);
+  return httpJson(url.toString(), { method: "POST" });
+}
+
+export function listSearchHistory({ limit = 5 } = {}) {
+  const url = new URL(`${API_BASE}/user/docs/history/search/list`);
+  url.searchParams.set("limit", String(limit));
+  url.searchParams.set("_ts", String(Date.now()));
+  return httpJson(url.toString(), { method: "GET" });
+}
+
+export function removeSearchHistory(q = "") {
+  const url = new URL(`${API_BASE}/user/docs/history/search/item`);
+  if (q) url.searchParams.set("q", q);
+  return httpJson(url.toString(), { method: "DELETE" });
+}
+
+export function clearSearchHistory() {
+  const url = new URL(`${API_BASE}/user/docs/history/search/clear`);
+  return httpJson(url.toString(), { method: "DELETE" });
+}
+
+export function saveViewHistory(chunkID, { category = "document" } = {}) {
+  const url = new URL(`${API_BASE}/user/docs/history/view/${encodeURIComponent(chunkID)}`);
+  url.searchParams.set("category", category);
+  return httpJson(url.toString(), { method: "POST" });
+}
+
+export function listViewHistory({ category = "all", limit = 50, offset = 0 } = {}) {
+  const url = new URL(`${API_BASE}/user/docs/history/view/list`);
+  url.searchParams.set("category", category);
+  url.searchParams.set("limit", String(limit));
+  url.searchParams.set("offset", String(offset));
+  url.searchParams.set("_ts", String(Date.now()));
+  return httpJson(url.toString(), { method: "GET" });
+}
+
+export function removeViewHistory(chunkID, { category = "document" } = {}) {
+  const url = new URL(`${API_BASE}/user/docs/history/view/${encodeURIComponent(chunkID)}`);
+  url.searchParams.set("category", category);
+  return httpJson(url.toString(), { method: "DELETE" });
+}
+
+export function clearViewHistory({ category = "all" } = {}) {
+  const url = new URL(`${API_BASE}/user/docs/history/view/clear`);
+  url.searchParams.set("category", category);
+  return httpJson(url.toString(), { method: "DELETE" });
+}
