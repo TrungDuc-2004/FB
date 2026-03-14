@@ -89,6 +89,7 @@ export default function MinIO() {
 
   const isRoot = currentPath === "";
   const isStorage = ["documents", "images", "video"].includes(section);
+  const isMediaStorage = ["images", "video"].includes(section);
 
   const lastSeg = normalizeFolderType(parts[parts.length - 1] || "");
   const isTypeFolder = ["subject", "topic", "lesson", "chunk"].includes(lastSeg);
@@ -101,9 +102,10 @@ export default function MinIO() {
   const isCategoryLevel =
     isStorage &&
     ((parts.length === 3 && isTypeFolder) || (parts.length === 4 && isTypeFolder));
+  const isDirectMediaFilePath = isMediaStorage && parts.length >= 2;
 
-  const isFileView = isCategoryLevel;
-  const isFolderView = isRoot || (isStorage && !isCategoryLevel);
+  const isFileView = isCategoryLevel || isDirectMediaFilePath;
+  const isFolderView = isRoot || (isStorage && !isFileView);
 
   useEffect(() => {
     let alive = true;
@@ -408,13 +410,17 @@ export default function MinIO() {
   }
 
   // ====== File actions ======
-  function canFileActionsHere() {
-    // Cho phép Upload/Insert ở subject (level 3) và category (level 4)
+  function canUploadHere() {
+    // Upload metadata/document chỉ giữ cho luồng documents cũ
     return isStorage && (parts.length === 3 || parts.length === 4);
   }
 
+  function canFilterHere() {
+    return isFileView;
+  }
+
   async function uploadFile(file) {
-    if (!canFileActionsHere()) return;
+    if (!canUploadHere()) return;
 
     try {
       await minioApi.uploadFiles(currentPath, [file]);
@@ -428,7 +434,7 @@ export default function MinIO() {
   }
 
   async function insertItem({ meta, file }) {
-    if (!canFileActionsHere()) return;
+    if (!canUploadHere()) return;
 
     try {
       await minioApi.insertItem(currentPath, meta || {}, file || null);
@@ -521,7 +527,7 @@ export default function MinIO() {
         <div className="page-header-bottom">
           <div className="search-box">
             <input
-              placeholder={canFileActionsHere() ? "Tìm file..." : "Tìm folder..."}
+              placeholder={isFileView ? "Tìm file..." : "Tìm folder..."}
               value={q}
               onChange={(e) => setQ(e.target.value)}
             />
@@ -534,18 +540,21 @@ export default function MinIO() {
               </button>
             )}
 
-            {canFileActionsHere() && (
+            {canUploadHere() && (
               <>
                 {/* <button className="btn btn-primary" onClick={() => setOpenUpload(true)}>
                   Upload
                 </button> */}
                 <button className="btn btn-primary" onClick={() => setOpenInsert(true)}>
-                Upload
-                </button>
-                <button className="btn" onClick={() => setOpenFilter(true)}>
-                  Filter
+                  Upload
                 </button>
               </>
+            )}
+
+            {canFilterHere() && (
+              <button className="btn" onClick={() => setOpenFilter(true)}>
+                Filter
+              </button>
             )}
           </div>
         </div>

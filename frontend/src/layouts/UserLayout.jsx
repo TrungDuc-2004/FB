@@ -141,10 +141,15 @@ export default function UserLayout() {
   const [globalQuery, setGlobalQuery] = useState("");
   const [showRecent, setShowRecent] = useState(false);
   const [recentSearches, setRecentSearches] = useState([]);
+  const [sessionProfile, setSessionProfile] = useState(() => ({
+    username: (localStorage.getItem("username") || "Người dùng").trim() || "Người dùng",
+    role: (localStorage.getItem("role") || "user").toLowerCase(),
+    avatar: localStorage.getItem(AVATAR_STORAGE_KEY) || "",
+  }));
 
-  const username = (localStorage.getItem("username") || "Người dùng").trim() || "Người dùng";
-  const role = (localStorage.getItem("role") || "user").toLowerCase();
-  const avatar = localStorage.getItem(AVATAR_STORAGE_KEY) || "";
+  const username = sessionProfile.username;
+  const role = sessionProfile.role;
+  const avatar = sessionProfile.avatar;
   const avatarLetter = (username[0] || "U").toUpperCase();
   const roleLabel = role === "admin" ? "Quản trị viên" : "Sinh viên";
 
@@ -174,6 +179,23 @@ export default function UserLayout() {
     document.body.classList.add("user-shell-clean");
     return () => {
       document.body.classList.remove("user-shell-clean");
+    };
+  }, []);
+
+  useEffect(() => {
+    function syncSessionProfile() {
+      setSessionProfile({
+        username: (localStorage.getItem("username") || "Người dùng").trim() || "Người dùng",
+        role: (localStorage.getItem("role") || "user").toLowerCase(),
+        avatar: localStorage.getItem(AVATAR_STORAGE_KEY) || "",
+      });
+    }
+
+    window.addEventListener("storage", syncSessionProfile);
+    window.addEventListener("account-profile-updated", syncSessionProfile);
+    return () => {
+      window.removeEventListener("storage", syncSessionProfile);
+      window.removeEventListener("account-profile-updated", syncSessionProfile);
     };
   }, []);
 
