@@ -37,3 +37,13 @@ export function getRow(tableName, pk) {
   const p = encodeURIComponent(pk); // pk có thể là "chunk_id::keyword_name"
   return httpJson(`${API_BASE}/admin/postgre/tables/${t}/rows/${p}`, { method: "GET" });
 }
+
+
+export function updateRow(tableName, pk, payload) {
+  const t = encodeURIComponent(tableName);
+  const p = encodeURIComponent(pk);
+  return httpJson(`${API_BASE}/admin/postgre/tables/${t}/rows/${p}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+}

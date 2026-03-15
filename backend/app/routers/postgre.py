@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, quote_plus, urlparse
 from uuid import uuid4
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, UploadFile, File, Form, Body
 from fastapi.encoders import jsonable_encoder
 from minio.error import S3Error
 from pydantic import BaseModel
@@ -31,6 +31,8 @@ from ..models import model_postgre as models
 from ..services.minio_client import get_minio_client
 from ..services.mongo_client import get_mongo_client
 from ..services.postgre_client import get_db
+from ..services.postgre_sync_from_mongo import sync_postgre_from_mongo_auto_ids
+from ..services.neo_sync import sync_neo4j_from_maps_and_pg_ids
 
 
 router = APIRouter(prefix="/admin/postgre", tags=["PostgreSQL"])
@@ -672,6 +674,175 @@ def forgot_password(payload: ForgotPasswordIn, db: db_dependency):
     return {"updated": True, "username": username, "synced_mongo": True}
 
 
+
+
+def _get_actor(request: Request | None) -> str:
+    if request is None:
+        return "system"
+    return request.headers.get("x-user") or request.headers.get("x-actor") or "system"
+
+
+def _mongo_collection_for_table(table_name: str) -> str | None:
+    return {
+        "class": "classes",
+        "subject": "subjects",
+        "topic": "topics",
+        "lesson": "lessons",
+        "chunk": "chunks",
+        "keyword": "keywords",
+        "user": _USERS_COLLECTION,
+    }.get(table_name)
+
+
+def _mongo_doc_by_id(collection_name: str, mongo_id: Any) -> Dict[str, Any] | None:
+    if not collection_name or mongo_id is None:
+        return None
+    try:
+        return _mongo_db[collection_name].find_one({"_id": ObjectId(str(mongo_id))})
+    except Exception:
+        return _mongo_db[collection_name].find_one({"_id": str(mongo_id)})
+
+
+def _mongo_map_payload_from_pg_row(table_name: str, obj, db: Session) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+
+    if table_name == "class":
+        payload["className"] = getattr(obj, "class_name", None)
+    elif table_name == "subject":
+        payload["subjectName"] = getattr(obj, "subject_name", None)
+        parent = db.query(models.Class).filter(models.Class.class_id == getattr(obj, "class_id", None)).first()
+        if parent and getattr(parent, "mongo_id", None):
+            parent_doc = _mongo_doc_by_id("classes", getattr(parent, "mongo_id", None))
+            if parent_doc and parent_doc.get("classID"):
+                payload["classID"] = parent_doc.get("classID")
+    elif table_name == "topic":
+        payload["topicName"] = getattr(obj, "topic_name", None)
+        parent = db.query(models.Subject).filter(models.Subject.subject_id == getattr(obj, "subject_id", None)).first()
+        if parent and getattr(parent, "mongo_id", None):
+            parent_doc = _mongo_doc_by_id("subjects", getattr(parent, "mongo_id", None))
+            if parent_doc and parent_doc.get("subjectID"):
+                payload["subjectID"] = parent_doc.get("subjectID")
+    elif table_name == "lesson":
+        payload["lessonName"] = getattr(obj, "lesson_name", None)
+        parent = db.query(models.Topic).filter(models.Topic.topic_id == getattr(obj, "topic_id", None)).first()
+        if parent and getattr(parent, "mongo_id", None):
+            parent_doc = _mongo_doc_by_id("topics", getattr(parent, "mongo_id", None))
+            if parent_doc and parent_doc.get("topicID"):
+                payload["topicID"] = parent_doc.get("topicID")
+    elif table_name == "chunk":
+        payload["chunkName"] = getattr(obj, "chunk_name", None)
+        payload["chunkType"] = getattr(obj, "chunk_type", None)
+        parent = db.query(models.Lesson).filter(models.Lesson.lesson_id == getattr(obj, "lesson_id", None)).first()
+        if parent and getattr(parent, "mongo_id", None):
+            parent_doc = _mongo_doc_by_id("lessons", getattr(parent, "mongo_id", None))
+            if parent_doc and parent_doc.get("lessonID"):
+                payload["lessonID"] = parent_doc.get("lessonID")
+    elif table_name == "keyword":
+        payload["keywordName"] = getattr(obj, "keyword_name", None)
+        payload["keywordEmbedding"] = getattr(obj, "keyword_embedding", None)
+        parent = db.query(models.Chunk).filter(models.Chunk.chunk_id == getattr(obj, "chunk_id", None)).first()
+        if parent and getattr(parent, "mongo_id", None):
+            parent_doc = _mongo_doc_by_id("chunks", getattr(parent, "mongo_id", None))
+            if parent_doc and parent_doc.get("chunkID"):
+                payload["chunkID"] = parent_doc.get("chunkID")
+    elif table_name == "user":
+        payload["username"] = getattr(obj, "username", None)
+        payload["password"] = getattr(obj, "password", None)
+        payload["user_role"] = getattr(obj, "user_role", None)
+        payload["is_active"] = getattr(obj, "is_active", None)
+
+    return {k: v for k, v in payload.items() if v is not None}
+
+
+def _apply_mongo_from_postgre_row(table_name: str, obj, db: Session, actor: str) -> Dict[str, Any] | None:
+    collection_name = _mongo_collection_for_table(table_name)
+    if not collection_name:
+        return None
+
+    mongo_doc = None
+    if getattr(obj, "mongo_id", None):
+        mongo_doc = _mongo_doc_by_id(collection_name, getattr(obj, "mongo_id", None))
+
+    if mongo_doc is None and table_name == "user":
+        mongo_doc = _mongo_db[collection_name].find_one({"username": str(getattr(obj, "username", ""))})
+
+    if mongo_doc is None:
+        return None
+
+    payload = _mongo_map_payload_from_pg_row(table_name, obj, db)
+    if not payload:
+        return mongo_doc
+
+    now = _now_utc()
+    payload["updated_at"] = now
+    payload["updated_by"] = actor
+    payload["updatedAt"] = now
+    if "updatedBy" not in payload:
+        payload["updatedBy"] = actor
+
+    _mongo_db[collection_name].update_one({"_id": mongo_doc["_id"]}, {"$set": payload}, upsert=False)
+    return _mongo_db[collection_name].find_one({"_id": mongo_doc["_id"]})
+
+
+def _sync_after_postgre_update(table_name: str, obj, db: Session, actor: str) -> Dict[str, Any] | None:
+    mongo_doc = _apply_mongo_from_postgre_row(table_name, obj, db, actor)
+    if table_name == "user":
+        return {
+            "target": "mongo",
+            "entity": "user",
+            "synced": mongo_doc is not None,
+            "mongo_id": str(mongo_doc.get("_id")) if mongo_doc else None,
+        }
+
+    if table_name not in ("class", "subject", "topic", "lesson", "chunk", "keyword"):
+        return None
+
+    if mongo_doc is None:
+        return {"target": "mongo+neo4j", "skipped": True, "reason": "missing mongo mapping"}
+
+    class_map = str(mongo_doc.get("classID") or "") if table_name == "class" else ""
+    subject_map = str(mongo_doc.get("subjectID") or "") if table_name == "subject" else ""
+    topic_map = str(mongo_doc.get("topicID") or "") if table_name == "topic" else ""
+    lesson_map = str(mongo_doc.get("lessonID") or "") if table_name == "lesson" else ""
+    chunk_map = str(mongo_doc.get("chunkID") or "") if table_name == "chunk" else ""
+
+    if table_name == "keyword":
+        chunk_map = str(mongo_doc.get("chunkID") or "")
+
+    pg_ids = sync_postgre_from_mongo_auto_ids(
+        class_map=class_map,
+        subject_map=subject_map,
+        topic_map=topic_map,
+        lesson_map=lesson_map,
+        chunk_map=chunk_map,
+    )
+    neo_res = sync_neo4j_from_maps_and_pg_ids(
+        class_map=class_map,
+        subject_map=subject_map,
+        topic_map=topic_map,
+        lesson_map=lesson_map,
+        chunk_map=chunk_map,
+        pg_ids=pg_ids,
+        actor=actor,
+    )
+    return {
+        "target": "mongo+neo4j",
+        "entity": table_name,
+        "mongo_id": str(mongo_doc.get("_id")),
+        "pg_ids": {
+            "class_id": getattr(pg_ids, "class_id", ""),
+            "subject_id": getattr(pg_ids, "subject_id", ""),
+            "topic_id": getattr(pg_ids, "topic_id", ""),
+            "lesson_id": getattr(pg_ids, "lesson_id", ""),
+            "chunk_id": getattr(pg_ids, "chunk_id", ""),
+        },
+        "neo4j": {
+            "ok": bool(getattr(neo_res, "ok", True)),
+            "keyword_count": int(getattr(neo_res, "keyword_count", 0) or 0),
+        },
+    }
+
+
 # ===================== READ-ONLY TABLE API =====================
 TABLE_MODEL_MAP = {
     "class": models.Class,
@@ -780,3 +951,84 @@ def get_row(
     model = _get_model(table_name)
     obj = _get_one_by_pk(db, model, pk)
     return {"table_name": table_name, "row": _row_to_dict(model, obj)}
+
+
+@router.put("/tables/{table_name}/rows/{pk}", summary="Update one row and sync related stores")
+def update_row(
+    table_name: str = Path(...),
+    pk: str = Path(..., description="PK string"),
+    request: Request = None,
+    body: Dict[str, Any] = Body(...),
+    db: db_dependency = None,
+):
+    model = _get_model(table_name)
+    obj = _get_one_by_pk(db, model, pk)
+
+    body = dict(body or {})
+    body.pop("_pk", None)
+
+    if not body:
+        raise HTTPException(status_code=422, detail="No fields to update")
+
+    all_cols = {c.name for c in model.__table__.columns}
+    pk_cols = set(_pk_cols(model))
+    readonly_cols = pk_cols | {"mongo_id"}
+
+    unknown = [k for k in body.keys() if k not in all_cols]
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"Unknown columns: {', '.join(unknown)}")
+
+    blocked = [k for k in body.keys() if k in readonly_cols]
+    if blocked:
+        raise HTTPException(status_code=422, detail=f"Không hỗ trợ sửa các cột: {', '.join(blocked)}")
+
+    if table_name == "user":
+        if "username" in body and not str(body.get("username") or "").strip():
+            raise HTTPException(status_code=422, detail="username is required")
+        if "user_role" in body:
+            body["user_role"] = _normalize_role(body.get("user_role"))
+        if "is_active" in body:
+            body["is_active"] = _normalize_active(body.get("is_active"), default=True)
+        if "password" in body and body.get("password") is not None and len(str(body.get("password") or "")) < 6:
+            raise HTTPException(status_code=422, detail="Mật khẩu phải có ít nhất 6 ký tự")
+
+    before = {col.name: getattr(obj, col.name) for col in model.__table__.columns}
+
+    for key, value in body.items():
+        setattr(obj, key, value)
+
+    try:
+        db.commit()
+        db.refresh(obj)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Cập nhật PostgreSQL thất bại: {e}") from e
+
+    sync_info = None
+    try:
+        sync_info = _sync_after_postgre_update(table_name, obj, db, _get_actor(request))
+    except HTTPException:
+        for key, value in before.items():
+            setattr(obj, key, value)
+        try:
+            db.commit()
+            db.refresh(obj)
+        except Exception:
+            db.rollback()
+        raise
+    except Exception as e:
+        for key, value in before.items():
+            setattr(obj, key, value)
+        try:
+            db.commit()
+            db.refresh(obj)
+        except Exception:
+            db.rollback()
+        raise HTTPException(status_code=500, detail=f"Sync after Postgre update failed: {e}") from e
+
+    return {
+        "updated": True,
+        "table_name": table_name,
+        "row": _row_to_dict(model, obj),
+        "sync": sync_info,
+    }

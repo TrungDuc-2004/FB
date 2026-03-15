@@ -2,7 +2,13 @@
 from fastapi import APIRouter, Query, Path, HTTPException, status, Body, Request, UploadFile, File
 from ..services.mongo_client import get_mongo_client
 from ..services.mongo_bulk_import import import_metadata_xlsx_bytes
+
+from ..models import model_postgre as pg_models
+from ..services.postgre_client import get_session_local
+from ..services.postgre_sync_from_mongo import sync_postgre_from_mongo_auto_ids
+from ..services.neo_sync import sync_neo4j_from_maps_and_pg_ids
 from typing import Any, Dict, Tuple, Optional
+from uuid import uuid4
 from fastapi.encoders import jsonable_encoder
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -86,7 +92,7 @@ def _find_one_by_any_key(
         return doc, {"_id": key}
 
     # 3) user: lookup by username (rất hay dùng trong UI)
-    if col == "user":
+    if col in ("user", "users"):
         doc = db[col].find_one({"username": key}, projection)
         if doc:
             return doc, {"_id": doc["_id"]}
@@ -113,7 +119,7 @@ def _user_normalize_and_validate(
     is_create: bool,
     doc_id: Any = None,
 ):
-    if col != "user":
+    if col not in ("user", "users"):
         return
 
     # alias fields (UI dùng role/active)
@@ -161,6 +167,134 @@ def _user_normalize_and_validate(
         existed = db[col].find_one({"username": u}, {"_id": 1})
         if existed and doc_id is not None and existed["_id"] != doc_id:
             raise HTTPException(status_code=409, detail="Username already exists")
+
+
+
+def _clean_str(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _sync_user_mongo_to_postgre(doc: Dict[str, Any]) -> Dict[str, Any]:
+    mongo_id = str(doc.get("_id") or "").strip()
+    username = _clean_str(doc.get("username"))
+    password = str(doc.get("password") or "")
+    role = _clean_str(doc.get("user_role") or doc.get("role") or "user").lower() or "user"
+    is_active = bool(doc.get("is_active", True))
+
+    if not username:
+        raise HTTPException(status_code=422, detail="Mongo user thiếu username nên không thể sync sang PostgreSQL")
+    if role not in ("admin", "user"):
+        raise HTTPException(status_code=422, detail="user_role must be 'admin' or 'user'")
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as pg:
+        user = None
+        if mongo_id:
+            user = pg.query(pg_models.User).filter(pg_models.User.mongo_id == mongo_id).first()
+        if user is None:
+            user = pg.query(pg_models.User).filter(pg_models.User.username == username).first()
+
+        conflict = pg.query(pg_models.User).filter(pg_models.User.username == username).first()
+        if conflict and user is not None and str(conflict.user_id) != str(user.user_id):
+            raise HTTPException(status_code=409, detail="Tên đăng nhập đã tồn tại trong PostgreSQL")
+
+        created = False
+        if user is None:
+            user = pg_models.User(
+                user_id=str(uuid4()),
+                username=username,
+                password=password,
+                user_role=role,
+                is_active=is_active,
+                mongo_id=mongo_id or None,
+            )
+            pg.add(user)
+            created = True
+        else:
+            user.username = username
+            if password:
+                user.password = password
+            user.user_role = role
+            user.is_active = is_active
+            user.mongo_id = mongo_id or getattr(user, "mongo_id", None)
+
+        try:
+            pg.commit()
+            pg.refresh(user)
+        except Exception as e:
+            pg.rollback()
+            raise HTTPException(status_code=500, detail=f"Sync PostgreSQL thất bại: {e}") from e
+
+        return {
+            "target": "postgre",
+            "entity": "user",
+            "created": created,
+            "user_id": str(user.user_id),
+            "username": str(user.username),
+        }
+
+
+def _sync_metadata_mongo_to_postgre_and_neo(collection_name: str, doc: Dict[str, Any], actor: str) -> Dict[str, Any]:
+    collection_name = _clean_str(collection_name).lower()
+
+    class_map = _clean_str(doc.get("classID")) if collection_name == "classes" else ""
+    subject_map = _clean_str(doc.get("subjectID")) if collection_name == "subjects" else ""
+    topic_map = _clean_str(doc.get("topicID")) if collection_name == "topics" else ""
+    lesson_map = _clean_str(doc.get("lessonID")) if collection_name == "lessons" else ""
+    chunk_map = _clean_str(doc.get("chunkID")) if collection_name == "chunks" else ""
+
+    if collection_name == "keywords":
+        chunk_map = _clean_str(doc.get("chunkID"))
+
+    if not any([class_map, subject_map, topic_map, lesson_map, chunk_map]):
+        return {"target": "postgre+neo4j", "skipped": True, "reason": "missing map ids"}
+
+    try:
+        pg_ids = sync_postgre_from_mongo_auto_ids(
+            class_map=class_map,
+            subject_map=subject_map,
+            topic_map=topic_map,
+            lesson_map=lesson_map,
+            chunk_map=chunk_map,
+        )
+        neo_res = sync_neo4j_from_maps_and_pg_ids(
+            class_map=class_map,
+            subject_map=subject_map,
+            topic_map=topic_map,
+            lesson_map=lesson_map,
+            chunk_map=chunk_map,
+            pg_ids=pg_ids,
+            actor=actor or "system",
+        )
+        return {
+            "target": "postgre+neo4j",
+            "entity": collection_name,
+            "pg_ids": {
+                "class_id": getattr(pg_ids, "class_id", ""),
+                "subject_id": getattr(pg_ids, "subject_id", ""),
+                "topic_id": getattr(pg_ids, "topic_id", ""),
+                "lesson_id": getattr(pg_ids, "lesson_id", ""),
+                "chunk_id": getattr(pg_ids, "chunk_id", ""),
+            },
+            "neo4j": {
+                "ok": bool(getattr(neo_res, "ok", True)),
+                "keyword_count": int(getattr(neo_res, "keyword_count", 0) or 0),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sync PostgreSQL/Neo4j thất bại: {e}") from e
+
+
+def _sync_after_mongo_update(collection_name: str, doc: Dict[str, Any], actor: str) -> Optional[Dict[str, Any]]:
+    col = _clean_str(collection_name).lower()
+    if col in ("user", "users"):
+        return _sync_user_mongo_to_postgre(doc)
+    if col in ("classes", "subjects", "topics", "lessons", "chunks", "keywords"):
+        return _sync_metadata_mongo_to_postgre_and_neo(col, doc, actor)
+    return None
+
 
 # ========================= COLLECTIONS =========================
 @router.get("/collections", summary="Lấy tất cả Collections")
@@ -290,8 +424,12 @@ def update_document(
     if not exist or not id_filter:
         raise HTTPException(status_code=404, detail=f"_id: '{oid}' not exist")
 
+    old_doc = db[col].find_one(id_filter)
+    if not old_doc:
+        raise HTTPException(status_code=404, detail=f"_id: '{oid}' not exist")
+
     # user normalize/validate (pass đúng id thật của doc)
-    _user_normalize_and_validate(col, body, is_create=False, doc_id=exist["_id"])
+    _user_normalize_and_validate(col, body, is_create=False, doc_id=old_doc.get("_id"))
 
     # handle soft delete toggle
     if "is_deleted" in body:
@@ -302,7 +440,26 @@ def update_document(
     body["updated_by"] = actor
 
     r = db[col].update_one(id_filter, {"$set": body})
-    return {"updated": True, "matched": r.matched_count, "modified": r.modified_count, "_id": oid}
+    updated_doc = db[col].find_one(id_filter)
+
+    sync_info = None
+    if updated_doc is not None:
+        try:
+            sync_info = _sync_after_mongo_update(col, updated_doc, actor)
+        except HTTPException:
+            db[col].replace_one(id_filter, old_doc)
+            raise
+        except Exception as e:
+            db[col].replace_one(id_filter, old_doc)
+            raise HTTPException(status_code=500, detail=f"Sync after update failed: {e}") from e
+
+    return {
+        "updated": True,
+        "matched": r.matched_count,
+        "modified": r.modified_count,
+        "_id": oid,
+        "sync": sync_info,
+    }
 
 
 @router.delete("/documents/{collection_name}/{oid}", summary="Delete document (generic)")
