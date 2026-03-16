@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 from bson import ObjectId
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -15,7 +16,14 @@ from .gemini_topic_expander import expand_topic_keywords_debug
 from .keyword_embedding import embed_keyword_cached
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
-_SERVICE_VERSION = "search_semantic_keyword_graph_v4_neo_only"
+_SERVICE_VERSION = "search_structured_hierarchy_neo_name_keyword_v4_accent_exact"
+_LABEL_RE = re.compile(
+    r"(?P<class>\b(?:lớp|lop|class)\b)|"
+    r"(?P<topic>\b(?:chủ\s*đề|chu\s*de|topic)\b)|"
+    r"(?P<lesson>\b(?:bài|bai|lesson)\b)|"
+    r"(?P<chunk>\b(?:chunk|mục|muc)\b)",
+    flags=re.IGNORECASE,
+)
 
 _STOP = {
     "a", "an", "and", "các", "cái", "cho", "có", "của", "dạng", "đến", "giúp",
@@ -25,8 +33,33 @@ _STOP = {
 }
 
 
+# --------------------------- basic text utils ---------------------------
+
 def _norm_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _normalize_for_phrase_strip(text: str) -> str:
+    s = _norm_spaces((text or "").lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _strip_query_filler_phrases(text: str) -> str:
+    s = _normalize_for_phrase_strip(text)
+    filler_patterns = [
+        r"\btài\s+liệu\s+về\b",
+        r"\btài\s+liệu\b",
+        r"\bthông\s+tin\s+về\b",
+        r"\bthông\s+tin\b",
+        r"\bnội\s+dung\s+về\b",
+        r"\bnội\s+dung\b",
+        r"\bcho\s+tôi\b",
+        r"\bhãy\b",
+        r"\bxin\b",
+    ]
+    for pat in filler_patterns:
+        s = re.sub(pat, " ", s, flags=re.IGNORECASE)
+    return _norm_spaces(s)
 
 
 def _tokens_no_stop(q: str) -> List[str]:
@@ -50,6 +83,30 @@ def _dedupe_keep_order(values: List[str]) -> List[str]:
     return out
 
 
+def _clean_hint_text(segment: str) -> str:
+    text = re.sub(r"\d+", " ", segment or "")
+    text = re.sub(r"[:;,\.\-_/]+", " ", text)
+    return _core_query_text(text)
+
+
+def _strip_keyword_filler(text: str) -> str:
+    return _core_query_text(_strip_query_filler_phrases(text))
+
+
+def _strip_accents(text: str) -> str:
+    s = unicodedata.normalize("NFD", text or "")
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return s.replace("đ", "d").replace("Đ", "D")
+
+
+def _norm_keyword_text(text: str) -> str:
+    base = _strip_query_filler_phrases(text)
+    base = _strip_accents(base)
+    return _norm_spaces(" ".join(_tokens_no_stop(base))).lower()
+
+
+# --------------------------- similarity ---------------------------
+
 def _cosine(a: List[float], b: List[float]) -> float:
     if not a or not b:
         return 0.0
@@ -66,6 +123,88 @@ def _cosine(a: List[float], b: List[float]) -> float:
     den = math.sqrt(na) * math.sqrt(nb)
     return float(dot / den) if den > 0 else 0.0
 
+
+# --------------------------- parsing ---------------------------
+
+def _parse_query_context(query: str) -> dict:
+    raw = _norm_spaces(query)
+    matches = list(_LABEL_RE.finditer(raw))
+    out = {
+        "classNumber": None,
+        "topicNumber": None,
+        "lessonNumber": None,
+        "chunkNumber": None,
+        "topicNameHint": "",
+        "lessonNameHint": "",
+        "chunkNameHint": "",
+        "genericQuery": "",
+        "raw": raw,
+    }
+    if not matches:
+        out["genericQuery"] = _strip_keyword_filler(raw)
+        return out
+
+    generic_parts: List[str] = []
+    first_start = matches[0].start()
+    if first_start > 0:
+        generic_parts.append(raw[:first_start])
+
+    for idx, match in enumerate(matches):
+        level = next((name for name, val in match.groupdict().items() if val), None)
+        if not level:
+            continue
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(raw)
+        segment = _norm_spaces(raw[start:end])
+        num_match = re.search(r"\d{1,3}", segment)
+        number = int(num_match.group(0)) if num_match else None
+        name_hint = _clean_hint_text(segment)
+
+        if level == "class":
+            if out["classNumber"] is None:
+                out["classNumber"] = number
+        elif level == "topic":
+            if out["topicNumber"] is None:
+                out["topicNumber"] = number
+            if name_hint and not out["topicNameHint"]:
+                out["topicNameHint"] = name_hint
+        elif level == "lesson":
+            if out["lessonNumber"] is None:
+                out["lessonNumber"] = number
+            if name_hint and not out["lessonNameHint"]:
+                out["lessonNameHint"] = name_hint
+        elif level == "chunk":
+            if out["chunkNumber"] is None:
+                out["chunkNumber"] = number
+            if name_hint and not out["chunkNameHint"]:
+                out["chunkNameHint"] = name_hint
+
+    last_end = matches[-1].end()
+    tail = raw[last_end:]
+    # only append trailing text if it is not simply the number/name of the last label segment
+    if tail and not re.fullmatch(r"\s*\d+\s*", tail):
+        generic_parts.append(tail)
+
+    generic_query = _strip_keyword_filler(" ".join(generic_parts))
+    out["genericQuery"] = generic_query
+    return out
+
+
+def _normalize_class_scope(class_id: str, class_number: Optional[int]) -> str:
+    if class_id:
+        return class_id
+    if class_number is not None:
+        return str(class_number)
+    return ""
+
+
+def _filter_by_number(rows: List[dict], key: str, number: Optional[int]) -> List[dict]:
+    if number is None:
+        return rows
+    return [row for row in rows if row.get(key) == number]
+
+
+# --------------------------- db helpers ---------------------------
 
 def _valid_object_id_hex(s: str) -> bool:
     if not s or len(s) != 24:
@@ -85,7 +224,6 @@ def _status_visible(doc: dict) -> bool:
 def _read_keywords_from_chunk_doc(doc: Optional[dict]) -> List[str]:
     if not doc:
         return []
-
     for key in ("keywordItems", "keywords", "keyword", "keyword_names", "keywordNames"):
         value = doc.get(key)
         if not value:
@@ -102,51 +240,6 @@ def _read_keywords_from_chunk_doc(doc: Optional[dict]) -> List[str]:
         if isinstance(value, str):
             return [value]
     return []
-
-
-def _candidate_chunk_ids_from_filters_pg(
-    *,
-    pg: Session,
-    classID: str,
-    subjectID: str,
-    topicID: str,
-    lessonID: str,
-) -> Optional[List[str]]:
-    try:
-        if lessonID:
-            rows = list(pg.execute(select(Chunk.chunk_id).where(Chunk.lesson_id == lessonID)).all())
-            return [r[0] for r in rows]
-
-        if topicID:
-            stmt = (
-                select(Chunk.chunk_id)
-                .join(Lesson, Lesson.lesson_id == Chunk.lesson_id)
-                .where(Lesson.topic_id == topicID)
-            )
-            return [r[0] for r in pg.execute(stmt).all()]
-
-        if subjectID:
-            stmt = (
-                select(Chunk.chunk_id)
-                .join(Lesson, Lesson.lesson_id == Chunk.lesson_id)
-                .join(Topic, Topic.topic_id == Lesson.topic_id)
-                .where(Topic.subject_id == subjectID)
-            )
-            return [r[0] for r in pg.execute(stmt).all()]
-
-        if classID:
-            stmt = (
-                select(Chunk.chunk_id)
-                .join(Lesson, Lesson.lesson_id == Chunk.lesson_id)
-                .join(Topic, Topic.topic_id == Lesson.topic_id)
-                .join(Subject, Subject.subject_id == Topic.subject_id)
-                .where(Subject.class_id == classID)
-            )
-            return [r[0] for r in pg.execute(stmt).all()]
-
-        return None
-    except Exception:
-        return None
 
 
 def _load_by_oids(mongo_db, col: str, oid_hex_list: List[str]) -> Dict[str, dict]:
@@ -172,7 +265,6 @@ def _media_sort_key(x: dict) -> tuple:
 def _build_media_item(doc: Optional[dict], *, media_type: str, follow_type: str, follow_id: str, pg_id: str) -> Optional[dict]:
     if not doc or not _status_visible(doc):
         return None
-
     if media_type == "image":
         name = doc.get("imgName") or doc.get("mapID") or pg_id
         desc = doc.get("imgDescription") or ""
@@ -181,7 +273,6 @@ def _build_media_item(doc: Optional[dict], *, media_type: str, follow_type: str,
         name = doc.get("videoName") or doc.get("mapID") or pg_id
         desc = doc.get("videoDescription") or ""
         url = doc.get("videoUrl") or ""
-
     return {
         "type": media_type,
         "id": pg_id,
@@ -205,7 +296,6 @@ def _load_media_map_for_targets(*, pg: Session, mongo_db, targets: List[tuple[st
             continue
         seen_targets.add(key)
         uniq_targets.append(key)
-
     if not uniq_targets:
         return out
 
@@ -217,7 +307,6 @@ def _load_media_map_for_targets(*, pg: Session, mongo_db, targets: List[tuple[st
             image_rows = list(pg.execute(select(Image.img_id, Image.mongo_id, Image.follow_type, Image.follow_id).where(or_(*conds))).all())
     except Exception:
         image_rows = []
-
     try:
         conds = [((Video.follow_type == ft) & (Video.follow_id == fid)) for ft, fid in uniq_targets]
         if conds:
@@ -236,27 +325,240 @@ def _load_media_map_for_targets(*, pg: Session, mongo_db, targets: List[tuple[st
             continue
         bucket = out.setdefault((follow_type, follow_id), {"images": [], "videos": []})
         bucket["images"].append(item)
-
     for video_id, mongo_id, follow_type, follow_id in video_rows:
         item = _build_media_item(videos_by_oid.get(mongo_id or ""), media_type="video", follow_type=follow_type, follow_id=follow_id, pg_id=video_id)
         if not item:
             continue
         bucket = out.setdefault((follow_type, follow_id), {"images": [], "videos": []})
         bucket["videos"].append(item)
-
     for bucket in out.values():
         bucket["images"].sort(key=_media_sort_key)
         bucket["videos"].sort(key=_media_sort_key)
-
     return out
 
+
+def _load_topic_rows_pg(*, pg: Session, class_id: str, subject_id: str, topic_id: str) -> List[dict]:
+    try:
+        stmt = (
+            select(
+                Topic.topic_id,
+                Topic.topic_name,
+                Topic.topic_number,
+                Topic.mongo_id,
+                Subject.subject_id,
+                Subject.subject_name,
+                Subject.mongo_id,
+                Class.class_id,
+                Class.class_name,
+                Class.mongo_id,
+            )
+            .join(Subject, Subject.subject_id == Topic.subject_id)
+            .join(Class, Class.class_id == Subject.class_id)
+        )
+        if class_id:
+            stmt = stmt.where(Class.class_id == class_id)
+        if subject_id:
+            stmt = stmt.where(Subject.subject_id == subject_id)
+        if topic_id:
+            stmt = stmt.where(Topic.topic_id == topic_id)
+        rows = []
+        for r in pg.execute(stmt).all():
+            rows.append({
+                "topicID": str(r[0]), "topicName": r[1], "topicNumber": r[2], "topicMongoId": r[3],
+                "subjectID": str(r[4]), "subjectName": r[5], "subjectMongoId": r[6],
+                "classID": str(r[7]), "className": r[8], "classMongoId": r[9],
+            })
+        return rows
+    except SQLAlchemyError:
+        return []
+
+
+def _load_lesson_rows_pg(*, pg: Session, class_id: str, subject_id: str, topic_ids: Optional[List[str]], lesson_id: str) -> List[dict]:
+    try:
+        stmt = (
+            select(
+                Lesson.lesson_id,
+                Lesson.lesson_name,
+                Lesson.lesson_number,
+                Lesson.mongo_id,
+                Topic.topic_id,
+                Topic.topic_name,
+                Topic.topic_number,
+                Topic.mongo_id,
+                Subject.subject_id,
+                Subject.subject_name,
+                Subject.mongo_id,
+                Class.class_id,
+                Class.class_name,
+                Class.mongo_id,
+            )
+            .join(Topic, Topic.topic_id == Lesson.topic_id)
+            .join(Subject, Subject.subject_id == Topic.subject_id)
+            .join(Class, Class.class_id == Subject.class_id)
+        )
+        if class_id:
+            stmt = stmt.where(Class.class_id == class_id)
+        if subject_id:
+            stmt = stmt.where(Subject.subject_id == subject_id)
+        if topic_ids is not None:
+            if len(topic_ids) == 0:
+                return []
+            stmt = stmt.where(Topic.topic_id.in_(topic_ids))
+        if lesson_id:
+            stmt = stmt.where(Lesson.lesson_id == lesson_id)
+        rows = []
+        for r in pg.execute(stmt).all():
+            rows.append({
+                "lessonID": str(r[0]), "lessonName": r[1], "lessonNumber": r[2], "lessonMongoId": r[3],
+                "topicID": str(r[4]), "topicName": r[5], "topicNumber": r[6], "topicMongoId": r[7],
+                "subjectID": str(r[8]), "subjectName": r[9], "subjectMongoId": r[10],
+                "classID": str(r[11]), "className": r[12], "classMongoId": r[13],
+            })
+        return rows
+    except SQLAlchemyError:
+        return []
+
+
+def _load_chunk_rows_pg(*, pg: Session, class_id: str, subject_id: str, topic_ids: Optional[List[str]], lesson_ids: Optional[List[str]]) -> List[dict]:
+    try:
+        stmt = (
+            select(
+                Chunk.chunk_id,
+                Chunk.chunk_name,
+                Chunk.chunk_number,
+                Chunk.chunk_type,
+                Chunk.mongo_id,
+                Lesson.lesson_id,
+                Lesson.lesson_name,
+                Lesson.lesson_number,
+                Lesson.mongo_id,
+                Topic.topic_id,
+                Topic.topic_name,
+                Topic.topic_number,
+                Topic.mongo_id,
+                Subject.subject_id,
+                Subject.subject_name,
+                Subject.mongo_id,
+                Class.class_id,
+                Class.class_name,
+                Class.mongo_id,
+            )
+            .join(Lesson, Lesson.lesson_id == Chunk.lesson_id)
+            .join(Topic, Topic.topic_id == Lesson.topic_id)
+            .join(Subject, Subject.subject_id == Topic.subject_id)
+            .join(Class, Class.class_id == Subject.class_id)
+        )
+        if class_id:
+            stmt = stmt.where(Class.class_id == class_id)
+        if subject_id:
+            stmt = stmt.where(Subject.subject_id == subject_id)
+        if topic_ids is not None:
+            if len(topic_ids) == 0:
+                return []
+            stmt = stmt.where(Topic.topic_id.in_(topic_ids))
+        if lesson_ids is not None:
+            if len(lesson_ids) == 0:
+                return []
+            stmt = stmt.where(Lesson.lesson_id.in_(lesson_ids))
+        rows = []
+        for r in pg.execute(stmt).all():
+            rows.append({
+                "chunkID": str(r[0]), "chunkName": r[1], "chunkNumber": r[2], "chunkType": r[3], "chunkMongoId": r[4],
+                "lessonID": str(r[5]), "lessonName": r[6], "lessonNumber": r[7], "lessonMongoId": r[8],
+                "topicID": str(r[9]), "topicName": r[10], "topicNumber": r[11], "topicMongoId": r[12],
+                "subjectID": str(r[13]), "subjectName": r[14], "subjectMongoId": r[15],
+                "classID": str(r[16]), "className": r[17], "classMongoId": r[18],
+            })
+        return rows
+    except SQLAlchemyError:
+        return []
+
+
+def _load_name_embedding_map_from_neo(neo, *, label: str, ids: List[str], embedding_field: str) -> Tuple[Dict[str, dict], Optional[str]]:
+    if neo is None or not ids:
+        return {}, None if neo is not None else "neo_session_unavailable"
+    try:
+        records = neo.run(
+            f"""
+            UNWIND $ids AS node_id
+            MATCH (n:{label} {{pg_id: node_id}})
+            WHERE n.{embedding_field} IS NOT NULL
+            RETURN n.pg_id AS pg_id,
+                   coalesce(n.name, n.pg_id) AS name,
+                   n.{embedding_field} AS embedding
+            """,
+            ids=ids,
+        )
+        out: Dict[str, dict] = {}
+        for record in records:
+            node_id = str(record.get("pg_id") or "").strip()
+            embedding = record.get("embedding")
+            if not node_id or not embedding:
+                continue
+            try:
+                out[node_id] = {
+                    "id": node_id,
+                    "name": str(record.get("name") or "").strip(),
+                    "embedding": [float(x) for x in list(embedding)],
+                }
+            except Exception:
+                continue
+        return out, None
+    except Exception as exc:
+        return {}, str(exc)
+
+
+def _resolve_scope_by_name(
+    *,
+    rows: List[dict],
+    id_key: str,
+    name_hint: str,
+    neo,
+    label: str,
+    embedding_field: str,
+    threshold: float = 0.28,
+    keep_ratio: float = 0.82,
+    keep_limit: int = 6,
+) -> Tuple[List[str], Dict[str, float], dict]:
+    debug = {"label": label, "name_hint": name_hint, "input_count": len(rows)}
+    if not name_hint:
+        ids = [str(row.get(id_key) or "") for row in rows if str(row.get(id_key) or "")]
+        return ids, {}, debug
+    ids = [str(row.get(id_key) or "") for row in rows if str(row.get(id_key) or "")]
+    emb_map, neo_error = _load_name_embedding_map_from_neo(neo, label=label, ids=ids, embedding_field=embedding_field)
+    if neo_error:
+        debug["neo_error"] = neo_error
+    if not emb_map:
+        debug["rejected"] = "no_embedding_rows"
+        return [], {}, debug
+    query_embedding = embed_keyword_cached(name_hint)
+    scored: List[dict] = []
+    for node_id, payload in emb_map.items():
+        score = _cosine(query_embedding, list(payload.get("embedding") or []))
+        scored.append({"id": node_id, "name": payload.get("name") or node_id, "score": float(score)})
+    scored.sort(key=lambda item: item["score"], reverse=True)
+    debug["top_matches"] = scored[:5]
+    if not scored:
+        debug["rejected"] = "no_scores"
+        return [], {}, debug
+    top_score = float(scored[0]["score"])
+    debug["top_score"] = top_score
+    if top_score < threshold:
+        debug["rejected"] = "below_threshold"
+        return [], {}, debug
+    min_keep = max(threshold, top_score * keep_ratio)
+    selected = [item for item in scored if float(item["score"]) >= min_keep][:keep_limit]
+    score_map = {str(item["id"]): float(item["score"]) for item in selected}
+    return [str(item["id"]) for item in selected], score_map, debug
+
+
+# --------------------------- keyword search helpers ---------------------------
 
 def _maybe_expand_with_gemini(query: str, cand_chunks: Optional[List[str]], pg: Session) -> Tuple[List[str], Dict[str, object]]:
     debug: Dict[str, object] = {}
     clean = _norm_spaces(query)
     if not clean:
         return [], debug
-
     try:
         gemini_terms, gem_dbg = expand_topic_keywords_debug(clean, None)
         debug.update(gem_dbg or {})
@@ -264,9 +566,9 @@ def _maybe_expand_with_gemini(query: str, cand_chunks: Optional[List[str]], pg: 
         return [], {"error": f"unexpected:{exc}"}
 
     terms = _dedupe_keep_order(list(gemini_terms or []))[:8]
+    debug["before_scope_filter"] = terms[:]
     if not terms:
         return [], debug
-
     try:
         filtered: List[str] = []
         for term in terms:
@@ -276,12 +578,24 @@ def _maybe_expand_with_gemini(query: str, cand_chunks: Optional[List[str]], pg: 
                 if len(cand_chunks) == 0:
                     return [], debug
                 stmt = stmt.where(Keyword.chunk_id.in_(cand_chunks))
-            has_hit = bool(list(pg.execute(stmt).all()))
-            if has_hit:
+            if bool(list(pg.execute(stmt).all())):
                 filtered.append(term)
+        debug["after_scope_filter"] = filtered[:]
         return filtered, debug
     except Exception:
         return terms, debug
+
+
+def _filter_gemini_terms_strict(base_query: str, gemini_terms: List[str]) -> List[str]:
+    q = _norm_keyword_text(base_query)
+    out: List[str] = []
+    for term in gemini_terms or []:
+        t = _norm_keyword_text(term)
+        if not t:
+            continue
+        if t in q or q in t:
+            out.append(term)
+    return _dedupe_keep_order(out)
 
 
 def _query_embedding_text(raw_query: str, core_query: str, gemini_terms: List[str]) -> str:
@@ -329,9 +643,53 @@ def _load_keyword_rows_from_neo(neo, cand_chunks: Optional[List[str]]) -> Tuple[
         return [], str(exc)
 
 
+def _load_keyword_rows_from_pg(pg: Session, cand_chunks: Optional[List[str]]) -> List[Tuple[str, str, str, List[float]]]:
+    try:
+        stmt = select(Keyword.keyword_id, Keyword.chunk_id, Keyword.keyword_name, Keyword.keyword_embedding).where(Keyword.keyword_embedding.isnot(None))
+        if cand_chunks is not None:
+            if len(cand_chunks) == 0:
+                return []
+            stmt = stmt.where(Keyword.chunk_id.in_(cand_chunks))
+        return [(str(r[0]), str(r[1]), str(r[2]), list(r[3])) for r in pg.execute(stmt).all() if r[0] and r[1] and r[2] and r[3]]
+    except SQLAlchemyError:
+        return []
+
+
 def _load_keyword_rows(neo, pg: Session, cand_chunks: Optional[List[str]]) -> Tuple[List[Tuple[str, str, str, List[float]]], str, Optional[str]]:
     neo_rows, neo_error = _load_keyword_rows_from_neo(neo, cand_chunks)
-    return neo_rows, "neo4j_only", neo_error
+    if neo_rows:
+        return neo_rows, "neo4j", neo_error
+    pg_rows = _load_keyword_rows_from_pg(pg, cand_chunks)
+    return pg_rows, "postgresql", neo_error
+
+
+def _exact_keyword_hits(keyword_query: str, rows: List[Tuple[str, str, str, List[float]]]) -> List[dict]:
+    q = _norm_keyword_text(keyword_query)
+    if not q:
+        return []
+    hits: List[dict] = []
+    for keyword_id, chunk_id, keyword_name, _embedding in rows:
+        nk = _norm_keyword_text(keyword_name)
+        if not nk:
+            continue
+        score: Optional[float] = None
+        if nk == q:
+            score = 1.0
+        elif q in nk:
+            score = 0.97
+        elif nk in q:
+            score = 0.94
+        if score is None:
+            continue
+        hits.append({
+            "keywordID": keyword_id,
+            "chunkID": chunk_id,
+            "keywordName": keyword_name,
+            "score": float(score),
+            "matchType": "exact",
+        })
+    hits.sort(key=lambda item: item["score"], reverse=True)
+    return hits
 
 
 def _score_keywords(query_embedding: List[float], rows: List[Tuple[str, str, str, List[float]]]) -> Tuple[List[dict], float]:
@@ -344,11 +702,9 @@ def _score_keywords(query_embedding: List[float], rows: List[Tuple[str, str, str
             "keywordName": keyword_name,
             "score": float(score),
         })
-
     matches.sort(key=lambda item: item["score"], reverse=True)
     if not matches:
         return [], 0.0
-
     top_score = float(matches[0]["score"])
     min_score = max(0.18, top_score * 0.55)
     filtered = [item for item in matches if float(item["score"]) >= min_score]
@@ -360,24 +716,20 @@ def _score_keywords(query_embedding: List[float], rows: List[Tuple[str, str, str
 def _rank_chunks_from_keyword_hits(keyword_hits: List[dict]) -> Tuple[List[Tuple[str, float]], Dict[str, List[Tuple[float, str]]]]:
     chunk_score: Dict[str, float] = {}
     chunk_keywords: Dict[str, List[Tuple[float, str]]] = defaultdict(list)
-
     for hit in keyword_hits:
         chunk_id = str(hit.get("chunkID") or "").strip()
         keyword_name = str(hit.get("keywordName") or "").strip()
         score = float(hit.get("score") or 0.0)
         if not chunk_id or not keyword_name:
             continue
-
         current = chunk_score.get(chunk_id)
         if current is None or score > current:
             chunk_score[chunk_id] = score
-
         bucket = chunk_keywords[chunk_id]
         if not any(existing_name == keyword_name for _existing_score, existing_name in bucket):
             bucket.append((score, keyword_name))
             bucket.sort(key=lambda x: x[0], reverse=True)
             chunk_keywords[chunk_id] = bucket[:5]
-
     ranked = sorted(chunk_score.items(), key=lambda item: item[1], reverse=True)
     return ranked, chunk_keywords
 
@@ -415,22 +767,10 @@ def _neo_hierarchy_for_chunks(neo, chunk_ids: List[str]) -> Tuple[Dict[str, dict
             out[chunk_id] = {
                 "chunkID": chunk_id,
                 "chunkName": str(record.get("chunk_name") or "").strip(),
-                "lesson": {
-                    "lessonID": str(record.get("lesson_id") or "").strip(),
-                    "lessonName": str(record.get("lesson_name") or "").strip(),
-                },
-                "topic": {
-                    "topicID": str(record.get("topic_id") or "").strip(),
-                    "topicName": str(record.get("topic_name") or "").strip(),
-                },
-                "subject": {
-                    "subjectID": str(record.get("subject_id") or "").strip(),
-                    "subjectName": str(record.get("subject_name") or "").strip(),
-                },
-                "class": {
-                    "classID": str(record.get("class_id") or "").strip(),
-                    "className": str(record.get("class_name") or "").strip(),
-                },
+                "lesson": {"lessonID": str(record.get("lesson_id") or "").strip(), "lessonName": str(record.get("lesson_name") or "").strip()},
+                "topic": {"topicID": str(record.get("topic_id") or "").strip(), "topicName": str(record.get("topic_name") or "").strip()},
+                "subject": {"subjectID": str(record.get("subject_id") or "").strip(), "subjectName": str(record.get("subject_name") or "").strip()},
+                "class": {"classID": str(record.get("class_id") or "").strip(), "className": str(record.get("class_name") or "").strip()},
             }
         return out, None
     except Exception as exc:
@@ -446,12 +786,15 @@ def _load_pg_page_rows(pg: Session, chunk_ids: List[str]) -> Dict[str, dict]:
                 Chunk.chunk_id,
                 Chunk.chunk_name,
                 Chunk.chunk_type,
+                Chunk.chunk_number,
                 Chunk.mongo_id,
                 Lesson.lesson_id,
                 Lesson.lesson_name,
+                Lesson.lesson_number,
                 Lesson.mongo_id,
                 Topic.topic_id,
                 Topic.topic_name,
+                Topic.topic_number,
                 Topic.mongo_id,
                 Subject.subject_id,
                 Subject.subject_name,
@@ -469,39 +812,222 @@ def _load_pg_page_rows(pg: Session, chunk_ids: List[str]) -> Dict[str, dict]:
         rows = list(pg.execute(stmt).all())
     except SQLAlchemyError:
         return {}
-
     out: Dict[str, dict] = {}
     for r in rows:
-        (
-            chunk_id,
-            chunk_name,
-            chunk_type,
-            chunk_mongo_id,
-            lesson_id,
-            lesson_name,
-            lesson_mongo_id,
-            topic_id,
-            topic_name,
-            topic_mongo_id,
-            subject_id,
-            subject_name,
-            subject_mongo_id,
-            class_id,
-            class_name,
-            class_mongo_id,
-        ) = r
-        out[str(chunk_id)] = {
-            "chunkID": str(chunk_id),
-            "chunkName": chunk_name,
-            "chunkType": chunk_type,
-            "chunkMongoId": chunk_mongo_id,
-            "lesson": {"lessonID": lesson_id, "lessonName": lesson_name, "mongoId": lesson_mongo_id},
-            "topic": {"topicID": topic_id, "topicName": topic_name, "mongoId": topic_mongo_id},
-            "subject": {"subjectID": subject_id, "subjectName": subject_name, "mongoId": subject_mongo_id},
-            "class": {"classID": class_id, "className": class_name, "mongoId": class_mongo_id},
+        out[str(r[0])] = {
+            "chunkID": str(r[0]), "chunkName": r[1], "chunkType": r[2], "chunkNumber": r[3], "chunkMongoId": r[4],
+            "lesson": {"lessonID": r[5], "lessonName": r[6], "lessonNumber": r[7], "mongoId": r[8]},
+            "topic": {"topicID": r[9], "topicName": r[10], "topicNumber": r[11], "mongoId": r[12]},
+            "subject": {"subjectID": r[13], "subjectName": r[14], "mongoId": r[15]},
+            "class": {"classID": r[16], "className": r[17], "mongoId": r[18]},
         }
     return out
 
+
+# --------------------------- response builders ---------------------------
+
+def _build_topic_items(rows: List[dict]) -> List[dict]:
+    items: List[dict] = []
+    seen = set()
+    for row in rows:
+        topic_id = str(row.get("topicID") or "")
+        if not topic_id or topic_id in seen:
+            continue
+        seen.add(topic_id)
+        items.append({
+            "type": "topic",
+            "id": topic_id,
+            "name": row.get("topicName") or topic_id,
+            "score": 1,
+            "topicID": topic_id,
+            "topicName": row.get("topicName") or topic_id,
+            "topicNumber": row.get("topicNumber"),
+            "class": {"classID": row.get("classID") or "", "className": row.get("className") or ""},
+            "subject": {"subjectID": row.get("subjectID") or "", "subjectName": row.get("subjectName") or ""},
+        })
+    return items
+
+
+def _build_lesson_items(rows: List[dict]) -> List[dict]:
+    items: List[dict] = []
+    seen = set()
+    for row in rows:
+        lesson_id = str(row.get("lessonID") or "")
+        if not lesson_id or lesson_id in seen:
+            continue
+        seen.add(lesson_id)
+        items.append({
+            "type": "lesson",
+            "id": lesson_id,
+            "name": row.get("lessonName") or lesson_id,
+            "score": 1,
+            "lessonID": lesson_id,
+            "lessonName": row.get("lessonName") or lesson_id,
+            "lessonNumber": row.get("lessonNumber"),
+            "class": {"classID": row.get("classID") or "", "className": row.get("className") or ""},
+            "subject": {"subjectID": row.get("subjectID") or "", "subjectName": row.get("subjectName") or ""},
+            "topic": {"topicID": row.get("topicID") or "", "topicName": row.get("topicName") or "", "topicNumber": row.get("topicNumber")},
+        })
+    return items
+
+
+def _build_chunk_items(
+    *,
+    page_chunk_ids: List[str],
+    score_by_chunk: Dict[str, float],
+    chunk_top_kw: Dict[str, List[Tuple[float, str]]],
+    pg_map: Dict[str, dict],
+    neo_map: Dict[str, dict],
+    mongo_db,
+    category: str,
+    username: str,
+    pg: Session,
+    dbg: Dict[str, object],
+) -> List[dict]:
+    chunk_mongo_hex: List[str] = []
+    lesson_mongo_hex: List[str] = []
+    topic_mongo_hex: List[str] = []
+    subject_mongo_hex: List[str] = []
+    for base in pg_map.values():
+        if _valid_object_id_hex(base.get("chunkMongoId") or ""):
+            chunk_mongo_hex.append(base["chunkMongoId"])
+        if _valid_object_id_hex((base.get("lesson") or {}).get("mongoId") or ""):
+            lesson_mongo_hex.append(base["lesson"]["mongoId"])
+        if _valid_object_id_hex((base.get("topic") or {}).get("mongoId") or ""):
+            topic_mongo_hex.append(base["topic"]["mongoId"])
+        if _valid_object_id_hex((base.get("subject") or {}).get("mongoId") or ""):
+            subject_mongo_hex.append(base["subject"]["mongoId"])
+    mongo_chunks_by_oid = _load_by_oids(mongo_db, "chunks", chunk_mongo_hex)
+    mongo_lessons_by_oid = _load_by_oids(mongo_db, "lessons", lesson_mongo_hex)
+    mongo_topics_by_oid = _load_by_oids(mongo_db, "topics", topic_mongo_hex)
+    mongo_subjects_by_oid = _load_by_oids(mongo_db, "subjects", subject_mongo_hex)
+
+    media_targets: List[tuple[str, str]] = []
+    chunk_targets_by_chunk: Dict[str, List[tuple[str, str]]] = {}
+    for chunk_id in page_chunk_ids:
+        pg_base = pg_map.get(chunk_id) or {}
+        neo_base = neo_map.get(chunk_id) or {}
+        lesson_id_v = (neo_base.get("lesson") or {}).get("lessonID") or (pg_base.get("lesson") or {}).get("lessonID") or ""
+        topic_id_v = (neo_base.get("topic") or {}).get("topicID") or (pg_base.get("topic") or {}).get("topicID") or ""
+        subject_id_v = (neo_base.get("subject") or {}).get("subjectID") or (pg_base.get("subject") or {}).get("subjectID") or ""
+        targets = [("chunk", chunk_id), ("lesson", lesson_id_v), ("topic", topic_id_v), ("subject", subject_id_v)]
+        norm_targets = [(ft, fid) for ft, fid in targets if ft and fid]
+        chunk_targets_by_chunk[chunk_id] = norm_targets
+        media_targets.extend(norm_targets)
+    media_map = _load_media_map_for_targets(pg=pg, mongo_db=mongo_db, targets=media_targets)
+    dbg["media_hit_groups"] = len(media_map)
+
+    items: List[dict] = []
+    for chunk_id in page_chunk_ids:
+        pg_base = pg_map.get(chunk_id)
+        if not pg_base:
+            continue
+        neo_base = neo_map.get(chunk_id) or {}
+        chunk_doc = None
+        if _valid_object_id_hex(pg_base.get("chunkMongoId") or ""):
+            chunk_doc = mongo_chunks_by_oid.get(pg_base["chunkMongoId"])
+        if chunk_doc and not _status_visible(chunk_doc):
+            continue
+        if category and category != "all":
+            chunk_category = (chunk_doc or {}).get("chunkCategory") or ""
+            if chunk_category and chunk_category != category:
+                continue
+
+        lesson_oid = (pg_base.get("lesson") or {}).get("mongoId") or ""
+        topic_oid = (pg_base.get("topic") or {}).get("mongoId") or ""
+        subject_oid = (pg_base.get("subject") or {}).get("mongoId") or ""
+        lesson_doc = mongo_lessons_by_oid.get(lesson_oid) if _valid_object_id_hex(lesson_oid) else None
+        topic_doc = mongo_topics_by_oid.get(topic_oid) if _valid_object_id_hex(topic_oid) else None
+        subject_doc = mongo_subjects_by_oid.get(subject_oid) if _valid_object_id_hex(subject_oid) else None
+
+        lesson_name = (neo_base.get("lesson") or {}).get("lessonName") or (pg_base.get("lesson") or {}).get("lessonName") or ""
+        topic_name = (neo_base.get("topic") or {}).get("topicName") or (pg_base.get("topic") or {}).get("topicName") or ""
+        subject_name = (neo_base.get("subject") or {}).get("subjectName") or (pg_base.get("subject") or {}).get("subjectName") or ""
+        class_name = (neo_base.get("class") or {}).get("className") or (pg_base.get("class") or {}).get("className") or ""
+        lesson_id_v = (neo_base.get("lesson") or {}).get("lessonID") or (pg_base.get("lesson") or {}).get("lessonID") or ""
+        topic_id_v = (neo_base.get("topic") or {}).get("topicID") or (pg_base.get("topic") or {}).get("topicID") or ""
+        subject_id_v = (neo_base.get("subject") or {}).get("subjectID") or (pg_base.get("subject") or {}).get("subjectID") or ""
+        class_id_v = (neo_base.get("class") or {}).get("classID") or (pg_base.get("class") or {}).get("classID") or ""
+
+        images: List[dict] = []
+        videos: List[dict] = []
+        media_sources = {"chunk": 0, "lesson": 0, "topic": 0, "subject": 0}
+        for follow_type, follow_id in chunk_targets_by_chunk.get(chunk_id, []):
+            bucket = media_map.get((follow_type, follow_id)) or {}
+            part_images = bucket.get("images") or []
+            part_videos = bucket.get("videos") or []
+            if part_images or part_videos:
+                media_sources[follow_type] = len(part_images) + len(part_videos)
+            images.extend(part_images)
+            videos.extend(part_videos)
+        images.sort(key=_media_sort_key)
+        videos.sort(key=_media_sort_key)
+
+        matched_kw = [name for _score, name in chunk_top_kw.get(chunk_id, [])]
+        item = {
+            "type": "chunk",
+            "id": chunk_id,
+            "name": (neo_base.get("chunkName") or pg_base.get("chunkName") or (chunk_doc or {}).get("chunkName") or chunk_id),
+            "score": float(score_by_chunk.get(chunk_id, 0.0)),
+            "chunkID": chunk_id,
+            "chunkName": (chunk_doc.get("chunkName") if chunk_doc else None) or neo_base.get("chunkName") or pg_base.get("chunkName"),
+            "chunkType": (chunk_doc.get("chunkType") if chunk_doc else None) or pg_base.get("chunkType"),
+            "chunkNumber": pg_base.get("chunkNumber"),
+            "chunkUrl": (chunk_doc.get("chunkUrl") if chunk_doc else None),
+            "chunkDescription": (chunk_doc.get("chunkDescription") if chunk_doc else None),
+            "keywords": _read_keywords_from_chunk_doc(chunk_doc),
+            "matchedKeywords": matched_kw,
+            "images": images,
+            "videos": videos,
+            "mediaSummary": {"totalImages": len(images), "totalVideos": len(videos), "byFollowType": media_sources},
+            "isSaved": False,
+            "class": {"classID": class_id_v, "className": class_name},
+            "subject": {
+                "subjectID": subject_id_v,
+                "subjectName": subject_name,
+                "subjectDescription": ((subject_doc.get("subjectTitle") if subject_doc else None) or (subject_doc.get("description") if subject_doc else None) or ""),
+                "subjectUrl": (subject_doc.get("subjectUrl") if subject_doc and _status_visible(subject_doc) else ""),
+            },
+            "topic": {
+                "topicID": topic_id_v,
+                "topicName": topic_name,
+                "topicNumber": (pg_base.get("topic") or {}).get("topicNumber"),
+                "topicDescription": ((topic_doc.get("topicDescription") if topic_doc else None) or (topic_doc.get("topic_description") if topic_doc else None) or (topic_doc.get("description") if topic_doc else None) or ""),
+                "topicUrl": (topic_doc.get("topicUrl") if topic_doc and _status_visible(topic_doc) else ""),
+            },
+            "lesson": {
+                "lessonID": lesson_id_v,
+                "lessonName": lesson_name,
+                "lessonNumber": (pg_base.get("lesson") or {}).get("lessonNumber"),
+                "lessonDescription": ((lesson_doc.get("lessonDescription") if lesson_doc else None) or (lesson_doc.get("lesson_description") if lesson_doc else None) or (lesson_doc.get("description") if lesson_doc else None) or (lesson_doc.get("lessonType") if lesson_doc else None) or ""),
+                "lessonUrl": (lesson_doc.get("lessonUrl") if lesson_doc and _status_visible(lesson_doc) else ""),
+                "lessonType": (lesson_doc.get("lessonType") if lesson_doc else None) or "",
+            },
+            "category": (chunk_doc.get("chunkCategory") if chunk_doc else None) or category or "document",
+        }
+        try:
+            if mongo_db is not None:
+                saved = mongo_db["user_saved_chunks"].find_one({"username": username, "chunkID": chunk_id})
+                item["isSaved"] = bool(saved)
+        except Exception:
+            pass
+        items.append(item)
+    return items
+
+
+def _pick_return_mode(ctx: dict, *, topicID: str, lessonID: str) -> str:
+    if ctx.get("chunkNumber") is not None or str(ctx.get("chunkNameHint") or ""):
+        return "chunk"
+    if lessonID or ctx.get("lessonNumber") is not None or str(ctx.get("lessonNameHint") or ""):
+        return "lesson"
+    if topicID or ctx.get("topicNumber") is not None or str(ctx.get("topicNameHint") or ""):
+        return "topic"
+    if ctx.get("classNumber") is not None:
+        return "class"
+    return "topic"
+
+
+# --------------------------- main entry ---------------------------
 
 def semantic_search(
     *,
@@ -525,35 +1051,160 @@ def semantic_search(
 
     dbg: Dict[str, object] = {"service_version": _SERVICE_VERSION, "category": category}
 
-    cand_chunks = _candidate_chunk_ids_from_filters_pg(
-        pg=pg,
-        classID=classID,
-        subjectID=subjectID,
-        topicID=topicID,
-        lessonID=lessonID,
+    ctx = _parse_query_context(query)
+    dbg["query_context"] = ctx
+    class_scope = _normalize_class_scope(classID, ctx.get("classNumber"))
+
+    topic_number = None if topicID else ctx.get("topicNumber")
+    lesson_number = None if lessonID else ctx.get("lessonNumber")
+    chunk_number = ctx.get("chunkNumber")
+
+    topic_rows = _load_topic_rows_pg(pg=pg, class_id=class_scope, subject_id=subjectID, topic_id=topicID)
+    dbg["topic_rows_before_number"] = len(topic_rows)
+    topic_rows = _filter_by_number(topic_rows, "topicNumber", topic_number)
+    dbg["topic_rows_after_number"] = len(topic_rows)
+    topic_ids, _topic_score_map, topic_dbg = _resolve_scope_by_name(
+        rows=topic_rows,
+        id_key="topicID",
+        name_hint=str(ctx.get("topicNameHint") or ""),
+        neo=neo,
+        label="Topic",
+        embedding_field="topic_embedding",
     )
-    dbg["candidate_chunk_scope"] = None if cand_chunks is None else len(cand_chunks)
+    dbg["topic_scope"] = topic_dbg
+    topic_scope_active = bool(topicID or topic_number is not None or str(ctx.get("topicNameHint") or ""))
+    if topic_scope_active and not topic_ids:
+        res = {"total": 0, "items": []}
+        if debug:
+            res["debug"] = dbg
+        return res
 
-    core_query = _core_query_text(query)
-    dbg["core_query"] = core_query
-    dbg["tokens_no_stop"] = _tokens_no_stop(query)
+    lessons_rows = _load_lesson_rows_pg(
+        pg=pg,
+        class_id=class_scope,
+        subject_id=subjectID,
+        topic_ids=topic_ids if topic_scope_active else None,
+        lesson_id=lessonID,
+    )
+    dbg["lesson_rows_before_number"] = len(lessons_rows)
+    lessons_rows = _filter_by_number(lessons_rows, "lessonNumber", lesson_number)
+    dbg["lesson_rows_after_number"] = len(lessons_rows)
+    lesson_ids, _lesson_score_map, lesson_dbg = _resolve_scope_by_name(
+        rows=lessons_rows,
+        id_key="lessonID",
+        name_hint=str(ctx.get("lessonNameHint") or ""),
+        neo=neo,
+        label="Lesson",
+        embedding_field="lesson_embedding",
+    )
+    dbg["lesson_scope"] = lesson_dbg
+    lesson_scope_active = bool(lessonID or lesson_number is not None or str(ctx.get("lessonNameHint") or ""))
+    if lesson_scope_active and not lesson_ids:
+        res = {"total": 0, "items": []}
+        if debug:
+            res["debug"] = dbg
+        return res
 
-    gemini_terms, gem_dbg = _maybe_expand_with_gemini(core_query or query, cand_chunks, pg)
-    dbg["gemini_terms"] = gemini_terms
-    if gem_dbg:
-        if gem_dbg.get("model"):
-            dbg["gemini_model"] = gem_dbg.get("model")
-        if gem_dbg.get("error"):
-            dbg["gemini_error"] = gem_dbg.get("error")
-        if gem_dbg.get("mode"):
-            dbg["gemini_mode"] = gem_dbg.get("mode")
+    chunk_rows = _load_chunk_rows_pg(
+        pg=pg,
+        class_id=class_scope,
+        subject_id=subjectID,
+        topic_ids=topic_ids if topic_scope_active else None,
+        lesson_ids=lesson_ids if lesson_scope_active else None,
+    )
+    dbg["chunk_rows_before_number"] = len(chunk_rows)
+    chunk_rows = _filter_by_number(chunk_rows, "chunkNumber", chunk_number)
+    dbg["chunk_rows_after_number"] = len(chunk_rows)
+    explicit_chunk_ids, _explicit_chunk_score_map, chunk_dbg = _resolve_scope_by_name(
+        rows=chunk_rows,
+        id_key="chunkID",
+        name_hint=str(ctx.get("chunkNameHint") or ""),
+        neo=neo,
+        label="Chunk",
+        embedding_field="chunk_embedding",
+    )
+    dbg["chunk_scope"] = chunk_dbg
+    chunk_scope_active = bool(chunk_number is not None or str(ctx.get("chunkNameHint") or ""))
+    if chunk_scope_active and not explicit_chunk_ids:
+        res = {"total": 0, "items": []}
+        if debug:
+            res["debug"] = dbg
+        return res
+    if chunk_scope_active:
+        chunk_rows = [row for row in chunk_rows if str(row.get("chunkID") or "") in set(explicit_chunk_ids)]
 
-    semantic_query = _query_embedding_text(query, core_query, gemini_terms)
-    dbg["semantic_query"] = semantic_query
-    query_embedding = embed_keyword_cached(semantic_query)
+    generic_query = str(ctx.get("genericQuery") or "")
+    dbg["generic_query"] = generic_query
+    is_keyword_search = bool(generic_query)
+    dbg["is_keyword_search"] = is_keyword_search
 
-    dbg["embedding_source"] = "neo4j_only"
-    keyword_rows, keyword_source, keyword_source_error = _load_keyword_rows(neo, pg, cand_chunks)
+    # structured-only path returns the lowest specified level
+    if not is_keyword_search:
+        return_mode = _pick_return_mode(ctx, topicID=topicID, lessonID=lessonID)
+        dbg["return_mode"] = f"structured_{return_mode}"
+        if return_mode == "chunk":
+            total = len(chunk_rows)
+            page_rows = chunk_rows[offset : offset + limit]
+            page_chunk_ids = [str(row.get("chunkID") or "") for row in page_rows]
+            score_by_chunk = {cid: 1.0 for cid in page_chunk_ids}
+            chunk_top_kw: Dict[str, List[Tuple[float, str]]] = {}
+            neo_map, neo_error = _neo_hierarchy_for_chunks(neo, page_chunk_ids)
+            if neo_error:
+                dbg["neo_error"] = neo_error
+            pg_map = _load_pg_page_rows(pg, page_chunk_ids)
+            items = _build_chunk_items(
+                page_chunk_ids=page_chunk_ids,
+                score_by_chunk=score_by_chunk,
+                chunk_top_kw=chunk_top_kw,
+                pg_map=pg_map,
+                neo_map=neo_map,
+                mongo_db=mongo_db,
+                category=category,
+                username=username,
+                pg=pg,
+                dbg=dbg,
+            )
+            res = {"total": total, "items": items}
+            if debug:
+                dbg["items_built"] = len(items)
+                res["debug"] = dbg
+            return res
+        if return_mode == "lesson":
+            total = len(lessons_rows)
+            items = _build_lesson_items(lessons_rows[offset : offset + limit])
+            res = {"total": total, "items": items}
+            if debug:
+                res["debug"] = dbg
+            return res
+        total = len(topic_rows)
+        items = _build_topic_items(topic_rows[offset : offset + limit])
+        res = {"total": total, "items": items}
+        if debug:
+            res["debug"] = dbg
+        return res
+
+    # keyword path must be scoped by parsed structure / names first
+    chunk_ids = [str(row.get("chunkID") or "") for row in chunk_rows if str(row.get("chunkID") or "")]
+    dbg["candidate_chunk_scope"] = len(chunk_ids)
+    if not chunk_ids:
+        res = {"total": 0, "items": []}
+        if debug:
+            res["debug"] = dbg
+        return res
+
+    # exact-first within scoped candidates, then semantic fallback
+    keyword_query = _strip_keyword_filler(generic_query)
+    dbg["keyword_query"] = keyword_query
+
+    gemini_terms, gem_dbg = _maybe_expand_with_gemini(keyword_query or generic_query or query, chunk_ids, pg)
+    dbg["gemini_terms_before_scope_filter"] = gem_dbg.get("before_scope_filter") if gem_dbg else []
+    dbg["gemini_terms_after_scope_filter"] = gem_dbg.get("after_scope_filter") if gem_dbg else []
+    dbg["gemini_model"] = gem_dbg.get("model") if gem_dbg else None
+    dbg["gemini_mode"] = gem_dbg.get("mode") if gem_dbg else None
+    gemini_terms = _filter_gemini_terms_strict(keyword_query or generic_query, gemini_terms)
+    dbg["gemini_terms_after_strict_filter"] = gemini_terms
+
+    keyword_rows, keyword_source, keyword_source_error = _load_keyword_rows(neo, pg, chunk_ids)
     dbg["keyword_rows"] = len(keyword_rows)
     dbg["keyword_embedding_source"] = keyword_source
     if keyword_source_error:
@@ -564,9 +1215,21 @@ def semantic_search(
             res["debug"] = dbg
         return res
 
-    keyword_hits, min_score = _score_keywords(query_embedding, keyword_rows)
+    exact_hits = _exact_keyword_hits(keyword_query, keyword_rows)
+    if exact_hits:
+        keyword_hits = exact_hits
+        dbg["keyword_match_mode"] = "exact_first"
+        dbg["keyword_min_score"] = 0.94
+        semantic_query = keyword_query
+    else:
+        semantic_query = _query_embedding_text(query, keyword_query or generic_query, gemini_terms)
+        dbg["semantic_query"] = semantic_query
+        query_embedding = embed_keyword_cached(semantic_query)
+        keyword_hits, min_score = _score_keywords(query_embedding, keyword_rows)
+        dbg["keyword_match_mode"] = "semantic_fallback"
+        dbg["keyword_min_score"] = min_score
+    dbg["semantic_query"] = semantic_query
     dbg["keyword_hit_count"] = len(keyword_hits)
-    dbg["keyword_min_score"] = min_score
     if not keyword_hits:
         res = {"total": 0, "items": []}
         if debug:
@@ -590,147 +1253,21 @@ def semantic_search(
     dbg["hierarchy_source"] = "neo4j" if neo_map else "postgresql"
     if neo_error:
         dbg["neo_error"] = neo_error
-
     pg_map = _load_pg_page_rows(pg, page_chunk_ids)
     dbg["pg_chunk_rows"] = len(pg_map)
 
-    chunk_mongo_hex: List[str] = []
-    lesson_mongo_hex: List[str] = []
-    topic_mongo_hex: List[str] = []
-    subject_mongo_hex: List[str] = []
-    for base in pg_map.values():
-        if _valid_object_id_hex(base.get("chunkMongoId") or ""):
-            chunk_mongo_hex.append(base["chunkMongoId"])
-        if _valid_object_id_hex((base.get("lesson") or {}).get("mongoId") or ""):
-            lesson_mongo_hex.append(base["lesson"]["mongoId"])
-        if _valid_object_id_hex((base.get("topic") or {}).get("mongoId") or ""):
-            topic_mongo_hex.append(base["topic"]["mongoId"])
-        if _valid_object_id_hex((base.get("subject") or {}).get("mongoId") or ""):
-            subject_mongo_hex.append(base["subject"]["mongoId"])
-
-    mongo_chunks_by_oid = _load_by_oids(mongo_db, "chunks", chunk_mongo_hex)
-    mongo_lessons_by_oid = _load_by_oids(mongo_db, "lessons", lesson_mongo_hex)
-    mongo_topics_by_oid = _load_by_oids(mongo_db, "topics", topic_mongo_hex)
-    mongo_subjects_by_oid = _load_by_oids(mongo_db, "subjects", subject_mongo_hex)
-
-    media_targets: List[tuple[str, str]] = []
-    chunk_targets_by_chunk: Dict[str, List[tuple[str, str]]] = {}
-    for chunk_id in page_chunk_ids:
-        pg_base = pg_map.get(chunk_id) or {}
-        neo_base = neo_map.get(chunk_id) or {}
-        lesson_id_v = (neo_base.get("lesson") or {}).get("lessonID") or (pg_base.get("lesson") or {}).get("lessonID") or ""
-        topic_id_v = (neo_base.get("topic") or {}).get("topicID") or (pg_base.get("topic") or {}).get("topicID") or ""
-        subject_id_v = (neo_base.get("subject") or {}).get("subjectID") or (pg_base.get("subject") or {}).get("subjectID") or ""
-        targets = [("chunk", chunk_id), ("lesson", lesson_id_v), ("topic", topic_id_v), ("subject", subject_id_v)]
-        norm_targets = [(ft, fid) for ft, fid in targets if ft and fid]
-        chunk_targets_by_chunk[chunk_id] = norm_targets
-        media_targets.extend(norm_targets)
-
-    media_map = _load_media_map_for_targets(pg=pg, mongo_db=mongo_db, targets=media_targets)
-    dbg["media_hit_groups"] = len(media_map)
-
-    items: List[dict] = []
-    for chunk_id in page_chunk_ids:
-        pg_base = pg_map.get(chunk_id)
-        if not pg_base:
-            continue
-
-        neo_base = neo_map.get(chunk_id) or {}
-        chunk_doc = None
-        if _valid_object_id_hex(pg_base.get("chunkMongoId") or ""):
-            chunk_doc = mongo_chunks_by_oid.get(pg_base["chunkMongoId"])
-        if chunk_doc and not _status_visible(chunk_doc):
-            continue
-
-        if category and category != "all":
-            chunk_category = (chunk_doc or {}).get("chunkCategory") or ""
-            if chunk_category and chunk_category != category:
-                continue
-
-        lesson_oid = (pg_base.get("lesson") or {}).get("mongoId") or ""
-        topic_oid = (pg_base.get("topic") or {}).get("mongoId") or ""
-        subject_oid = (pg_base.get("subject") or {}).get("mongoId") or ""
-        lesson_doc = mongo_lessons_by_oid.get(lesson_oid) if _valid_object_id_hex(lesson_oid) else None
-        topic_doc = mongo_topics_by_oid.get(topic_oid) if _valid_object_id_hex(topic_oid) else None
-        subject_doc = mongo_subjects_by_oid.get(subject_oid) if _valid_object_id_hex(subject_oid) else None
-
-        lesson_name = (neo_base.get("lesson") or {}).get("lessonName") or (pg_base.get("lesson") or {}).get("lessonName") or ""
-        topic_name = (neo_base.get("topic") or {}).get("topicName") or (pg_base.get("topic") or {}).get("topicName") or ""
-        subject_name = (neo_base.get("subject") or {}).get("subjectName") or (pg_base.get("subject") or {}).get("subjectName") or ""
-        class_name = (neo_base.get("class") or {}).get("className") or (pg_base.get("class") or {}).get("className") or ""
-
-        lesson_id_v = (neo_base.get("lesson") or {}).get("lessonID") or (pg_base.get("lesson") or {}).get("lessonID") or ""
-        topic_id_v = (neo_base.get("topic") or {}).get("topicID") or (pg_base.get("topic") or {}).get("topicID") or ""
-        subject_id_v = (neo_base.get("subject") or {}).get("subjectID") or (pg_base.get("subject") or {}).get("subjectID") or ""
-        class_id_v = (neo_base.get("class") or {}).get("classID") or (pg_base.get("class") or {}).get("classID") or ""
-
-        images: List[dict] = []
-        videos: List[dict] = []
-        media_sources = {"chunk": 0, "lesson": 0, "topic": 0, "subject": 0}
-        for follow_type, follow_id in chunk_targets_by_chunk.get(chunk_id, []):
-            bucket = media_map.get((follow_type, follow_id)) or {}
-            part_images = bucket.get("images") or []
-            part_videos = bucket.get("videos") or []
-            if part_images or part_videos:
-                media_sources[follow_type] = len(part_images) + len(part_videos)
-            images.extend(part_images)
-            videos.extend(part_videos)
-
-        images.sort(key=_media_sort_key)
-        videos.sort(key=_media_sort_key)
-
-        matched_kw = [name for _score, name in chunk_top_kw.get(chunk_id, [])]
-        item = {
-            "type": "chunk",
-            "id": chunk_id,
-            "name": (neo_base.get("chunkName") or pg_base.get("chunkName") or (chunk_doc or {}).get("chunkName") or chunk_id),
-            "score": float(score_by_chunk.get(chunk_id, 0.0)),
-            "chunkID": chunk_id,
-            "chunkName": (chunk_doc.get("chunkName") if chunk_doc else None) or neo_base.get("chunkName") or pg_base.get("chunkName"),
-            "chunkType": (chunk_doc.get("chunkType") if chunk_doc else None) or pg_base.get("chunkType"),
-            "chunkUrl": (chunk_doc.get("chunkUrl") if chunk_doc else None),
-            "chunkDescription": (chunk_doc.get("chunkDescription") if chunk_doc else None),
-            "keywords": _read_keywords_from_chunk_doc(chunk_doc),
-            "matchedKeywords": matched_kw,
-            "images": images,
-            "videos": videos,
-            "mediaSummary": {
-                "totalImages": len(images),
-                "totalVideos": len(videos),
-                "byFollowType": media_sources,
-            },
-            "isSaved": False,
-            "class": {"classID": class_id_v, "className": class_name},
-            "subject": {
-                "subjectID": subject_id_v,
-                "subjectName": subject_name,
-                "subjectDescription": ((subject_doc.get("subjectTitle") if subject_doc else None) or (subject_doc.get("description") if subject_doc else None) or ""),
-                "subjectUrl": (subject_doc.get("subjectUrl") if subject_doc and _status_visible(subject_doc) else ""),
-            },
-            "topic": {
-                "topicID": topic_id_v,
-                "topicName": topic_name,
-                "topicDescription": ((topic_doc.get("topicDescription") if topic_doc else None) or (topic_doc.get("topic_description") if topic_doc else None) or (topic_doc.get("description") if topic_doc else None) or ""),
-                "topicUrl": (topic_doc.get("topicUrl") if topic_doc and _status_visible(topic_doc) else ""),
-            },
-            "lesson": {
-                "lessonID": lesson_id_v,
-                "lessonName": lesson_name,
-                "lessonDescription": ((lesson_doc.get("lessonDescription") if lesson_doc else None) or (lesson_doc.get("lesson_description") if lesson_doc else None) or (lesson_doc.get("description") if lesson_doc else None) or (lesson_doc.get("lessonType") if lesson_doc else None) or ""),
-                "lessonUrl": (lesson_doc.get("lessonUrl") if lesson_doc and _status_visible(lesson_doc) else ""),
-                "lessonType": (lesson_doc.get("lessonType") if lesson_doc else None) or "",
-            },
-            "category": (chunk_doc.get("chunkCategory") if chunk_doc else None) or category or "document",
-        }
-
-        try:
-            if mongo_db is not None:
-                saved = mongo_db["user_saved_chunks"].find_one({"username": username, "chunkID": chunk_id})
-                item["isSaved"] = bool(saved)
-        except Exception:
-            pass
-
-        items.append(item)
+    items = _build_chunk_items(
+        page_chunk_ids=page_chunk_ids,
+        score_by_chunk=score_by_chunk,
+        chunk_top_kw=chunk_top_kw,
+        pg_map=pg_map,
+        neo_map=neo_map,
+        mongo_db=mongo_db,
+        category=category,
+        username=username,
+        pg=pg,
+        dbg=dbg,
+    )
 
     res = {"total": total, "items": items}
     if debug:

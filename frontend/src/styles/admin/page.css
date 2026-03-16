@@ -417,3 +417,58 @@ body.user-shell-clean .header-actions .btn {
   flex: 1;
   min-height: 0;
 }
+
+/* ===== MinIO page: cố định vùng bảng + có thanh cuộn riêng ===== */
+.minio-page {
+  height: calc(100vh - var(--topbar-h, 76px) - 40px);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.minio-page .page-header {
+  flex: 0 0 auto;
+}
+
+.minio-page .table-wrapper {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.minio-page .table-container,
+.minio-page .table-scroll {
+  min-height: 0;
+}
+
+.minio-page .table-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #94a3b8 #e2e8f0;
+}
+
+.minio-page .table-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.minio-page .table-scroll::-webkit-scrollbar-track {
+  background: #e2e8f0;
+  border-radius: 999px;
+}
+
+.minio-page .table-scroll::-webkit-scrollbar-thumb {
+  background: #94a3b8;
+  border-radius: 999px;
+  border: 2px solid #e2e8f0;
+}
+
+.minio-page .table-scroll::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+@media (max-width: 768px) {
+  .minio-page {
+    height: auto;
+    min-height: calc(100vh - var(--topbar-h, 76px) - 24px);
+  }
+}

@@ -499,7 +499,7 @@ export default function MinIO() {
   const hasFileData = fileRows.length > 0;
 
   return (
-    <div>
+    <div className="minio-page">
       <div className="page-header">
         <div className="page-header-top">
           <div className="title-row">

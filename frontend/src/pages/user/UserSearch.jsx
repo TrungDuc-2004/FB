@@ -59,10 +59,27 @@ function uniqueBy(items, getKey) {
 }
 
 function aggregateSearchItems(items) {
-  const chunks = Array.isArray(items)
-    ? items.filter((item) => (item?.itemType || item?.type || "chunk") === "chunk")
-    : [];
-  const out = [...chunks];
+  if (!Array.isArray(items)) return [];
+
+  const normalized = items.map((item) => {
+    const kind = item?.itemType || item?.type || "chunk";
+    return {
+      ...item,
+      itemType: kind,
+      type: kind,
+      category: item?.category || (kind === "chunk" ? "document" : kind),
+      chunkID: item?.chunkID || item?.id || "",
+      chunkName: item?.chunkName || item?.name || item?.id || "Chưa có tên",
+    };
+  });
+
+  const chunks = normalized.filter((item) => (item?.itemType || item?.type) === "chunk");
+
+  // Giữ nguyên các kết quả trả trực tiếp từ backend:
+  // lesson / topic / subject / class / image / video
+  const directItems = normalized.filter((item) => (item?.itemType || item?.type) !== "chunk");
+
+  const out = [...chunks, ...directItems];
   const groups = new Map();
 
   function pushGroup(kind, id, name, seed, extra = {}) {
@@ -79,7 +96,9 @@ function aggregateSearchItems(items) {
         type: kind,
         category: kind,
         chunkID: cleanId,
+        id: cleanId,
         chunkName: name || cleanId,
+        name: name || cleanId,
         chunkType: extra.chunkType || kind,
         chunkUrl: fallbackChunkUrl,
         chunkDescription: fallbackDescription,
@@ -107,15 +126,18 @@ function aggregateSearchItems(items) {
     }
   }
 
+  // Chỉ sinh group từ chunk
   for (const item of chunks) {
     pushGroup("subject", item?.subject?.subjectID, item?.subject?.subjectName || item?.subject?.subjectID, item, {
       chunkUrl: item?.subject?.subjectUrl || item?.chunkUrl || "",
       chunkDescription: item?.subject?.subjectDescription || "",
     });
+
     pushGroup("topic", item?.topic?.topicID, item?.topic?.topicName || item?.topic?.topicID, item, {
       chunkUrl: item?.topic?.topicUrl || item?.chunkUrl || "",
       chunkDescription: item?.topic?.topicDescription || "",
     });
+
     pushGroup("lesson", item?.lesson?.lessonID, item?.lesson?.lessonName || item?.lesson?.lessonID, item, {
       chunkUrl: item?.lesson?.lessonUrl || item?.chunkUrl || "",
       chunkDescription: item?.lesson?.lessonDescription || "",
@@ -128,6 +150,7 @@ function aggregateSearchItems(items) {
         chunkDescription: media?.description || "",
       });
     }
+
     for (const media of item?.videos || []) {
       pushGroup("video", media?.id, media?.name || media?.id, item, {
         chunkUrl: media?.url || "",
@@ -136,7 +159,10 @@ function aggregateSearchItems(items) {
     }
   }
 
-  return [...out, ...Array.from(groups.values())];
+  return uniqueBy(
+    [...out, ...Array.from(groups.values())],
+    (item) => `${item?.itemType || item?.type || item?.category || "document"}::${item?.chunkID || item?.id}`
+  );
 }
 
 function typeRank(item) {
