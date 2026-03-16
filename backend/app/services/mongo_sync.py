@@ -278,6 +278,14 @@ def sync_minio_object_to_mongo(
     if not class_map:
         raise ValueError("Cannot derive class_map. Hãy nhập subject_map đúng (VD TH10) hoặc class_map (VD L10)")
 
+    topic_meta = _parse_topic_map(topic_map) if topic_map else None
+    lesson_meta = _parse_lesson_map(lesson_map) if lesson_map else None
+    chunk_meta = _parse_chunk_map(chunk_map) if chunk_map else None
+
+    topic_number = int(topic_meta["topicNumber"]) if topic_meta and topic_meta.get("topicNumber") else None
+    lesson_number = int(lesson_meta["lessonNumber"]) if lesson_meta and lesson_meta.get("lessonNumber") else None
+    chunk_number = int(chunk_meta["chunkNumber"]) if chunk_meta and chunk_meta.get("chunkNumber") else None
+
     now = _now()
 
     # ====== Names (giảm bắt buộc, cho phép rỗng) ======
@@ -360,6 +368,7 @@ def sync_minio_object_to_mongo(
             set_fields = {
                 "subjectID": subject_map,
                 "topicName": topic_name,
+                "topicNumber": topic_number,
                 "updatedAt": now,
             }
             if folder_type == "topic":
@@ -371,6 +380,7 @@ def sync_minio_object_to_mongo(
                     **topic_filter,
                     "subjectID": subject_map,
                     "topicName": topic_name,
+                    "topicNumber": topic_number,
                     "topicUrl": file_url if folder_type == "topic" else "",
                     "status": "active",
                     "createdBy": actor or "system",
@@ -390,6 +400,7 @@ def sync_minio_object_to_mongo(
                 "topicID": topic_map or "",
                 "lessonName": lesson_name,
                 "lessonType": lesson_type,
+                "lessonNumber": lesson_number,
                 "updatedAt": now,
             }
             if folder_type == "lesson":
@@ -402,6 +413,7 @@ def sync_minio_object_to_mongo(
                     "topicID": topic_map or "",
                     "lessonName": lesson_name,
                     "lessonType": lesson_type,
+                    "lessonNumber": lesson_number,
                     "lessonUrl": file_url if folder_type == "lesson" else "",
                     "status": "active",
                     "createdBy": actor or "system",
@@ -424,12 +436,11 @@ def sync_minio_object_to_mongo(
                 {"_id": chunk_id},
                 {
                     "$set": {
-                        "lessonID": lesson_map,  # QUAN TRỌNG: lesson_map
+                        "lessonID": lesson_map,
                         "chunkName": chunk_name,
                         "chunkType": chunk_type,
+                        "chunkNumber": chunk_number,
                         "chunkUrl": file_url,
-                        # giữ keywords ở chunk để tương thích dữ liệu cũ/UI,
-                        # nhưng canonical source mới là collection `keywords`.
                         "keywords": keywords,
                         "chunkDescription": chunk_desc,
                         "updatedAt": now,
@@ -440,9 +451,10 @@ def sync_minio_object_to_mongo(
             chunk_id = db[COL_CHUNKS].insert_one(
                 {
                     **chunk_filter,
-                    "lessonID": lesson_map,  # QUAN TRỌNG: lesson_map
+                    "lessonID": lesson_map,
                     "chunkName": chunk_name,
                     "chunkType": chunk_type,
+                    "chunkNumber": chunk_number,
                     "chunkUrl": file_url,
                     "keywords": keywords,
                     "chunkDescription": chunk_desc,

@@ -29,7 +29,8 @@ from sqlalchemy import text
 
 from .mongo_client import get_mongo_client
 from .postgre_client import get_engine
-from .db_migrations import ensure_keyword_embedding_column
+from .db_migrations import ensure_postgre_search_columns
+from .keyword_embedding import embed_keyword_cached
 
 
 def _md5_32(s: str) -> str:
@@ -203,6 +204,142 @@ def _parse_topic_lesson_chunk_numbers_from_chunk_map(chunk_map: str) -> Tuple[st
     return (m.group(1), m.group(2), m.group(3)) if m else ("", "", "")
 
 
+def _to_int(v: str) -> Optional[int]:
+    s = _clean(v)
+    if not s:
+        return None
+    try:
+        return int(s)
+    except Exception:
+        return None
+
+
+def _derive_hierarchy_numbers(
+    *,
+    topic_map: str = "",
+    lesson_map: str = "",
+    chunk_map: str = "",
+) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    topic_number: Optional[int] = None
+    lesson_number: Optional[int] = None
+    chunk_number: Optional[int] = None
+
+    if topic_map:
+        topic_number = _to_int(_parse_topic_number_from_topic_map(topic_map))
+
+    if lesson_map:
+        tnum, lnum = _parse_topic_lesson_numbers_from_lesson_map(lesson_map)
+        if topic_number is None:
+            topic_number = _to_int(tnum)
+        lesson_number = _to_int(lnum)
+
+    if chunk_map:
+        tnum, lnum, cnum = _parse_topic_lesson_chunk_numbers_from_chunk_map(chunk_map)
+        if topic_number is None:
+            topic_number = _to_int(tnum)
+        if lesson_number is None:
+            lesson_number = _to_int(lnum)
+        chunk_number = _to_int(cnum)
+
+    return topic_number, lesson_number, chunk_number
+
+
+def _upsert_topic(
+    conn,
+    *,
+    topic_id: str,
+    topic_name: str,
+    mongo_id: Optional[str],
+    subject_id: Optional[str],
+    topic_number: Optional[int],
+) -> None:
+    conn.execute(
+        text(
+            """
+            INSERT INTO topic (topic_id, topic_name, mongo_id, subject_id, topic_number)
+            VALUES (:topic_id, :topic_name, :mongo_id, :subject_id, :topic_number)
+            ON CONFLICT (topic_id) DO UPDATE
+            SET topic_name    = EXCLUDED.topic_name,
+                mongo_id      = COALESCE(EXCLUDED.mongo_id, topic.mongo_id),
+                subject_id    = EXCLUDED.subject_id,
+                topic_number  = COALESCE(EXCLUDED.topic_number, topic.topic_number)
+            """
+        ),
+        {
+            "topic_id": topic_id,
+            "topic_name": topic_name,
+            "mongo_id": mongo_id,
+            "subject_id": subject_id,
+            "topic_number": topic_number,
+        },
+    )
+
+
+def _upsert_lesson(
+    conn,
+    *,
+    lesson_id: str,
+    lesson_name: str,
+    mongo_id: Optional[str],
+    topic_id: Optional[str],
+    lesson_number: Optional[int],
+) -> None:
+    conn.execute(
+        text(
+            """
+            INSERT INTO lesson (lesson_id, lesson_name, mongo_id, topic_id, lesson_number)
+            VALUES (:lesson_id, :lesson_name, :mongo_id, :topic_id, :lesson_number)
+            ON CONFLICT (lesson_id) DO UPDATE
+            SET lesson_name    = EXCLUDED.lesson_name,
+                mongo_id       = COALESCE(EXCLUDED.mongo_id, lesson.mongo_id),
+                topic_id       = EXCLUDED.topic_id,
+                lesson_number  = COALESCE(EXCLUDED.lesson_number, lesson.lesson_number)
+            """
+        ),
+        {
+            "lesson_id": lesson_id,
+            "lesson_name": lesson_name,
+            "mongo_id": mongo_id,
+            "topic_id": topic_id,
+            "lesson_number": lesson_number,
+        },
+    )
+
+
+def _upsert_chunk(
+    conn,
+    *,
+    chunk_id: str,
+    chunk_name: str,
+    chunk_type: Optional[str],
+    mongo_id: Optional[str],
+    lesson_id: Optional[str],
+    chunk_number: Optional[int],
+) -> None:
+    conn.execute(
+        text(
+            """
+            INSERT INTO chunk (chunk_id, chunk_name, chunk_type, mongo_id, lesson_id, chunk_number)
+            VALUES (:chunk_id, :chunk_name, :chunk_type, :mongo_id, :lesson_id, :chunk_number)
+            ON CONFLICT (chunk_id) DO UPDATE
+            SET chunk_name    = EXCLUDED.chunk_name,
+                chunk_type    = EXCLUDED.chunk_type,
+                mongo_id      = COALESCE(EXCLUDED.mongo_id, chunk.mongo_id),
+                lesson_id     = EXCLUDED.lesson_id,
+                chunk_number  = COALESCE(EXCLUDED.chunk_number, chunk.chunk_number)
+            """
+        ),
+        {
+            "chunk_id": chunk_id,
+            "chunk_name": chunk_name,
+            "chunk_type": chunk_type,
+            "mongo_id": mongo_id,
+            "lesson_id": lesson_id,
+            "chunk_number": chunk_number,
+        },
+    )
+
+
 # ======================================================================================
 # 1) GIỮ NGUYÊN: sync theo mongo ObjectId -> hash PK
 # ======================================================================================
@@ -216,7 +353,7 @@ def sync_postgre_from_mongo_ids(
     mongo_chunk_id: str,
 ) -> PgIds:
     # Ensure schema supports keyword embeddings
-    ensure_keyword_embedding_column()
+    ensure_postgre_search_columns()
     mg = get_mongo_client()
     db = mg["db"]
 
@@ -233,7 +370,16 @@ def sync_postgre_from_mongo_ids(
     chunk_name = _clean(ch_doc.get("chunkName"))
     chunk_type = _clean(ch_doc.get("chunkType"))
 
+    topic_map = _clean(t_doc.get("topicID"))
+    lesson_map = _clean(l_doc.get("lessonID"))
     chunk_map = _clean(ch_doc.get("chunkID"))
+
+    topic_number, lesson_number, chunk_number = _derive_hierarchy_numbers(
+        topic_map=topic_map,
+        lesson_map=lesson_map,
+        chunk_map=chunk_map,
+    )
+
     kw_docs = _get_keywords_for_chunk(db, chunk_map=chunk_map, chunk_doc=ch_doc)
 
     class_id_guess = _md5_32(mongo_class_id)
@@ -283,63 +429,32 @@ def sync_postgre_from_mongo_ids(
             },
         )
 
-        conn.execute(
-            text(
-                """
-                INSERT INTO topic (topic_id, topic_name, mongo_id, subject_id)
-                VALUES (:topic_id, :topic_name, :mongo_id, :subject_id)
-                ON CONFLICT (topic_id) DO UPDATE
-                SET topic_name  = EXCLUDED.topic_name,
-                    mongo_id    = COALESCE(EXCLUDED.mongo_id, topic.mongo_id),
-                    subject_id  = EXCLUDED.subject_id
-                """
-            ),
-            {
-                "topic_id": topic_id,
-                "topic_name": topic_name,
-                "mongo_id": mongo_topic_id,
-                "subject_id": subject_id,
-            },
+        _upsert_topic(
+            conn,
+            topic_id=topic_id,
+            topic_name=topic_name,
+            mongo_id=mongo_topic_id,
+            subject_id=subject_id,
+            topic_number=topic_number,
         )
 
-        conn.execute(
-            text(
-                """
-                INSERT INTO lesson (lesson_id, lesson_name, mongo_id, topic_id)
-                VALUES (:lesson_id, :lesson_name, :mongo_id, :topic_id)
-                ON CONFLICT (lesson_id) DO UPDATE
-                SET lesson_name = EXCLUDED.lesson_name,
-                    mongo_id    = COALESCE(EXCLUDED.mongo_id, lesson.mongo_id),
-                    topic_id    = EXCLUDED.topic_id
-                """
-            ),
-            {
-                "lesson_id": lesson_id,
-                "lesson_name": lesson_name,
-                "mongo_id": mongo_lesson_id,
-                "topic_id": topic_id,
-            },
+        _upsert_lesson(
+            conn,
+            lesson_id=lesson_id,
+            lesson_name=lesson_name,
+            mongo_id=mongo_lesson_id,
+            topic_id=topic_id,
+            lesson_number=lesson_number,
         )
 
-        conn.execute(
-            text(
-                """
-                INSERT INTO chunk (chunk_id, chunk_name, chunk_type, mongo_id, lesson_id)
-                VALUES (:chunk_id, :chunk_name, :chunk_type, :mongo_id, :lesson_id)
-                ON CONFLICT (chunk_id) DO UPDATE
-                SET chunk_name = EXCLUDED.chunk_name,
-                    chunk_type = EXCLUDED.chunk_type,
-                    mongo_id   = COALESCE(EXCLUDED.mongo_id, chunk.mongo_id),
-                    lesson_id  = EXCLUDED.lesson_id
-                """
-            ),
-            {
-                "chunk_id": chunk_id,
-                "chunk_name": chunk_name,
-                "chunk_type": chunk_type or None,
-                "mongo_id": mongo_chunk_id,
-                "lesson_id": lesson_id,
-            },
+        _upsert_chunk(
+            conn,
+            chunk_id=chunk_id,
+            chunk_name=chunk_name,
+            chunk_type=chunk_type or None,
+            mongo_id=mongo_chunk_id,
+            lesson_id=lesson_id,
+            chunk_number=chunk_number,
         )
 
         conn.execute(text("DELETE FROM keyword WHERE chunk_id = :chunk_id"), {"chunk_id": chunk_id})
@@ -358,6 +473,8 @@ def sync_postgre_from_mongo_ids(
             kw_emb = d.get("keywordEmbedding")
             if kw_emb is not None and not isinstance(kw_emb, list):
                 kw_emb = None
+            if kw_emb is None:
+                kw_emb = embed_keyword_cached(kw_name)
 
             conn.execute(
                 text(
@@ -441,7 +558,7 @@ def sync_postgre_from_mongo_maps(
     chunk_map: str = "",
 ) -> PgIds:
     # Ensure schema supports keyword embeddings
-    ensure_keyword_embedding_column()
+    ensure_postgre_search_columns()
     """Sync PG theo map IDs.
 
     - Nếu truyền chunk_map: sync đủ chain + chunk + keywords
@@ -488,6 +605,16 @@ def sync_postgre_from_mongo_maps(
     mongo_topic_id = str((topic_doc or {}).get("_id")) if topic_doc else None
     mongo_lesson_id = str((lesson_doc or {}).get("_id")) if lesson_doc else None
     mongo_chunk_id = str((chunk_doc or {}).get("_id")) if chunk_doc else None
+
+    topic_map_for_number = topic_map or _clean((topic_doc or {}).get("topicID"))
+    lesson_map_for_number = lesson_map or _clean((lesson_doc or {}).get("lessonID"))
+    chunk_map_for_number = chunk_map or _clean((chunk_doc or {}).get("chunkID"))
+
+    topic_number, lesson_number, chunk_number = _derive_hierarchy_numbers(
+        topic_map=topic_map_for_number,
+        lesson_map=lesson_map_for_number,
+        chunk_map=chunk_map_for_number,
+    )
 
     kw_docs = _get_keywords_for_chunk(db, chunk_map=chunk_map, chunk_doc=chunk_doc)
 
@@ -537,65 +664,34 @@ def sync_postgre_from_mongo_maps(
             )
 
         if want_topic:
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO topic (topic_id, topic_name, mongo_id, subject_id)
-                    VALUES (:topic_id, :topic_name, :mongo_id, :subject_id)
-                    ON CONFLICT (topic_id) DO UPDATE
-                    SET topic_name  = EXCLUDED.topic_name,
-                        mongo_id    = COALESCE(EXCLUDED.mongo_id, topic.mongo_id),
-                        subject_id  = EXCLUDED.subject_id
-                    """
-                ),
-                {
-                    "topic_id": topic_id,
-                    "topic_name": topic_name,
-                    "mongo_id": mongo_topic_id,
-                    "subject_id": subject_id or None,
-                },
+            _upsert_topic(
+                conn,
+                topic_id=topic_id,
+                topic_name=topic_name,
+                mongo_id=mongo_topic_id,
+                subject_id=subject_id or None,
+                topic_number=topic_number,
             )
 
         if want_lesson:
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO lesson (lesson_id, lesson_name, mongo_id, topic_id)
-                    VALUES (:lesson_id, :lesson_name, :mongo_id, :topic_id)
-                    ON CONFLICT (lesson_id) DO UPDATE
-                    SET lesson_name = EXCLUDED.lesson_name,
-                        mongo_id    = COALESCE(EXCLUDED.mongo_id, lesson.mongo_id),
-                        topic_id    = EXCLUDED.topic_id
-                    """
-                ),
-                {
-                    "lesson_id": lesson_id,
-                    "lesson_name": lesson_name,
-                    "mongo_id": mongo_lesson_id,
-                    "topic_id": topic_id or None,
-                },
+            _upsert_lesson(
+                conn,
+                lesson_id=lesson_id,
+                lesson_name=lesson_name,
+                mongo_id=mongo_lesson_id,
+                topic_id=topic_id or None,
+                lesson_number=lesson_number,
             )
 
         if want_chunk:
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO chunk (chunk_id, chunk_name, chunk_type, mongo_id, lesson_id)
-                    VALUES (:chunk_id, :chunk_name, :chunk_type, :mongo_id, :lesson_id)
-                    ON CONFLICT (chunk_id) DO UPDATE
-                    SET chunk_name = EXCLUDED.chunk_name,
-                        chunk_type = EXCLUDED.chunk_type,
-                        mongo_id   = COALESCE(EXCLUDED.mongo_id, chunk.mongo_id),
-                        lesson_id  = EXCLUDED.lesson_id
-                    """
-                ),
-                {
-                    "chunk_id": chunk_id,
-                    "chunk_name": chunk_name,
-                    "chunk_type": chunk_type or None,
-                    "mongo_id": mongo_chunk_id,
-                    "lesson_id": lesson_id or None,
-                },
+            _upsert_chunk(
+                conn,
+                chunk_id=chunk_id,
+                chunk_name=chunk_name,
+                chunk_type=chunk_type or None,
+                mongo_id=mongo_chunk_id,
+                lesson_id=lesson_id or None,
+                chunk_number=chunk_number,
             )
 
             # keywords: xoá cũ rồi insert lại
@@ -612,6 +708,8 @@ def sync_postgre_from_mongo_maps(
                 kw_emb = d.get("keywordEmbedding")
                 if kw_emb is not None and not isinstance(kw_emb, list):
                     kw_emb = None
+                if kw_emb is None:
+                    kw_emb = embed_keyword_cached(kw_name)
 
                 conn.execute(
                     text(
@@ -665,7 +763,7 @@ def sync_postgre_from_mongo_auto_ids(
     chunk_map: str = "",
 ) -> PgIds:
     # Ensure schema supports keyword embeddings
-    ensure_keyword_embedding_column()
+    ensure_postgre_search_columns()
     """Sync PG từ Mongo nhưng *ID trong PG* theo chuẩn mới.
 
     Map ID (CD/B/C) chỉ dùng để suy ra số thứ tự T/L/C.
@@ -735,6 +833,16 @@ def sync_postgre_from_mongo_auto_ids(
             chunk_id = f"{lesson_id}_C{cnum}"
 
     # keywords (collection `keywords` mới; fallback legacy chunk.keywords)
+    topic_map_for_number = topic_map or _clean((topic_doc or {}).get("topicID"))
+    lesson_map_for_number = lesson_map or _clean((lesson_doc or {}).get("lessonID"))
+    chunk_map_for_number = chunk_map or _clean((chunk_doc or {}).get("chunkID"))
+
+    topic_number, lesson_number, chunk_number = _derive_hierarchy_numbers(
+        topic_map=topic_map_for_number,
+        lesson_map=lesson_map_for_number,
+        chunk_map=chunk_map_for_number,
+    )
+
     kw_docs = _get_keywords_for_chunk(db, chunk_map=chunk_map, chunk_doc=chunk_doc)
 
     engine = get_engine()
@@ -781,65 +889,34 @@ def sync_postgre_from_mongo_auto_ids(
             )
 
         if want_topic:
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO topic (topic_id, topic_name, mongo_id, subject_id)
-                    VALUES (:topic_id, :topic_name, :mongo_id, :subject_id)
-                    ON CONFLICT (topic_id) DO UPDATE
-                    SET topic_name  = EXCLUDED.topic_name,
-                        mongo_id    = COALESCE(EXCLUDED.mongo_id, topic.mongo_id),
-                        subject_id  = EXCLUDED.subject_id
-                    """
-                ),
-                {
-                    "topic_id": topic_id,
-                    "topic_name": topic_name or topic_id,
-                    "mongo_id": mongo_topic_id,
-                    "subject_id": subject_id,
-                },
+            _upsert_topic(
+                conn,
+                topic_id=topic_id,
+                topic_name=topic_name or topic_id,
+                mongo_id=mongo_topic_id,
+                subject_id=subject_id,
+                topic_number=topic_number,
             )
 
         if want_lesson:
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO lesson (lesson_id, lesson_name, mongo_id, topic_id)
-                    VALUES (:lesson_id, :lesson_name, :mongo_id, :topic_id)
-                    ON CONFLICT (lesson_id) DO UPDATE
-                    SET lesson_name = EXCLUDED.lesson_name,
-                        mongo_id    = COALESCE(EXCLUDED.mongo_id, lesson.mongo_id),
-                        topic_id    = EXCLUDED.topic_id
-                    """
-                ),
-                {
-                    "lesson_id": lesson_id,
-                    "lesson_name": lesson_name or lesson_id,
-                    "mongo_id": mongo_lesson_id,
-                    "topic_id": topic_id,
-                },
+            _upsert_lesson(
+                conn,
+                lesson_id=lesson_id,
+                lesson_name=lesson_name or lesson_id,
+                mongo_id=mongo_lesson_id,
+                topic_id=topic_id,
+                lesson_number=lesson_number,
             )
 
         if want_chunk:
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO chunk (chunk_id, chunk_name, chunk_type, mongo_id, lesson_id)
-                    VALUES (:chunk_id, :chunk_name, :chunk_type, :mongo_id, :lesson_id)
-                    ON CONFLICT (chunk_id) DO UPDATE
-                    SET chunk_name = EXCLUDED.chunk_name,
-                        chunk_type = EXCLUDED.chunk_type,
-                        mongo_id   = COALESCE(EXCLUDED.mongo_id, chunk.mongo_id),
-                        lesson_id  = EXCLUDED.lesson_id
-                    """
-                ),
-                {
-                    "chunk_id": chunk_id,
-                    "chunk_name": chunk_name or chunk_id,
-                    "chunk_type": chunk_type or None,
-                    "mongo_id": mongo_chunk_id,
-                    "lesson_id": lesson_id,
-                },
+            _upsert_chunk(
+                conn,
+                chunk_id=chunk_id,
+                chunk_name=chunk_name or chunk_id,
+                chunk_type=chunk_type or None,
+                mongo_id=mongo_chunk_id,
+                lesson_id=lesson_id,
+                chunk_number=chunk_number,
             )
 
             # keywords: xoá cũ rồi insert lại
@@ -864,6 +941,8 @@ def sync_postgre_from_mongo_auto_ids(
                 kw_emb = d.get("keywordEmbedding")
                 if kw_emb is not None and not isinstance(kw_emb, list):
                     kw_emb = None
+                if kw_emb is None:
+                    kw_emb = embed_keyword_cached(kw_name)
 
                 conn.execute(
                     text(

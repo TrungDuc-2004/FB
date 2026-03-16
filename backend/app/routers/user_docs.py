@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import re
-from typing import Any, Optional
+from typing import Any, Generator, Optional
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -58,6 +58,35 @@ def _actor(request: Request) -> str:
 
 def _not_hidden_q():
     return {"$ne": "hidden"}
+
+
+def _get_search_neo_session() -> Generator[object | None, None, None]:
+    gen = None
+    try:
+        gen = get_neo4j_session()
+        session = next(gen)
+    except Exception:
+        if gen is not None:
+            try:
+                gen.close()
+            except Exception:
+                pass
+        yield None
+        return
+
+    try:
+        yield session
+    finally:
+        if gen is not None:
+            try:
+                next(gen)
+            except StopIteration:
+                pass
+            except Exception:
+                try:
+                    gen.close()
+                except Exception:
+                    pass
 
 
 def _get_any(doc: Optional[dict], keys: list[str], default: Any = None):
@@ -1163,7 +1192,7 @@ def search(
     offset: int = Query(0, ge=0),
     debug: int = Query(0),
     pg: Session = Depends(get_db),
-    neo=Depends(get_neo4j_session),
+    neo=Depends(_get_search_neo_session),
 ):
     username = _actor(request)
     if q and offset == 0:
