@@ -59,108 +59,16 @@ function uniqueBy(items, getKey) {
 }
 
 function aggregateSearchItems(items) {
-  if (!Array.isArray(items)) return [];
-
-  const normalized = items.map((item) => {
-    const kind = item?.itemType || item?.type || "chunk";
-    return {
-      ...item,
-      itemType: kind,
-      type: kind,
-      category: item?.category || (kind === "chunk" ? "document" : kind),
-      chunkID: item?.chunkID || item?.id || "",
-      chunkName: item?.chunkName || item?.name || item?.id || "Chưa có tên",
-    };
-  });
-
-  const chunks = normalized.filter((item) => (item?.itemType || item?.type) === "chunk");
-
-  // Giữ nguyên các kết quả trả trực tiếp từ backend:
-  // lesson / topic / subject / class / image / video
-  const directItems = normalized.filter((item) => (item?.itemType || item?.type) !== "chunk");
-
-  const out = [...chunks, ...directItems];
-  const groups = new Map();
-
-  function pushGroup(kind, id, name, seed, extra = {}) {
-    const cleanId = String(id || "").trim();
-    if (!cleanId) return;
-
-    const key = `${kind}::${cleanId}`;
-    const fallbackChunkUrl = extra.chunkUrl || seed?.chunkUrl || "";
-    const fallbackDescription = extra.chunkDescription || "";
-
-    if (!groups.has(key)) {
-      groups.set(key, {
-        itemType: kind,
-        type: kind,
-        category: kind,
-        chunkID: cleanId,
-        id: cleanId,
-        chunkName: name || cleanId,
-        name: name || cleanId,
-        chunkType: extra.chunkType || kind,
-        chunkUrl: fallbackChunkUrl,
-        chunkDescription: fallbackDescription,
-        score: typeof seed?.score === "number" ? seed.score : 0,
-        isSaved: false,
-        class: seed?.class || { classID: "", className: "" },
-        subject: seed?.subject || { subjectID: "", subjectName: "", subjectUrl: "" },
-        topic: seed?.topic || { topicID: "", topicName: "", topicUrl: "" },
-        lesson: seed?.lesson || { lessonID: "", lessonName: "", lessonType: "", lessonUrl: "" },
-        mappedDocuments: [],
-        images: seed?.images || [],
-        videos: seed?.videos || [],
-      });
-    }
-
-    const current = groups.get(key);
-    current.score = Math.max(current.score || 0, typeof seed?.score === "number" ? seed.score : 0);
-    if (!current.chunkUrl && fallbackChunkUrl) current.chunkUrl = fallbackChunkUrl;
-    if (!current.chunkDescription && fallbackDescription) current.chunkDescription = fallbackDescription;
-    if (!current.chunkType && extra.chunkType) current.chunkType = extra.chunkType;
-
-    if (seed?.chunkID && !(current.mappedDocuments || []).some((item) => item.chunkID === seed.chunkID)) {
-      current.mappedDocuments.push(seed);
-      if (!current.chunkUrl && seed?.chunkUrl) current.chunkUrl = seed.chunkUrl;
-    }
-  }
-
-  // Chỉ sinh group từ chunk
-  for (const item of chunks) {
-    pushGroup("subject", item?.subject?.subjectID, item?.subject?.subjectName || item?.subject?.subjectID, item, {
-      chunkUrl: item?.subject?.subjectUrl || item?.chunkUrl || "",
-      chunkDescription: item?.subject?.subjectDescription || "",
-    });
-
-    pushGroup("topic", item?.topic?.topicID, item?.topic?.topicName || item?.topic?.topicID, item, {
-      chunkUrl: item?.topic?.topicUrl || item?.chunkUrl || "",
-      chunkDescription: item?.topic?.topicDescription || "",
-    });
-
-    pushGroup("lesson", item?.lesson?.lessonID, item?.lesson?.lessonName || item?.lesson?.lessonID, item, {
-      chunkUrl: item?.lesson?.lessonUrl || item?.chunkUrl || "",
-      chunkDescription: item?.lesson?.lessonDescription || "",
-      chunkType: item?.lesson?.lessonType || "",
-    });
-
-    for (const media of item?.images || []) {
-      pushGroup("image", media?.id, media?.name || media?.id, item, {
-        chunkUrl: media?.url || "",
-        chunkDescription: media?.description || "",
-      });
-    }
-
-    for (const media of item?.videos || []) {
-      pushGroup("video", media?.id, media?.name || media?.id, item, {
-        chunkUrl: media?.url || "",
-        chunkDescription: media?.description || "",
-      });
-    }
-  }
+  const normalized = (Array.isArray(items) ? items : []).map((item) => ({
+    ...item,
+    itemType: item?.itemType || item?.type || "chunk",
+    type: item?.type || item?.itemType || "chunk",
+    chunkID: item?.chunkID || item?.id || "",
+    chunkName: item?.chunkName || item?.name || item?.id || "Chưa có tên",
+  }));
 
   return uniqueBy(
-    [...out, ...Array.from(groups.values())],
+    normalized,
     (item) => `${item?.itemType || item?.type || item?.category || "document"}::${item?.chunkID || item?.id}`
   );
 }
@@ -258,20 +166,15 @@ export default function Search() {
         setLoading(true);
         setErr("");
 
-        const categories = mediaType === "all" ? ["document", "image", "video"] : [mediaType];
-        const responses = await Promise.all(
-          categories.map((category) =>
-            searchDocs({ q, category, limit: 100, offset: 0 }).then((response) => {
-              const normalized = normalizeSearchResponse(response);
-              return (normalized.items || []).map((item) => ({
-                ...item,
-                category: item.category || category,
-              }));
-            })
-          )
-        );
+        const response = await searchDocs({ q, category: mediaType, limit: 100, offset: 0 });
+        const normalized = normalizeSearchResponse(response);
 
-        const items = aggregateSearchItems(responses.flat())
+        const items = aggregateSearchItems(
+          (normalized.items || []).map((item) => ({
+            ...item,
+            category: item.category || mediaType || "all",
+          }))
+        )
           .sort((a, b) => {
             const rankDiff = typeRank(a) - typeRank(b);
             if (rankDiff !== 0) return rankDiff;
@@ -281,7 +184,7 @@ export default function Search() {
           });
 
         if (seq !== reqSeqRef.current) return;
-        setRawItems(uniqueBy(items, (item) => `${item.category || "document"}::${item.chunkID || item.id}`));
+        setRawItems(uniqueBy(items, (item) => `${item.itemType || item.type || item.category || "document"}::${item.chunkID || item.id}`));
       } catch (error) {
         if (seq !== reqSeqRef.current) return;
         setErr(String(error?.message || error));

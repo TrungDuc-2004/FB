@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from openpyxl import load_workbook
 
 from .mongo_client import get_mongo_client
+from .keyword_embedding import embed_keyword_cached, get_keyword_embedder
 from .postgre_sync_from_mongo import PgIds, sync_postgre_from_mongo_auto_ids
 from .neo_sync import NeoSyncResult, sync_neo4j_from_maps_and_pg_ids
 
@@ -234,6 +235,7 @@ def upsert_chain_to_mongo_by_maps(
     COL_TOPICS = "topics"
     COL_LESSONS = "lessons"
     COL_CHUNKS = "chunks"
+    COL_KEYWORDS = "keywords"
 
     def _bump(col_key: str, action: str):
         if not stats:
@@ -416,6 +418,39 @@ def upsert_chain_to_mongo_by_maps(
                 }
             ).inserted_id
             _bump("chunks", "inserted")
+
+        # Đồng bộ keywords collection để cùng schema với luồng import Mongo cũ.
+        try:
+            db[COL_KEYWORDS].delete_many({"chunkID": chunk_map})
+        except Exception:
+            pass
+
+        if kw:
+            embedder = get_keyword_embedder()
+            for idx, kw_name in enumerate(kw, start=1):
+                kw_name = _clean(kw_name)
+                if not kw_name:
+                    continue
+                kw_map = f"{chunk_map}_K{idx}"
+                db[COL_KEYWORDS].update_one(
+                    {"keywordID": kw_map},
+                    {
+                        "$set": {
+                            "chunkID": chunk_map,
+                            "keywordName": kw_name,
+                            "keywordEmbedding": embed_keyword_cached(kw_name),
+                            "embeddingProvider": getattr(embedder, "name", ""),
+                            "status": status or "active",
+                            "updatedAt": now,
+                        },
+                        "$setOnInsert": {
+                            "createdBy": actor,
+                            "createdAt": now,
+                        },
+                    },
+                    upsert=True,
+                )
+
         out["chunk_id"] = str(chunk_id)
 
     return out
@@ -565,17 +600,31 @@ def parse_excel_to_payload(excel_bytes: bytes) -> Dict[str, List[Dict[str, Any]]
         )
 
     for rowno, r in raw["topic"]:
+        topic_id = _best(r, "topicID", "topic_id", "topicMap", "topic_map")
         subject_ref = _best(r, "subjectID", "subject_ref", "subject_map")
         subject_id = subject_key_to_id.get(subject_ref, subject_ref)
-        if not subject_id:
-            continue
-        topic_id = _best(r, "topicID", "topic_id", "topicMap", "topic_map")
-        if not topic_id:
+
+        if not subject_id and topic_id:
+            parsed_topic = _parse_topic_map(topic_id)
+            if parsed_topic:
+                subject_id = parsed_topic["subject_map"]
+
+        if not topic_id and subject_id:
             tnum = _to_int(_best(r, "topic_num", "topicNum", "topicNumber"))
             if tnum:
                 topic_id = f"{subject_id}_CD{tnum}"
+
         if not topic_id:
             continue
+
+        if not subject_id:
+            parsed_topic = _parse_topic_map(topic_id)
+            if parsed_topic:
+                subject_id = parsed_topic["subject_map"]
+
+        if not subject_id:
+            continue
+
         payload["topics"].append(
             {
                 "_row": rowno,
@@ -589,20 +638,27 @@ def parse_excel_to_payload(excel_bytes: bytes) -> Dict[str, List[Dict[str, Any]]
         )
 
     for rowno, r in raw["lesson"]:
+        lesson_id = _best(r, "lessonID", "lesson_id", "lessonMap", "lesson_map")
         topic_ref = _best(r, "topicID", "topic_ref", "topic_map")
         topic_id = topic_key_to_id.get(topic_ref, topic_ref)
-        if not topic_id:
-            continue
-        lesson_id = _best(r, "lessonID", "lesson_id", "lessonMap", "lesson_map")
-        if not lesson_id:
+
+        if not topic_id and lesson_id:
+            parsed_lesson = _parse_lesson_map(lesson_id)
+            if parsed_lesson:
+                topic_id = parsed_lesson["topic_map"]
+
+        if not lesson_id and topic_id:
             lnum = _to_int(_best(r, "lesson_num", "lessonNum", "lessonNumber"))
             if lnum:
                 lesson_id = f"{topic_id}_B{lnum}"
+
         if not lesson_id:
             continue
+
         d = _parse_lesson_map(lesson_id)
         if not d:
             continue
+
         payload["lessons"].append(
             {
                 "_row": rowno,

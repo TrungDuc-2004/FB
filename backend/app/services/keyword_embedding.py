@@ -2,14 +2,15 @@ from __future__ import annotations
 
 """Keyword embedding utilities.
 
-Mục tiêu:
-- Không phụ thuộc thư viện ML nặng (chạy được ngay chỉ với stdlib).
-- Có thể chuyển sang provider khác (OpenAI / local model) qua ENV.
+Mặc định dùng sentence-transformers với model `intfloat/multilingual-e5-base`.
+- Dữ liệu lưu/index: prefix `passage: `
+- Query semantic search: prefix `query: `
 
-ENV hỗ trợ:
-- KEYWORD_EMBEDDING_PROVIDER: "hash" (default) | "openai"
-- KEYWORD_EMBED_DIM: số chiều embedding (default 256)
-- OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL (khi provider=openai)
+Có thể override bằng ENV nếu cần:
+- KEYWORD_EMBEDDING_PROVIDER: sentence_transformers (default) | hash | openai
+- KEYWORD_EMBEDDING_MODEL: default intfloat/multilingual-e5-base
+- KEYWORD_EMBED_DIM: optional, fallback khi provider=hash/openai
+- OPENAI_API_KEY, OPENAI_EMBEDDING_MODEL: khi provider=openai
 """
 
 import hashlib
@@ -18,14 +19,17 @@ import os
 import re
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Protocol
+from typing import List, Literal, Protocol
+
+
+EmbedMode = Literal["passage", "query"]
 
 
 class Embedder(Protocol):
     name: str
     dim: int
 
-    def embed(self, text: str) -> List[float]: ...
+    def embed(self, text: str, *, mode: EmbedMode = "passage") -> List[float]: ...
 
 
 def _clean(s: str | None) -> str:
@@ -40,14 +44,15 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _normalize(v: List[float]) -> List[float]:
+    norm = math.sqrt(sum(float(x) * float(x) for x in v))
+    if norm <= 0:
+        return [float(x) for x in v]
+    return [float(x) / norm for x in v]
+
+
 @dataclass(frozen=True)
 class HashEmbedder:
-    """Embedding bằng hashing (stable) – dùng được ngay không cần model.
-
-    Đây KHÔNG phải semantic embedding chuẩn như SBERT/OpenAI.
-    Nhưng đủ để bạn build pipeline (Mongo -> PG -> Neo4j) và test end-to-end.
-    """
-
     dim: int = 256
     name: str = "hash"
 
@@ -63,14 +68,15 @@ class HashEmbedder:
             sign = -1.0 if (h[i] & 1) else 1.0
             vec[idx] += sign * weight
 
-    def embed(self, text: str) -> List[float]:
+    def embed(self, text: str, *, mode: EmbedMode = "passage") -> List[float]:
         s = _clean(text)
         if not s:
             return [0.0] * self.dim
 
+        prefix = "query: " if mode == "query" else "passage: "
+        low = f"{prefix}{s}".lower()
         vec = [0.0] * self.dim
 
-        low = s.lower()
         tokens = self._token_re.findall(low)
         for t in tokens:
             self._acc(vec, t.encode("utf-8"), weight=1.0)
@@ -81,24 +87,16 @@ class HashEmbedder:
                 gram = compact[i : i + 3]
                 self._acc(vec, gram.encode("utf-8"), weight=0.5)
 
-        norm = math.sqrt(sum(x * x for x in vec))
-        if norm > 0:
-            vec = [x / norm for x in vec]
-        return vec
+        return _normalize(vec)
 
 
 @dataclass(frozen=True)
 class OpenAIEmbedder:
-    """OpenAI embedding provider (optional).
-
-    Cần cài thêm package `openai` và set OPENAI_API_KEY.
-    """
-
     model: str
     dim: int
     name: str = "openai"
 
-    def embed(self, text: str) -> List[float]:
+    def embed(self, text: str, *, mode: EmbedMode = "passage") -> List[float]:
         s = _clean(text)
         if not s:
             return [0.0] * self.dim
@@ -110,16 +108,57 @@ class OpenAIEmbedder:
                 "OpenAI provider selected but `openai` package is not installed. Run: pip install openai"
             ) from e
 
+        prefix = "query: " if mode == "query" else "passage: "
         client = OpenAI()
-        res = client.embeddings.create(model=self.model, input=s)
+        res = client.embeddings.create(model=self.model, input=f"{prefix}{s}")
         emb = list(res.data[0].embedding)
-        return [float(x) for x in emb]
+        return _normalize([float(x) for x in emb])
+
+
+@dataclass(frozen=True)
+class SentenceTransformerEmbedder:
+    model: str
+    dim: int
+    name: str = "sentence-transformers"
+
+    def embed(self, text: str, *, mode: EmbedMode = "passage") -> List[float]:
+        s = _clean(text)
+        if not s:
+            return [0.0] * self.dim
+
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                "sentence-transformers chưa được cài. Run: pip install sentence-transformers torch"
+            ) from e
+
+        model = _load_sentence_transformer(self.model)
+        prefix = "query: " if mode == "query" else "passage: "
+        vec = model.encode(
+            f"{prefix}{s}",
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        return [float(x) for x in vec.tolist()]
+
+
+@lru_cache(maxsize=2)
+def _load_sentence_transformer(model_name: str):
+    from sentence_transformers import SentenceTransformer  # type: ignore
+
+    return SentenceTransformer(model_name)
 
 
 @lru_cache(maxsize=1)
 def get_keyword_embedder() -> Embedder:
-    provider = (_clean(os.getenv("KEYWORD_EMBEDDING_PROVIDER")) or "hash").lower()
-    dim = _env_int("KEYWORD_EMBED_DIM", 256)
+    provider = (_clean(os.getenv("KEYWORD_EMBEDDING_PROVIDER")) or "sentence_transformers").lower()
+    model_name = _clean(os.getenv("KEYWORD_EMBEDDING_MODEL")) or "intfloat/multilingual-e5-base"
+    dim = _env_int("KEYWORD_EMBED_DIM", 768)
+
+    if provider in {"sentence_transformers", "sentence-transformers", "hf", "huggingface", "e5"}:
+        return SentenceTransformerEmbedder(model=model_name, dim=dim, name=model_name)
 
     if provider == "openai":
         model = _clean(os.getenv("OPENAI_EMBEDDING_MODEL")) or "text-embedding-3-small"
@@ -129,6 +168,15 @@ def get_keyword_embedder() -> Embedder:
 
 
 @lru_cache(maxsize=4096)
+def embed_text_cached(text: str, *, mode: EmbedMode = "passage") -> List[float]:
+    return get_keyword_embedder().embed(text, mode=mode)
+
+
+@lru_cache(maxsize=4096)
 def embed_keyword_cached(text: str) -> List[float]:
-    """Cache embedding theo keyword text để giảm thời gian khi upsert lại."""
-    return get_keyword_embedder().embed(text)
+    return embed_text_cached(text, mode="passage")
+
+
+@lru_cache(maxsize=4096)
+def embed_query_cached(text: str) -> List[float]:
+    return embed_text_cached(text, mode="query")

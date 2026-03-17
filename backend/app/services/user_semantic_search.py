@@ -16,7 +16,8 @@ from .gemini_topic_expander import expand_topic_keywords_debug
 from .keyword_embedding import embed_keyword_cached
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
-_SERVICE_VERSION = "search_structured_hierarchy_neo_name_keyword_v4_accent_exact"
+_SERVICE_VERSION = "search_structured_hierarchy_neo_name_keyword_v6_semantic_parts_anchor"
+# lấy cấu trúc để giới hạn 
 _LABEL_RE = re.compile(
     r"(?P<class>\b(?:lớp|lop|class)\b)|"
     r"(?P<topic>\b(?:chủ\s*đề|chu\s*de|topic)\b)|"
@@ -25,6 +26,7 @@ _LABEL_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+# các stop word 
 _STOP = {
     "a", "an", "and", "các", "cái", "cho", "có", "của", "dạng", "đến", "giúp",
     "hãy", "in", "không", "kiếm", "là", "liên", "muốn", "một", "nào", "những",
@@ -125,7 +127,7 @@ def _cosine(a: List[float], b: List[float]) -> float:
 
 
 # --------------------------- parsing ---------------------------
-
+# bóc câu hỏi ra thành các thành phần để giới hạn phần nào cần tìm kiếm, đồng thời tách phần query chung để tìm kiếm keyword
 def _parse_query_context(query: str) -> dict:
     raw = _norm_spaces(query)
     matches = list(_LABEL_RE.finditer(raw))
@@ -598,6 +600,17 @@ def _filter_gemini_terms_strict(base_query: str, gemini_terms: List[str]) -> Lis
     return _dedupe_keep_order(out)
 
 
+def _split_keyword_query_parts(raw_query: str, core_query: str) -> List[str]:
+    raw = _strip_keyword_filler(raw_query or "")
+    pieces = re.split(r"[,;\n]+|\b(?:va|và|hoặc|hay|and|or)\b", raw)
+    parts = [_strip_keyword_filler(piece) for piece in pieces]
+    parts = [part for part in parts if part]
+    if parts:
+        return _dedupe_keep_order(parts)
+    core = _strip_keyword_filler(core_query or raw_query or "")
+    return [core] if core else []
+
+
 def _query_embedding_text(raw_query: str, core_query: str, gemini_terms: List[str]) -> str:
     parts: List[str] = []
     if core_query:
@@ -606,6 +619,46 @@ def _query_embedding_text(raw_query: str, core_query: str, gemini_terms: List[st
         parts.append(_norm_spaces(raw_query.lower()))
     parts.extend(gemini_terms or [])
     return _norm_spaces(" ".join(_dedupe_keep_order(parts)))
+
+
+def _token_overlap_ratio(query_text: str, keyword_name: str) -> float:
+    q_tokens = set(_tokens_no_stop(_strip_keyword_filler(query_text or "")))
+    k_tokens = set(_tokens_no_stop(_strip_keyword_filler(keyword_name or "")))
+    if not q_tokens or not k_tokens:
+        return 0.0
+    return float(len(q_tokens & k_tokens) / len(q_tokens))
+
+
+def _score_keywords_for_query_part(
+    query_text: str,
+    query_embedding: List[float],
+    rows: List[Tuple[str, str, str, List[float]]],
+) -> Tuple[List[dict], float]:
+    matches: List[dict] = []
+    for keyword_id, chunk_id, keyword_name, keyword_embedding in rows:
+        cosine = _cosine(query_embedding, keyword_embedding)
+        overlap = _token_overlap_ratio(query_text, keyword_name)
+        adjusted = float(cosine + 0.06 * overlap)
+        matches.append({
+            "keywordID": keyword_id,
+            "chunkID": chunk_id,
+            "keywordName": keyword_name,
+            "score": adjusted,
+            "cosine": float(cosine),
+            "overlap": float(overlap),
+            "matchedQueryPart": query_text,
+        })
+    matches.sort(key=lambda item: item["score"], reverse=True)
+    if not matches:
+        return [], 0.0
+    top_score = float(matches[0]["score"])
+    min_score = max(0.82, top_score * 0.96)
+    filtered = [item for item in matches if float(item["score"]) >= min_score]
+    if len(filtered) < 5:
+        filtered = matches[: min(8, len(matches))]
+    else:
+        filtered = filtered[:20]
+    return filtered, min_score
 
 
 def _load_keyword_rows_from_neo(neo, cand_chunks: Optional[List[str]]) -> Tuple[List[Tuple[str, str, str, List[float]]], Optional[str]]:
@@ -706,10 +759,12 @@ def _score_keywords(query_embedding: List[float], rows: List[Tuple[str, str, str
     if not matches:
         return [], 0.0
     top_score = float(matches[0]["score"])
-    min_score = max(0.18, top_score * 0.55)
+    min_score = max(0.82, top_score * 0.96)
     filtered = [item for item in matches if float(item["score"]) >= min_score]
-    if not filtered:
-        filtered = matches[:100]
+    if len(filtered) < 5:
+        filtered = matches[: min(8, len(matches))]
+    else:
+        filtered = filtered[:20]
     return filtered, min_score
 
 
@@ -1192,16 +1247,21 @@ def semantic_search(
             res["debug"] = dbg
         return res
 
-    # exact-first within scoped candidates, then semantic fallback
+    # semantic-only within scoped candidates, scored per query part then merged
     keyword_query = _strip_keyword_filler(generic_query)
     dbg["keyword_query"] = keyword_query
+    query_parts = _split_keyword_query_parts(ctx.get("raw") or query, keyword_query or generic_query)
+    dbg["keyword_query_parts"] = query_parts
 
-    gemini_terms, gem_dbg = _maybe_expand_with_gemini(keyword_query or generic_query or query, chunk_ids, pg)
+    gemini_terms: List[str] = []
+    gem_dbg: dict = {}
+    if len(query_parts) <= 1:
+        gemini_terms, gem_dbg = _maybe_expand_with_gemini(keyword_query or generic_query or query, chunk_ids, pg)
+        gemini_terms = _filter_gemini_terms_strict(keyword_query or generic_query, gemini_terms)
     dbg["gemini_terms_before_scope_filter"] = gem_dbg.get("before_scope_filter") if gem_dbg else []
     dbg["gemini_terms_after_scope_filter"] = gem_dbg.get("after_scope_filter") if gem_dbg else []
     dbg["gemini_model"] = gem_dbg.get("model") if gem_dbg else None
     dbg["gemini_mode"] = gem_dbg.get("mode") if gem_dbg else None
-    gemini_terms = _filter_gemini_terms_strict(keyword_query or generic_query, gemini_terms)
     dbg["gemini_terms_after_strict_filter"] = gemini_terms
 
     keyword_rows, keyword_source, keyword_source_error = _load_keyword_rows(neo, pg, chunk_ids)
@@ -1215,19 +1275,37 @@ def semantic_search(
             res["debug"] = dbg
         return res
 
-    exact_hits = _exact_keyword_hits(keyword_query, keyword_rows)
-    if exact_hits:
-        keyword_hits = exact_hits
-        dbg["keyword_match_mode"] = "exact_first"
-        dbg["keyword_min_score"] = 0.94
-        semantic_query = keyword_query
-    else:
+    part_hits: List[dict] = []
+    part_min_scores: Dict[str, float] = {}
+    semantic_queries: List[str] = []
+    parts_to_use = query_parts or [keyword_query or generic_query or query]
+    for part in parts_to_use:
+        semantic_part = _query_embedding_text(part, part, gemini_terms if len(parts_to_use) == 1 else [])
+        semantic_queries.append(semantic_part)
+        query_embedding = embed_keyword_cached(semantic_part)
+        hits_for_part, min_score = _score_keywords_for_query_part(part, query_embedding, keyword_rows)
+        part_min_scores[part] = min_score
+        part_hits.extend(hits_for_part)
+
+    if not part_hits:
         semantic_query = _query_embedding_text(query, keyword_query or generic_query, gemini_terms)
         dbg["semantic_query"] = semantic_query
         query_embedding = embed_keyword_cached(semantic_query)
         keyword_hits, min_score = _score_keywords(query_embedding, keyword_rows)
-        dbg["keyword_match_mode"] = "semantic_fallback"
+        dbg["keyword_match_mode"] = "semantic_only_fallback"
         dbg["keyword_min_score"] = min_score
+    else:
+        merged: Dict[tuple, dict] = {}
+        for hit in part_hits:
+            key = (str(hit.get("keywordID") or ""), str(hit.get("chunkID") or ""))
+            prev = merged.get(key)
+            if prev is None or float(hit.get("score") or 0.0) > float(prev.get("score") or 0.0):
+                merged[key] = dict(hit)
+        keyword_hits = sorted(merged.values(), key=lambda item: float(item.get("score") or 0.0), reverse=True)
+        keyword_hits = keyword_hits[:60]
+        semantic_query = " | ".join([q for q in semantic_queries if q])
+        dbg["keyword_match_mode"] = "semantic_only_multi_part"
+        dbg["keyword_min_score"] = part_min_scores
     dbg["semantic_query"] = semantic_query
     dbg["keyword_hit_count"] = len(keyword_hits)
     if not keyword_hits:
