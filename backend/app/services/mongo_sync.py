@@ -12,6 +12,15 @@ from bson import ObjectId
 from .mongo_client import get_mongo_client
 from .keyword_embedding import embed_keyword_cached, get_keyword_embedder
 
+_WORD_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
+_CHUNK_STOPWORDS = {
+    "va", "và", "la", "là", "cua", "của", "cho", "voi", "với", "cac", "các",
+    "mot", "một", "nhung", "những", "trong", "tren", "trên", "duoi", "dưới", "tai",
+    "tu", "từ", "den", "đến", "ve", "về", "phan", "phần", "noi", "nội", "dung",
+    "bai", "bài", "chu", "chủ", "de", "đề", "muc", "mục", "ly", "thuyet", "thực",
+    "hanh", "thông", "tin", "du", "lieu", "dữ", "liệu"
+}
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -57,6 +66,69 @@ def _parse_keywords(v: Any) -> List[str]:
 def _extract_last_number(s: str) -> str:
     m = re.findall(r"\d+", s or "")
     return m[-1] if m else ""
+
+
+def _uniq_keep_order(values: List[str], *, limit: Optional[int] = None) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for value in values or []:
+        clean = _clean_str(value)
+        if not clean:
+            continue
+        key = clean.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(clean)
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
+def _auto_chunk_keywords(chunk_name: str, chunk_desc: str, *, limit: int = 5) -> List[str]:
+    seeds: List[str] = []
+    name = _clean_str(chunk_name)
+    desc = _clean_str(chunk_desc)
+
+    if name:
+        seeds.append(name)
+        parts = [x.strip(' -–—:') for x in re.split(r'[;,:\-–—]+', name) if x.strip()]
+        seeds.extend(parts)
+
+    if desc:
+        parts = [x.strip(' -–—:') for x in re.split(r'[.;\n\r]+', desc) if x.strip()]
+        for part in parts:
+            if 2 <= len(part.split()) <= 6:
+                seeds.append(part)
+
+        tokens = []
+        for tok in _WORD_RE.findall(desc):
+            low = tok.casefold()
+            if len(tok) < 3 or low in _CHUNK_STOPWORDS:
+                continue
+            tokens.append(tok)
+        freq = {}
+        for tok in tokens:
+            key = tok.casefold()
+            freq[key] = freq.get(key, 0) + 1
+        ranked = sorted(freq.items(), key=lambda item: (-item[1], item[0]))
+        for key, _count in ranked:
+            for tok in tokens:
+                if tok.casefold() == key:
+                    seeds.append(tok)
+                    break
+            if len(seeds) >= limit * 3:
+                break
+
+    return _uniq_keep_order(seeds, limit=limit)
+
+
+def _prepare_chunk_keywords(explicit_keywords: List[str], chunk_name: str, chunk_desc: str, *, limit: int = 5) -> List[str]:
+    kws = _uniq_keep_order(explicit_keywords, limit=limit)
+    if len(kws) >= limit:
+        return kws[:limit]
+    auto = _auto_chunk_keywords(chunk_name, chunk_desc, limit=limit)
+    return _uniq_keep_order([*kws, *auto], limit=limit)
 
 
 def _minio_public_base() -> str:
@@ -299,7 +371,19 @@ def sync_minio_object_to_mongo(
     chunk_name = _pick(meta, "chunkName", "chunk", "chunk_name") or (filename.rsplit(".", 1)[0] if filename else (chunk_map or ""))
     chunk_type = _pick(meta, "chunkType", "chunk_type") or lesson_type
     chunk_desc = _pick(meta, "chunkDescription", "description", "chunk_description")
-    keywords = _parse_keywords(_pick(meta, "keywords", "keyword"))
+    keywords = _prepare_chunk_keywords(
+        _parse_keywords(_pick(meta, "keywords", "keyword")),
+        chunk_name,
+        chunk_desc,
+        limit=5,
+    )
+
+    subject_desc = _pick(meta, "subjectDescription", "subject_description")
+    topic_desc = _pick(meta, "topicDescription", "topic_description")
+    lesson_desc = _pick(meta, "lessonDescription", "lesson_description")
+    subject_keywords = _parse_keywords(_pick(meta, "keywordSubject", "subjectKeywords", "subject_keywords"))
+    topic_keywords = _parse_keywords(_pick(meta, "keywordTopic", "topicKeywords", "topic_keywords"))
+    lesson_keywords = _parse_keywords(_pick(meta, "keywordLesson", "lessonKeywords", "lesson_keywords"))
 
     # ====== Collections ======
     COL_CLASSES = "classes"
@@ -339,6 +423,10 @@ def sync_minio_object_to_mongo(
             "subjectTitle": subject_title,
             "updatedAt": now,
         }
+        if subject_desc:
+            set_fields["subjectDescription"] = subject_desc
+        if subject_keywords:
+            set_fields["keywordSubject"] = subject_keywords
         # chỉ update url khi insert trong folder subjects
         if folder_type == "subject":
             set_fields["subjectUrl"] = file_url
@@ -351,6 +439,8 @@ def sync_minio_object_to_mongo(
                 "subjectName": subject_name,
                 "subjectTitle": subject_title,
                 "subjectUrl": file_url if folder_type == "subject" else "",
+                "subjectDescription": subject_desc,
+                "keywordSubject": subject_keywords,
                 "status": "active",
                 "createdBy": actor or "system",
                 "createdAt": now,
@@ -371,6 +461,10 @@ def sync_minio_object_to_mongo(
                 "topicNumber": topic_number,
                 "updatedAt": now,
             }
+            if topic_desc:
+                set_fields["topicDescription"] = topic_desc
+            if topic_keywords:
+                set_fields["keywordTopic"] = topic_keywords
             if folder_type == "topic":
                 set_fields["topicUrl"] = file_url
             db[COL_TOPICS].update_one({"_id": topic_id}, {"$set": set_fields})
@@ -382,6 +476,8 @@ def sync_minio_object_to_mongo(
                     "topicName": topic_name,
                     "topicNumber": topic_number,
                     "topicUrl": file_url if folder_type == "topic" else "",
+                    "topicDescription": topic_desc,
+                    "keywordTopic": topic_keywords,
                     "status": "active",
                     "createdBy": actor or "system",
                     "createdAt": now,
@@ -403,6 +499,10 @@ def sync_minio_object_to_mongo(
                 "lessonNumber": lesson_number,
                 "updatedAt": now,
             }
+            if lesson_desc:
+                set_fields["lessonDescription"] = lesson_desc
+            if lesson_keywords:
+                set_fields["keywordLesson"] = lesson_keywords
             if folder_type == "lesson":
                 set_fields["lessonUrl"] = file_url
             db[COL_LESSONS].update_one({"_id": lesson_id}, {"$set": set_fields})
@@ -415,6 +515,8 @@ def sync_minio_object_to_mongo(
                     "lessonType": lesson_type,
                     "lessonNumber": lesson_number,
                     "lessonUrl": file_url if folder_type == "lesson" else "",
+                    "lessonDescription": lesson_desc,
+                    "keywordLesson": lesson_keywords,
                     "status": "active",
                     "createdBy": actor or "system",
                     "createdAt": now,

@@ -740,11 +740,21 @@ def _mongo_map_payload_from_pg_row(table_name: str, obj, db: Session) -> Dict[st
     elif table_name == "keyword":
         payload["keywordName"] = getattr(obj, "keyword_name", None)
         payload["keywordEmbedding"] = getattr(obj, "keyword_embedding", None)
-        parent = db.query(models.Chunk).filter(models.Chunk.chunk_id == getattr(obj, "chunk_id", None)).first()
+        payload["mapID"] = getattr(obj, "map_id", None) or getattr(obj, "chunk_id", None)
+        map_id = payload.get("mapID")
+        parent = db.query(models.Chunk).filter(models.Chunk.chunk_id == map_id).first()
         if parent and getattr(parent, "mongo_id", None):
             parent_doc = _mongo_doc_by_id("chunks", getattr(parent, "mongo_id", None))
             if parent_doc and parent_doc.get("chunkID"):
                 payload["chunkID"] = parent_doc.get("chunkID")
+        else:
+            for collection_name, table_model, key_name in (("lessons", models.Lesson, "lessonID"), ("topics", models.Topic, "topicID"), ("subjects", models.Subject, "subjectID")):
+                parent_any = db.query(table_model).filter(getattr(table_model, list(table_model.__table__.primary_key.columns)[0].name) == map_id).first()
+                if parent_any and getattr(parent_any, "mongo_id", None):
+                    parent_doc = _mongo_doc_by_id(collection_name, getattr(parent_any, "mongo_id", None))
+                    if parent_doc and parent_doc.get(key_name):
+                        payload[key_name] = parent_doc.get(key_name)
+                        break
     elif table_name == "user":
         payload["username"] = getattr(obj, "username", None)
         payload["password"] = getattr(obj, "password", None)

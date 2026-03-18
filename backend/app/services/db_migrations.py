@@ -37,6 +37,25 @@ def _column_exists(conn, table_name: str, column_name: str) -> bool:
     return bool(row)
 
 
+
+
+def ensure_keyword_map_id_column() -> None:
+    """Ensure PostgreSQL table 'keyword' has column map_id and backfill from chunk_id if needed."""
+    engine = get_engine()
+    try:
+        with engine.begin() as conn:
+            if not _table_exists(conn, "keyword"):
+                return
+            if not _column_exists(conn, "keyword", "map_id"):
+                conn.execute(text("ALTER TABLE keyword ADD COLUMN map_id VARCHAR(64)"))
+            if _column_exists(conn, "keyword", "chunk_id"):
+                conn.execute(text("UPDATE keyword SET map_id = COALESCE(NULLIF(map_id, ''), chunk_id) WHERE chunk_id IS NOT NULL"))
+            conn.execute(text("UPDATE keyword SET map_id = keyword_id WHERE map_id IS NULL"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_keyword_map_id ON keyword(map_id)"))
+    except Exception:
+        return
+
+
 def ensure_keyword_embedding_column() -> None:
     """Ensure PostgreSQL table 'keyword' has column keyword_embedding REAL[]."""
     engine = get_engine()
@@ -69,5 +88,6 @@ def ensure_hierarchy_number_columns() -> None:
 
 
 def ensure_postgre_search_columns() -> None:
+    ensure_keyword_map_id_column()
     ensure_keyword_embedding_column()
     ensure_hierarchy_number_columns()

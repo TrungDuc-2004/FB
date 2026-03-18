@@ -574,6 +574,8 @@ export default function MinIO() {
             <DataTable
               columns={folderColumns}
               rows={isRoot ? rootRows : childFolders}
+              pageSize={-1}
+              showPagination={false}
               getRowClassName={() => "row-click"}
               onRowDoubleClick={(row) => openFolder(row.fullPath)}
               renderActions={
@@ -618,6 +620,8 @@ export default function MinIO() {
           <DataTable
             columns={fileColumns}
             rows={fileRows}
+            pageSize={-1}
+            showPagination={false}
             renderActions={(row) => (
               <div className="table-actions">
                 <button className="btn" onClick={() => editFile(row)}>

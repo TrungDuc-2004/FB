@@ -18,6 +18,7 @@ from minio.deleteobjects import DeleteObject
 from ..services.minio_client import get_minio_client
 from ..services.mongo_client import get_mongo_client
 from ..services.mongo_sync import sync_minio_object_to_mongo
+from ..services.hierarchy_description_keywords import rebuild_hierarchy_descriptions_and_keywords
 from ..services.postgre_sync_from_mongo import sync_postgre_from_mongo_auto_ids
 from ..services.neo_sync import sync_neo4j_from_maps_and_pg_ids
 from ..services.media_sync import sync_minio_media_to_mongo
@@ -914,6 +915,18 @@ async def insert_item(
                 pass
             raise HTTPException(status_code=500, detail=f"Mongo sync failed: {e}") from e
 
+        hierarchy_info: Dict[str, Any] = {"updated": False, "details": None, "error": None}
+        try:
+            hierarchy_details = rebuild_hierarchy_descriptions_and_keywords(
+                subject_map=sync_res.subject_map,
+                topic_map=sync_res.topic_map or "",
+                lesson_map=sync_res.lesson_map or "",
+                chunk_map=sync_res.chunk_map or "",
+            )
+            hierarchy_info = {"updated": True, "details": hierarchy_details, "error": None}
+        except Exception as e:
+            hierarchy_info = {"updated": False, "details": None, "error": str(e)}
+
         try:
             pg_ids = sync_postgre_from_mongo_auto_ids(
                 class_map=sync_res.class_map,
@@ -971,6 +984,7 @@ async def insert_item(
                 "lessonId": str(sync_res.lesson_id) if sync_res.lesson_id else None,
                 "chunkId": str(sync_res.chunk_id) if sync_res.chunk_id else None,
             },
+            "searchHierarchy": hierarchy_info,
             "postgre": {
                 "classId": pg_ids.class_id,
                 "subjectId": pg_ids.subject_id,

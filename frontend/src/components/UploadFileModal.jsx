@@ -1,26 +1,35 @@
-// components/UploadFileModal.jsx
 import { useState } from "react";
 import "../styles/admin/modal.css";
 
 export default function UploadFileModal({ open, onClose, folderName, onUpload }) {
-  const [file, setFile] = useState(null);
+  const [files, setFiles] = useState([]);
 
   if (!open) return null;
 
+  function reset() {
+    setFiles([]);
+  }
+
   function submit(e) {
-    e.preventDefault();
-    if (!file) return;
-    onUpload(file);
-    setFile(null);
+    if (e?.preventDefault) e.preventDefault();
+    if (!files.length) return;
+    onUpload(files);
+    reset();
   }
 
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
-          <h3 className="modal-title">Tạo thư mục mới</h3>
-          <p className="modal-subtitle">Thêm thư mục để tổ chức tập tin</p>
-          <button className="modal-close" onClick={onClose}>
+          <h3 className="modal-title">Upload file</h3>
+          <p className="modal-subtitle">Chọn một hoặc nhiều file để tải lên thư mục hiện tại</p>
+          <button
+            className="modal-close"
+            onClick={() => {
+              reset();
+              onClose();
+            }}
+          >
             ×
           </button>
         </div>
@@ -28,39 +37,56 @@ export default function UploadFileModal({ open, onClose, folderName, onUpload })
         <div className="modal-body">
           <form onSubmit={submit}>
             <div className="field">
+              <label htmlFor="upload-file">Thư mục hiện tại</label>
+              <input id="upload-folder" type="text" value={folderName || ""} disabled />
+            </div>
+
+            <div className="field">
               <label htmlFor="upload-file">Chọn file để upload</label>
               <input
                 id="upload-file"
                 type="file"
-                onChange={(e) => setFile(e.target.files?.[0] || null)}
+                multiple
+                onChange={(e) => setFiles(Array.from(e.target.files || []))}
               />
-              {file && (
+
+              {files.length > 0 && (
                 <div className="file-info">
                   <div>
-                    <strong>Tên file:</strong> {file.name}
+                    <strong>Số file:</strong> {files.length}
                   </div>
                   <div>
-                    <strong>Kích thước:</strong> {Math.round(file.size / 1024)} KB
+                    <strong>Tổng dung lượng:</strong>{" "}
+                    {Math.round(files.reduce((sum, f) => sum + (f?.size || 0), 0) / 1024)} KB
                   </div>
-                  <div>
-                    <strong>Loại file:</strong> {file.type || "Không xác định"}
+                  <div style={{ maxHeight: 180, overflow: "auto", marginTop: 8 }}>
+                    {files.map((f) => (
+                      <div key={`${f.name}-${f.size}`}>
+                        • {f.name} ({Math.round((f.size || 0) / 1024)} KB)
+                      </div>
+                    ))}
                   </div>
                 </div>
               )}
             </div>
 
             <div className="modal-note">
-              <strong>Lưu ý:</strong> Demo UI - File chỉ được thêm vào bảng dữ liệu. Sau này sẽ tích
-              hợp API upload thực tế lên MinIO.
+              <strong>Lưu ý:</strong> Sau khi upload xong, hệ thống sẽ báo rõ file nào thành công và file nào lỗi.
             </div>
           </form>
         </div>
 
         <div className="modal-footer">
-          <button className="btn" onClick={onClose}>
+          <button
+            className="btn"
+            onClick={() => {
+              reset();
+              onClose();
+            }}
+          >
             Huỷ
           </button>
-          <button className="btn btn-primary" onClick={submit} disabled={!file}>
+          <button className="btn btn-primary" onClick={submit} disabled={!files.length}>
             Upload file
           </button>
         </div>

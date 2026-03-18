@@ -9,6 +9,7 @@ Ghi chú quan trọng:
 """
 
 from sqlalchemy import Boolean, Column, ForeignKey, String, Text, Float, Integer
+from sqlalchemy.orm import synonym
 from sqlalchemy.dialects.postgresql import ARRAY
 
 from ..services.postgre_client import Base
@@ -74,7 +75,8 @@ class Keyword(Base):
     keyword_embedding = Column(ARRAY(Float), nullable=True)
     mongo_id = Column(String(24), unique=True, nullable=True)
 
-    chunk_id = Column(String, ForeignKey("chunk.chunk_id", ondelete="CASCADE"), nullable=False)
+    map_id = Column(String, nullable=False)
+    chunk_id = synonym("map_id")
 
 
 # ===== MEDIA =====

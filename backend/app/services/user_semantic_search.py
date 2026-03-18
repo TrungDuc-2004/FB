@@ -17,7 +17,6 @@ from .keyword_embedding import embed_keyword_cached
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
 _SERVICE_VERSION = "search_structured_hierarchy_neo_name_keyword_v6_semantic_parts_anchor"
-# lấy cấu trúc để giới hạn 
 _LABEL_RE = re.compile(
     r"(?P<class>\b(?:lớp|lop|class)\b)|"
     r"(?P<topic>\b(?:chủ\s*đề|chu\s*de|topic)\b)|"
@@ -26,7 +25,6 @@ _LABEL_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
-# các stop word 
 _STOP = {
     "a", "an", "and", "các", "cái", "cho", "có", "của", "dạng", "đến", "giúp",
     "hãy", "in", "không", "kiếm", "là", "liên", "muốn", "một", "nào", "những",
@@ -127,7 +125,7 @@ def _cosine(a: List[float], b: List[float]) -> float:
 
 
 # --------------------------- parsing ---------------------------
-# bóc câu hỏi ra thành các thành phần để giới hạn phần nào cần tìm kiếm, đồng thời tách phần query chung để tìm kiếm keyword
+
 def _parse_query_context(query: str) -> dict:
     raw = _norm_spaces(query)
     matches = list(_LABEL_RE.finditer(raw))
@@ -716,6 +714,76 @@ def _load_keyword_rows(neo, pg: Session, cand_chunks: Optional[List[str]]) -> Tu
     return pg_rows, "postgresql", neo_error
 
 
+def _load_keyword_rows_by_map_ids(pg: Session, map_ids: List[str]) -> List[Tuple[str, str, str, List[float]]]:
+    clean_map_ids = [str(mid).strip() for mid in map_ids if str(mid).strip()]
+    if not clean_map_ids:
+        return []
+    try:
+        stmt = (
+            select(Keyword.keyword_id, Keyword.map_id, Keyword.keyword_name, Keyword.keyword_embedding)
+            .where(Keyword.keyword_embedding.isnot(None))
+            .where(Keyword.map_id.in_(clean_map_ids))
+        )
+        return [
+            (str(r[0]), str(r[1]), str(r[2]), list(r[3]))
+            for r in pg.execute(stmt).all()
+            if r[0] and r[1] and r[2] and r[3]
+        ]
+    except SQLAlchemyError:
+        return []
+
+
+def _score_entity_keyword_rows(
+    query_text: str,
+    rows: List[Tuple[str, str, str, List[float]]],
+) -> Tuple[List[str], Dict[str, float], Dict[str, List[Tuple[float, str]]], Dict[str, object]]:
+    clean_query = _strip_keyword_filler(query_text or "")
+    if not clean_query or not rows:
+        return [], {}, {}, {"keyword_rows": len(rows)}
+
+    query_embedding = embed_keyword_cached(clean_query)
+    score_by_map: Dict[str, float] = {}
+    matched_keywords: Dict[str, List[Tuple[float, str]]] = defaultdict(list)
+    for keyword_id, map_id, keyword_name, keyword_embedding in rows:
+        cosine = _cosine(query_embedding, keyword_embedding)
+        overlap = _token_overlap_ratio(clean_query, keyword_name)
+        exact_bonus = 0.0
+        norm_q = _norm_keyword_text(clean_query)
+        norm_kw = _norm_keyword_text(keyword_name)
+        if norm_kw and norm_q:
+            if norm_kw == norm_q:
+                exact_bonus = 0.12
+            elif norm_q in norm_kw or norm_kw in norm_q:
+                exact_bonus = 0.08
+        score = float(cosine + 0.08 * overlap + exact_bonus)
+        current = score_by_map.get(map_id)
+        if current is None or score > current:
+            score_by_map[map_id] = score
+        bucket = matched_keywords[map_id]
+        if not any(existing_name == keyword_name for _existing_score, existing_name in bucket):
+            bucket.append((score, keyword_name))
+            bucket.sort(key=lambda item: item[0], reverse=True)
+            matched_keywords[map_id] = bucket[:5]
+
+    ranked = sorted(score_by_map.items(), key=lambda item: item[1], reverse=True)
+    if not ranked:
+        return [], score_by_map, matched_keywords, {"keyword_rows": len(rows)}
+
+    top_score = float(ranked[0][1])
+    min_score = max(0.72, top_score * 0.93)
+    matched_ids = [map_id for map_id, score in ranked if float(score) >= min_score]
+    if len(matched_ids) < 1 and ranked:
+        matched_ids = [ranked[0][0]]
+    matched_ids = matched_ids[:8]
+    debug = {
+        "keyword_rows": len(rows),
+        "top_score": top_score,
+        "min_score": min_score,
+        "matched_count": len(matched_ids),
+    }
+    return matched_ids, score_by_map, matched_keywords, debug
+
+
 def _exact_keyword_hits(keyword_query: str, rows: List[Tuple[str, str, str, List[float]]]) -> List[dict]:
     q = _norm_keyword_text(keyword_query)
     if not q:
@@ -1040,7 +1108,7 @@ def _build_chunk_items(
             "subject": {
                 "subjectID": subject_id_v,
                 "subjectName": subject_name,
-                "subjectDescription": ((subject_doc.get("subjectTitle") if subject_doc else None) or (subject_doc.get("description") if subject_doc else None) or ""),
+                "subjectDescription": ((subject_doc.get("subjectDescription") if subject_doc else None) or (subject_doc.get("subjectTitle") if subject_doc else None) or (subject_doc.get("description") if subject_doc else None) or ""),
                 "subjectUrl": (subject_doc.get("subjectUrl") if subject_doc and _status_visible(subject_doc) else ""),
             },
             "topic": {
@@ -1238,20 +1306,72 @@ def semantic_search(
             res["debug"] = dbg
         return res
 
-    # keyword path must be scoped by parsed structure / names first
-    chunk_ids = [str(row.get("chunkID") or "") for row in chunk_rows if str(row.get("chunkID") or "")]
+    # keyword path: subject -> topic -> lesson -> chunk
+    keyword_query = _strip_keyword_filler(generic_query)
+    dbg["keyword_query"] = keyword_query
+    query_parts = _split_keyword_query_parts(ctx.get("raw") or query, keyword_query or generic_query)
+    dbg["keyword_query_parts"] = query_parts
+
+    filtered_chunk_rows = list(chunk_rows)
+    hierarchy_dbg: Dict[str, object] = {}
+
+    current_subject_ids = _dedupe_keep_order([str(row.get("subjectID") or "") for row in filtered_chunk_rows if str(row.get("subjectID") or "")])
+    current_topic_ids = _dedupe_keep_order([str(row.get("topicID") or "") for row in filtered_chunk_rows if str(row.get("topicID") or "")])
+    current_lesson_ids = _dedupe_keep_order([str(row.get("lessonID") or "") for row in filtered_chunk_rows if str(row.get("lessonID") or "")])
+
+    subject_keyword_rows = _load_keyword_rows_by_map_ids(pg, current_subject_ids)
+    hierarchy_dbg["subject_keyword_rows"] = len(subject_keyword_rows)
+    if not subjectID and len(current_subject_ids) > 1 and subject_keyword_rows:
+        matched_subject_ids, subject_scores, subject_kw, subject_match_dbg = _score_entity_keyword_rows(keyword_query or generic_query or query, subject_keyword_rows)
+        hierarchy_dbg["subject_match"] = subject_match_dbg
+        hierarchy_dbg["subject_matched_ids"] = matched_subject_ids
+        if not matched_subject_ids:
+            res = {"total": 0, "items": []}
+            if debug:
+                dbg["hierarchy_keyword_filter"] = hierarchy_dbg
+                res["debug"] = dbg
+            return res
+        filtered_chunk_rows = [row for row in filtered_chunk_rows if str(row.get("subjectID") or "") in set(matched_subject_ids)]
+        current_topic_ids = _dedupe_keep_order([str(row.get("topicID") or "") for row in filtered_chunk_rows if str(row.get("topicID") or "")])
+        current_lesson_ids = _dedupe_keep_order([str(row.get("lessonID") or "") for row in filtered_chunk_rows if str(row.get("lessonID") or "")])
+
+    topic_keyword_rows = _load_keyword_rows_by_map_ids(pg, current_topic_ids)
+    hierarchy_dbg["topic_keyword_rows"] = len(topic_keyword_rows)
+    if not topic_scope_active and len(current_topic_ids) > 1 and topic_keyword_rows:
+        matched_topic_ids, topic_scores, topic_kw, topic_match_dbg = _score_entity_keyword_rows(keyword_query or generic_query or query, topic_keyword_rows)
+        hierarchy_dbg["topic_match"] = topic_match_dbg
+        hierarchy_dbg["topic_matched_ids"] = matched_topic_ids
+        if not matched_topic_ids:
+            res = {"total": 0, "items": []}
+            if debug:
+                dbg["hierarchy_keyword_filter"] = hierarchy_dbg
+                res["debug"] = dbg
+            return res
+        filtered_chunk_rows = [row for row in filtered_chunk_rows if str(row.get("topicID") or "") in set(matched_topic_ids)]
+        current_lesson_ids = _dedupe_keep_order([str(row.get("lessonID") or "") for row in filtered_chunk_rows if str(row.get("lessonID") or "")])
+
+    lesson_keyword_rows = _load_keyword_rows_by_map_ids(pg, current_lesson_ids)
+    hierarchy_dbg["lesson_keyword_rows"] = len(lesson_keyword_rows)
+    if not lesson_scope_active and len(current_lesson_ids) > 1 and lesson_keyword_rows:
+        matched_lesson_ids, lesson_scores, lesson_kw, lesson_match_dbg = _score_entity_keyword_rows(keyword_query or generic_query or query, lesson_keyword_rows)
+        hierarchy_dbg["lesson_match"] = lesson_match_dbg
+        hierarchy_dbg["lesson_matched_ids"] = matched_lesson_ids
+        if not matched_lesson_ids:
+            res = {"total": 0, "items": []}
+            if debug:
+                dbg["hierarchy_keyword_filter"] = hierarchy_dbg
+                res["debug"] = dbg
+            return res
+        filtered_chunk_rows = [row for row in filtered_chunk_rows if str(row.get("lessonID") or "") in set(matched_lesson_ids)]
+
+    chunk_ids = [str(row.get("chunkID") or "") for row in filtered_chunk_rows if str(row.get("chunkID") or "")]
     dbg["candidate_chunk_scope"] = len(chunk_ids)
+    dbg["hierarchy_keyword_filter"] = hierarchy_dbg
     if not chunk_ids:
         res = {"total": 0, "items": []}
         if debug:
             res["debug"] = dbg
         return res
-
-    # semantic-only within scoped candidates, scored per query part then merged
-    keyword_query = _strip_keyword_filler(generic_query)
-    dbg["keyword_query"] = keyword_query
-    query_parts = _split_keyword_query_parts(ctx.get("raw") or query, keyword_query or generic_query)
-    dbg["keyword_query_parts"] = query_parts
 
     gemini_terms: List[str] = []
     gem_dbg: dict = {}
@@ -1264,11 +1384,9 @@ def semantic_search(
     dbg["gemini_mode"] = gem_dbg.get("mode") if gem_dbg else None
     dbg["gemini_terms_after_strict_filter"] = gemini_terms
 
-    keyword_rows, keyword_source, keyword_source_error = _load_keyword_rows(neo, pg, chunk_ids)
+    keyword_rows = _load_keyword_rows_by_map_ids(pg, chunk_ids)
     dbg["keyword_rows"] = len(keyword_rows)
-    dbg["keyword_embedding_source"] = keyword_source
-    if keyword_source_error:
-        dbg["keyword_source_error"] = keyword_source_error
+    dbg["keyword_embedding_source"] = "postgresql_map_id"
     if not keyword_rows:
         res = {"total": 0, "items": []}
         if debug:

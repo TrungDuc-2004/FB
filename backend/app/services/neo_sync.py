@@ -243,21 +243,27 @@ def _merge_chunk(
     )
 
 
-def _merge_keywords(tx, *, chunk_pg_id: str, keywords: list[dict[str, object]]):
+def _merge_keywords_for_owner(tx, *, owner_label: str, owner_pg_id: str, keywords: list[dict[str, object]]):
+    if owner_label not in {"Subject", "Topic", "Lesson", "Chunk"}:
+        raise ValueError(f"Unsupported owner label: {owner_label}")
+
     kw_ids = [k.get("pg_id", "") for k in (keywords or []) if k.get("pg_id")]
 
     tx.run(
-        """
-        MATCH (ch:Chunk {pg_id: $chunk_pg_id})-[r:HAS_KEYWORD]->(k:Keyword)
+        f"""
+        MATCH (owner:{owner_label} {{pg_id: $owner_pg_id}})-[r:HAS_KEYWORD]->(k:Keyword)
         WHERE size($kw_ids) = 0 OR NOT k.pg_id IN $kw_ids
         DELETE r
         WITH collect(DISTINCT k) AS ks
         UNWIND ks AS k
         WITH DISTINCT k
-        WHERE NOT ( (:Chunk)-[:HAS_KEYWORD]->(k) )
+        WHERE NOT ((:Subject)-[:HAS_KEYWORD]->(k))
+          AND NOT ((:Topic)-[:HAS_KEYWORD]->(k))
+          AND NOT ((:Lesson)-[:HAS_KEYWORD]->(k))
+          AND NOT ((:Chunk)-[:HAS_KEYWORD]->(k))
         DETACH DELETE k
         """,
-        chunk_pg_id=chunk_pg_id,
+        owner_pg_id=owner_pg_id,
         kw_ids=kw_ids,
     )
 
@@ -269,27 +275,54 @@ def _merge_keywords(tx, *, chunk_pg_id: str, keywords: list[dict[str, object]]):
             continue
 
         tx.run(
-            """
-            MATCH (ch:Chunk {pg_id: $chunk_pg_id})
-            MERGE (k:Keyword {pg_id: $kw_pg_id})
+            f"""
+            MATCH (owner:{owner_label} {{pg_id: $owner_pg_id}})
+            MERGE (k:Keyword {{pg_id: $kw_pg_id}})
             SET k.name = $kw_name
             SET k.embedding = CASE WHEN $kw_emb IS NULL THEN k.embedding ELSE $kw_emb END
-            SET k.chunk_id = $chunk_pg_id
+            SET k.map_id = $owner_pg_id
             REMOVE k.neo_id
-            MERGE (ch)-[:HAS_KEYWORD]->(k)
+            MERGE (owner)-[:HAS_KEYWORD]->(k)
             """,
-            chunk_pg_id=chunk_pg_id,
+            owner_pg_id=owner_pg_id,
             kw_pg_id=kw_pg_id,
             kw_name=kw_name,
             kw_emb=kw_emb,
         )
 
 
-def _fetch_keywords_from_postgre(*, chunk_pg_id: str) -> list[dict[str, object]]:
+def _fetch_keywords_from_postgre(*, map_id: str) -> list[dict[str, object]]:
     engine = get_engine()
     out: list[dict[str, object]] = []
-    if not chunk_pg_id:
+    if not map_id:
         return out
+
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT keyword_id, keyword_name, keyword_embedding
+                FROM keyword
+                WHERE map_id = :map_id
+                ORDER BY keyword_id
+                """
+            ),
+            {"map_id": map_id},
+        ).fetchall()
+
+        for r in rows:
+            kw_name = _clean(r[1]) or _clean(r[0])
+            kw_embedding = r[2]
+            if kw_embedding is None and kw_name:
+                kw_embedding = embed_keyword_cached(kw_name)
+            out.append(
+                {
+                    "pg_id": _clean(r[0]),
+                    "name": kw_name,
+                    "embedding": kw_embedding,
+                }
+            )
+    return out
 
     with engine.begin() as conn:
         rows = conn.execute(
@@ -447,10 +480,27 @@ def sync_neo4j_from_maps_and_pg_ids(
                 )
                 created_or_updated["Chunk"] = 1
 
-                kw_rows = _fetch_keywords_from_postgre(chunk_pg_id=chunk_pg_id)
-                if kw_rows:
-                    session.execute_write(_merge_keywords, chunk_pg_id=chunk_pg_id, keywords=kw_rows)
-                    keyword_count = len(kw_rows)
+                keyword_count = 0
+
+            keyword_targets = [
+                ("Subject", subject_pg_id),
+                ("Topic", topic_pg_id),
+                ("Lesson", lesson_pg_id),
+                ("Chunk", chunk_pg_id),
+            ]
+            for owner_label, owner_pg_id in keyword_targets:
+                if not owner_pg_id:
+                    continue
+                kw_rows = _fetch_keywords_from_postgre(map_id=owner_pg_id)
+                if not kw_rows:
+                    continue
+                session.execute_write(
+                    _merge_keywords_for_owner,
+                    owner_label=owner_label,
+                    owner_pg_id=owner_pg_id,
+                    keywords=kw_rows,
+                )
+                keyword_count += len(kw_rows)
 
     finally:
         try:

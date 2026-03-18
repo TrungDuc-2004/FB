@@ -617,9 +617,22 @@ export default function MongoDB() {
     if (!collectionName) return;
     setErr("");
     try {
-      const data = await mongoApi.listDocuments(collectionName, 200, 0);
-      setDocs(data.documents || []);
-      setTotalDocs(data.total ?? (data.documents || []).length);
+      const batchSize = 500;
+      let offset = 0;
+      let total = 0;
+      let merged = [];
+
+      while (true) {
+        const data = await mongoApi.listDocuments(collectionName, batchSize, offset);
+        const part = data.documents || [];
+        total = data.total ?? (offset + part.length);
+        merged = merged.concat(part);
+        offset += part.length;
+        if (!part.length || merged.length >= total) break;
+      }
+
+      setDocs(merged);
+      setTotalDocs(total || merged.length);
     } catch (e) {
       setErr(String(e?.message || e));
       setDocs([]);

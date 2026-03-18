@@ -346,7 +346,7 @@ def rename_collection(collection_name: str = Path(...), new_name: str = Query(..
 @router.get("/documents", summary="Lấy Documents trong Collection (có phân trang)")
 def get_documents(
     collection_name: str = Query(...),
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(200, ge=1, le=2000),
     offset: int = Query(0, ge=0),
 ):
     col = _normalize_collection_name(collection_name)

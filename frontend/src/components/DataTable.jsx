@@ -8,6 +8,7 @@ export default function DataTable({
   onRowDoubleClick,
   getRowClassName,
   pageSize, // nếu không truyền => auto
+  showPagination = true,
 }) {
   const total = rows.length;
 
@@ -16,7 +17,7 @@ export default function DataTable({
 
   // ✅ đo chiều cao để tính số row fit màn hình
   useLayoutEffect(() => {
-    if (pageSize && pageSize > 0) return; // có pageSize thì khỏi auto
+    if (pageSize === -1 || (pageSize && pageSize > 0)) return; // có pageSize hoặc hiển thị toàn bộ thì khỏi auto
 
     const el = scrollRef.current;
     if (!el) return;
@@ -47,7 +48,7 @@ export default function DataTable({
   }, [pageSize, columns.length, rows.length]);
 
   // ✅ size cuối cùng
-  const size = pageSize && pageSize > 0 ? pageSize : autoSize;
+  const size = pageSize === -1 ? 0 : (pageSize && pageSize > 0 ? pageSize : autoSize);
   const totalPages = size > 0 ? Math.max(1, Math.ceil(total / size)) : 1;
 
   const [page, setPage] = useState(1);
@@ -107,7 +108,7 @@ export default function DataTable({
         </table>
       </div>
 
-      {size > 0 && total > size ? (
+      {showPagination && size > 0 && total > size ? (
         <div className="table-pagination">
           <div className="table-pagination__info">
             Hiển thị {startIdx}-{endIdx} / {total}
