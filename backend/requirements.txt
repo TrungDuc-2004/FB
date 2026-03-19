@@ -10,3 +10,4 @@ python-multipart
 openpyxl
 sentence-transformers
 torch
+google-generativeai

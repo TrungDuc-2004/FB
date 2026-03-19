@@ -1,10 +1,15 @@
 import os
 import io
 import time
+import tempfile
 import json
+import threading
+import uuid
 
 from urllib.parse import quote, quote_plus
 from typing import List, Optional, Tuple, Set, Dict, Any
+
+from sqlalchemy import text
 from datetime import timedelta, datetime, timezone
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, Request
@@ -19,8 +24,10 @@ from ..services.minio_client import get_minio_client
 from ..services.mongo_client import get_mongo_client
 from ..services.mongo_sync import sync_minio_object_to_mongo
 from ..services.hierarchy_description_keywords import rebuild_hierarchy_descriptions_and_keywords
-from ..services.postgre_sync_from_mongo import sync_postgre_from_mongo_auto_ids
+from ..services.postgre_sync_from_mongo import sync_postgre_from_mongo_auto_ids, PgIds
 from ..services.neo_sync import sync_neo4j_from_maps_and_pg_ids
+from ..services.postgre_client import get_engine
+from ..services.neo_client import neo4j_driver
 from ..services.media_sync import sync_minio_media_to_mongo
 from ..services.postgre_media_sync import sync_postgre_media_from_mongo
 from ..services.neo_media_sync import sync_media_to_neo4j
@@ -30,6 +37,156 @@ router = APIRouter(
 )
 
 # =================== Helpers =================== #
+
+_UPLOAD_PROGRESS: Dict[str, Dict[str, Any]] = {}
+_UPLOAD_PROGRESS_LOCK = threading.Lock()
+_UPLOAD_PROGRESS_TTL_SECONDS = 60 * 60 * 6
+
+
+def _progress_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _cleanup_upload_progress() -> None:
+    now_ts = time.time()
+    stale_ids = []
+    with _UPLOAD_PROGRESS_LOCK:
+        for upload_id, payload in list(_UPLOAD_PROGRESS.items()):
+            updated_at = payload.get("updated_ts") or payload.get("created_ts") or now_ts
+            if now_ts - float(updated_at) > _UPLOAD_PROGRESS_TTL_SECONDS:
+                stale_ids.append(upload_id)
+        for upload_id in stale_ids:
+            _UPLOAD_PROGRESS.pop(upload_id, None)
+
+
+def _init_upload_progress(upload_id: str, *, path: str, total_files: int) -> None:
+    if not upload_id:
+        return
+    _cleanup_upload_progress()
+    now_iso = _progress_now_iso()
+    now_ts = time.time()
+    payload = {
+        "uploadId": upload_id,
+        "path": path,
+        "status": "processing",
+        "stage": "preparing",
+        "stageLabel": "Đang chuẩn bị xử lý",
+        "message": "Đang chuẩn bị xử lý",
+        "percent": 12,
+        "totalFiles": max(1, int(total_files or 1)),
+        "completedFiles": 0,
+        "currentFileIndex": 0,
+        "currentFileName": "",
+        "errors": [],
+        "startedAt": now_iso,
+        "updatedAt": now_iso,
+        "created_ts": now_ts,
+        "updated_ts": now_ts,
+    }
+    with _UPLOAD_PROGRESS_LOCK:
+        _UPLOAD_PROGRESS[upload_id] = payload
+
+
+def _update_upload_progress(upload_id: str, **fields: Any) -> None:
+    if not upload_id:
+        return
+    now_iso = _progress_now_iso()
+    now_ts = time.time()
+    with _UPLOAD_PROGRESS_LOCK:
+        payload = _UPLOAD_PROGRESS.get(upload_id)
+        if payload is None:
+            payload = {
+                "uploadId": upload_id,
+                "status": "processing",
+                "stage": "preparing",
+                "stageLabel": "Đang chuẩn bị xử lý",
+                "message": "Đang chuẩn bị xử lý",
+                "percent": 0,
+                "totalFiles": 1,
+                "completedFiles": 0,
+                "currentFileIndex": 0,
+                "currentFileName": "",
+                "errors": [],
+                "startedAt": now_iso,
+                "created_ts": now_ts,
+            }
+            _UPLOAD_PROGRESS[upload_id] = payload
+        payload.update(fields)
+        payload["updatedAt"] = now_iso
+        payload["updated_ts"] = now_ts
+
+
+def _append_upload_error(upload_id: str, error: Dict[str, Any]) -> None:
+    if not upload_id:
+        return
+    with _UPLOAD_PROGRESS_LOCK:
+        payload = _UPLOAD_PROGRESS.get(upload_id)
+        if not payload:
+            return
+        errors = list(payload.get("errors") or [])
+        errors.append(error)
+        payload["errors"] = errors
+        payload["updatedAt"] = _progress_now_iso()
+        payload["updated_ts"] = time.time()
+
+
+def _mark_file_progress(
+    upload_id: str,
+    *,
+    file_index: int,
+    total_files: int,
+    file_name: str,
+    stage: str,
+    stage_label: str,
+    file_percent: float,
+    message: str | None = None,
+    status: str = "processing",
+    completed_files: int | None = None,
+) -> None:
+    if not upload_id:
+        return
+    total = max(1, int(total_files or 1))
+    idx = max(1, int(file_index or 1))
+    normalized = max(0.0, min(1.0, float(file_percent)))
+    overall = ((idx - 1) + normalized) / total * 100.0
+    if completed_files is None:
+        completed_files = idx - 1 + (1 if normalized >= 1.0 else 0)
+    _update_upload_progress(
+        upload_id,
+        status=status,
+        stage=stage,
+        stageLabel=stage_label,
+        message=message or stage_label,
+        percent=min(100, max(0, round(overall))),
+        totalFiles=total,
+        completedFiles=max(0, min(total, int(completed_files))),
+        currentFileIndex=idx,
+        currentFileName=file_name or "",
+    )
+
+
+def _finish_upload_progress(
+    upload_id: str,
+    *,
+    total_files: int,
+    completed_files: int,
+    status: str,
+    message: str,
+    stage: str = "completed",
+    stage_label: str = "Hoàn tất",
+) -> None:
+    if not upload_id:
+        return
+    _update_upload_progress(
+        upload_id,
+        status=status,
+        stage=stage,
+        stageLabel=stage_label,
+        message=message,
+        percent=100,
+        totalFiles=max(1, int(total_files or 1)),
+        completedFiles=max(0, int(completed_files or 0)),
+    )
 
 def clean_path(path: str) -> str:
     p = (path or "").strip()
@@ -251,6 +408,19 @@ def _get_actor(request: Request | None) -> str:
     return request.headers.get("x-user") or request.headers.get("x-actor") or "system"
 
 
+def _normalize_folder_type(s: str) -> str:
+    x = str(s or "").strip().lower()
+    if x == "subjects":
+        return "subject"
+    if x == "topics":
+        return "topic"
+    if x == "lessons":
+        return "lesson"
+    if x == "chunks":
+        return "chunk"
+    return x
+
+
 def _infer_category_from_path(path: str) -> str:
     parts = [p for p in clean_path(path).split("/") if p]
     head = (parts[0] if parts else "").lower()
@@ -259,6 +429,152 @@ def _infer_category_from_path(path: str) -> str:
     if head in ("video", "videos"):
         return "video"
     return "document"
+
+def _extract_last_number(value: Any) -> str:
+    s = str(value or "").strip()
+    nums = []
+    current = []
+    for ch in s:
+        if ch.isdigit():
+            current.append(ch)
+        elif current:
+            nums.append("".join(current))
+            current = []
+    if current:
+        nums.append("".join(current))
+    return nums[-1] if nums else ""
+
+
+def _derive_class_map_from_subject_map(subject_map: str) -> str:
+    n = _extract_last_number(subject_map)
+    return f"L{n}" if n else ""
+
+
+def _parse_topic_map(topic_map: str) -> Optional[Dict[str, str]]:
+    s = str(topic_map or "").strip()
+    parts = s.split("_CD", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1].isdigit():
+        return None
+    subject_map, topic_no = parts
+    return {
+        "class_map": _derive_class_map_from_subject_map(subject_map),
+        "subject_map": subject_map,
+        "topic_map": s,
+        "topicNumber": topic_no,
+    }
+
+
+def _parse_lesson_map(lesson_map: str) -> Optional[Dict[str, str]]:
+    s = str(lesson_map or "").strip()
+    base, lesson_no = s.rsplit("_B", 1) if "_B" in s else ("", "")
+    topic_meta = _parse_topic_map(base)
+    if not topic_meta or not lesson_no.isdigit():
+        return None
+    return {
+        **topic_meta,
+        "lesson_map": s,
+        "lessonNumber": lesson_no,
+    }
+
+
+def _parse_chunk_map(chunk_map: str) -> Optional[Dict[str, str]]:
+    s = str(chunk_map or "").strip()
+    base, chunk_no = s.rsplit("_C", 1) if "_C" in s else ("", "")
+    lesson_meta = _parse_lesson_map(base)
+    if not lesson_meta or not chunk_no.isdigit():
+        return None
+    return {
+        **lesson_meta,
+        "chunk_map": s,
+        "chunkNumber": chunk_no,
+    }
+
+
+def _derive_chain_from_meta(path: str, meta: Dict[str, Any]) -> Dict[str, str]:
+    folder_type = _normalize_folder_type(
+        (meta.get("folderType") or meta.get("folder_type") or "").strip()
+    )
+    subject_map = str(meta.get("subject_map") or meta.get("subjectMap") or meta.get("subjectID") or "").strip()
+    topic_map = str(meta.get("topic_map") or meta.get("topicMap") or meta.get("topicID") or "").strip()
+    lesson_map = str(meta.get("lesson_map") or meta.get("lessonMap") or meta.get("lessonID") or "").strip()
+    chunk_map = str(meta.get("chunk_map") or meta.get("chunkMap") or meta.get("chunkID") or "").strip()
+    class_map = str(meta.get("class_map") or meta.get("classMap") or meta.get("classID") or "").strip()
+
+    if folder_type == "chunk" and chunk_map:
+        data = _parse_chunk_map(chunk_map) or {}
+    elif folder_type == "lesson" and lesson_map:
+        data = _parse_lesson_map(lesson_map) or {}
+    elif folder_type == "topic" and topic_map:
+        data = _parse_topic_map(topic_map) or {}
+    elif folder_type == "subject" and subject_map:
+        data = {
+            "class_map": _derive_class_map_from_subject_map(subject_map),
+            "subject_map": subject_map,
+        }
+    else:
+        data = {}
+
+    class_map = class_map or str(data.get("class_map") or "")
+    subject_map = subject_map or str(data.get("subject_map") or "")
+    topic_map = topic_map or str(data.get("topic_map") or "")
+    lesson_map = lesson_map or str(data.get("lesson_map") or "")
+    chunk_map = chunk_map or str(data.get("chunk_map") or "")
+
+    return {
+        "folder_type": folder_type,
+        "class_map": class_map,
+        "subject_map": subject_map,
+        "topic_map": topic_map,
+        "lesson_map": lesson_map,
+        "chunk_map": chunk_map,
+        "class_number": _extract_last_number(class_map or subject_map),
+    }
+
+
+def _remap_virtual_path_by_meta(path: str, meta: Dict[str, Any]) -> str:
+    raw_parts = [p for p in clean_path(path).split("/") if p]
+    if not raw_parts:
+        return clean_path(path)
+
+    chain = _derive_chain_from_meta(path, meta)
+    class_no = chain.get("class_number", "")
+    folder_type = chain.get("folder_type", "")
+    if not class_no or folder_type not in {"subject", "topic", "lesson", "chunk"}:
+        return clean_path(path)
+
+    class_folder = f"class-{class_no}"
+    parts = list(raw_parts)
+    if len(parts) >= 2:
+        parts[1] = class_folder
+    else:
+        parts.append(class_folder)
+
+    normalized_folder = f"{folder_type}s"
+    if parts:
+        tail = parts[-1].lower()
+        if tail in {"subjects", "topics", "lessons", "chunks"}:
+            parts[-1] = normalized_folder
+
+    return "/".join(parts)
+
+
+def _ensure_folder_markers(client, bucket: str, rel_path: str) -> None:
+    parts = [p for p in clean_path(rel_path).split("/") if p]
+    acc = []
+    for part in parts:
+        acc.append(part)
+        marker = "/".join(acc) + "/"
+        try:
+            client.stat_object(bucket, marker)
+        except Exception:
+            client.put_object(
+                bucket,
+                marker,
+                data=io.BytesIO(b""),
+                length=0,
+                content_type="application/octet-stream",
+            )
+
 
 
 def _parse_meta_json(meta_json: str) -> Dict[str, Any]:
@@ -318,6 +634,172 @@ def _hide_mongo_media(collection: str, mongo_id: str, actor: str = "system") -> 
         pass
 
 
+def _set_hierarchy_sync_status(
+    sync_res,
+    *,
+    minio_ok: bool,
+    mongo_ok: bool,
+    postgre_ok: bool,
+    neo4j_ok: bool,
+    actor: str = "system",
+    error: str | None = None,
+    verify: Optional[Dict[str, Any]] = None,
+) -> None:
+    try:
+        mg = get_mongo_client()
+        db = mg["db"]
+        now = datetime.now(timezone.utc)
+        is_full = bool(minio_ok and mongo_ok and postgre_ok and neo4j_ok and not error)
+        status_doc: Dict[str, Any] = {
+            "isFullySynced": is_full,
+            "minio": bool(minio_ok),
+            "mongo": bool(mongo_ok),
+            "postgre": bool(postgre_ok),
+            "neo4j": bool(neo4j_ok),
+            "lastError": (error or "").strip() or None,
+            "verifiedAt": now,
+        }
+        if verify:
+            status_doc["verify"] = verify
+
+        targets = [
+            ("classes", "classID", getattr(sync_res, "class_map", "")),
+            ("subjects", "subjectID", getattr(sync_res, "subject_map", "")),
+            ("topics", "topicID", getattr(sync_res, "topic_map", "")),
+            ("lessons", "lessonID", getattr(sync_res, "lesson_map", "")),
+            ("chunks", "chunkID", getattr(sync_res, "chunk_map", "")),
+        ]
+        for col, field, value in targets:
+            value = (str(value).strip() if value is not None else "")
+            if not value:
+                continue
+            db[col].update_one(
+                {field: value},
+                {"$set": {"syncStatus": status_doc, "updatedAt": now, "updatedBy": actor}},
+            )
+    except Exception:
+        pass
+
+
+def _verify_hierarchy_sync(
+    *,
+    client,
+    bucket: str,
+    object_key: str,
+    sync_res,
+    pg_ids: PgIds,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "minio": False,
+        "mongo": False,
+        "postgre": False,
+        "neo4j": False,
+        "isFullySynced": False,
+        "missing": [],
+    }
+
+    try:
+        client.stat_object(bucket, object_key)
+        result["minio"] = True
+    except Exception as e:
+        result["missing"].append(f"MinIO: {e}")
+
+    try:
+        mg = get_mongo_client()
+        db = mg["db"]
+        mongo_targets = [
+            ("classes", "classID", getattr(sync_res, "class_map", "")),
+            ("subjects", "subjectID", getattr(sync_res, "subject_map", "")),
+            ("topics", "topicID", getattr(sync_res, "topic_map", "")),
+            ("lessons", "lessonID", getattr(sync_res, "lesson_map", "")),
+            ("chunks", "chunkID", getattr(sync_res, "chunk_map", "")),
+        ]
+        mongo_missing = []
+        for col, field, value in mongo_targets:
+            value = (str(value).strip() if value is not None else "")
+            if not value:
+                continue
+            if not db[col].find_one({field: value, "status": {"$ne": "hidden"}}):
+                mongo_missing.append(f"{col}.{field}={value}")
+        if mongo_missing:
+            result["missing"].append("MongoDB: " + ", ".join(mongo_missing))
+        else:
+            result["mongo"] = True
+    except Exception as e:
+        result["missing"].append(f"MongoDB: {e}")
+
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            pg_targets = [
+                ("class", "class_id", getattr(pg_ids, "class_id", "")),
+                ("subject", "subject_id", getattr(pg_ids, "subject_id", "")),
+                ("topic", "topic_id", getattr(pg_ids, "topic_id", "")),
+                ("lesson", "lesson_id", getattr(pg_ids, "lesson_id", "")),
+                ("chunk", "chunk_id", getattr(pg_ids, "chunk_id", "")),
+            ]
+            pg_missing = []
+            for table, field, value in pg_targets:
+                value = (str(value).strip() if value is not None else "")
+                if not value:
+                    continue
+                row = conn.execute(text(f"SELECT 1 FROM {table} WHERE {field} = :value LIMIT 1"), {"value": value}).fetchone()
+                if not row:
+                    pg_missing.append(f"{table}.{field}={value}")
+            if pg_missing:
+                result["missing"].append("PostgreSQL: " + ", ".join(pg_missing))
+            else:
+                result["postgre"] = True
+    except Exception as e:
+        result["missing"].append(f"PostgreSQL: {e}")
+
+    driver = None
+    try:
+        driver = neo4j_driver()
+        db_name = (os.getenv("NEO4J_DATABASE") or "").strip() or None
+        neo_targets = [
+            ("Class", getattr(pg_ids, "class_id", "")),
+            ("Subject", getattr(pg_ids, "subject_id", "")),
+            ("Topic", getattr(pg_ids, "topic_id", "")),
+            ("Lesson", getattr(pg_ids, "lesson_id", "")),
+            ("Chunk", getattr(pg_ids, "chunk_id", "")),
+        ]
+        neo_missing = []
+        with driver.session(database=db_name) as session:  # type: ignore[arg-type]
+            session.run("RETURN 1").consume()
+            for label, value in neo_targets:
+                value = (str(value).strip() if value is not None else "")
+                if not value:
+                    continue
+                row = session.run(
+                    f"MATCH (n:{label} {{pg_id: $pg_id}}) RETURN count(n) AS c",
+                    pg_id=value,
+                ).single()
+                if not row or int(row.get("c", 0)) <= 0:
+                    neo_missing.append(f"{label}.pg_id={value}")
+        if neo_missing:
+            result["missing"].append("Neo4j: " + ", ".join(neo_missing))
+        else:
+            result["neo4j"] = True
+    except Exception as e:
+        result["missing"].append(f"Neo4j: {e}")
+    finally:
+        try:
+            driver.close()
+        except Exception:
+            pass
+
+    result["isFullySynced"] = bool(result["minio"] and result["mongo"] and result["postgre"] and result["neo4j"])
+    return result
+
+
+def _sync_error_message(sync_status: Dict[str, Any]) -> str:
+    missing = sync_status.get("missing") or []
+    if missing:
+        return "Chưa sync đủ MinIO/MongoDB/PostgreSQL/Neo4j: " + " | ".join(str(x) for x in missing)
+    return "Chưa sync đủ MinIO/MongoDB/PostgreSQL/Neo4j"
+
+
 # =================== Models =================== #
 
 class CreateFolderBody(BaseModel):
@@ -335,6 +817,15 @@ class RenameObjectBody(BaseModel):
 
 
 # =================== GET =================== #
+
+@router.get("/uploads/progress/{upload_id}", summary="Lấy tiến trình upload/import hiện tại")
+def get_upload_progress(upload_id: str):
+    _cleanup_upload_progress()
+    with _UPLOAD_PROGRESS_LOCK:
+        payload = _UPLOAD_PROGRESS.get((upload_id or "").strip())
+        if not payload:
+            raise HTTPException(status_code=404, detail="Upload progress not found")
+        return dict(payload)
 
 @router.get("/open", summary="Mở/Download file (proxy qua backend - copy URL mở được ngay)")
 def open_file(
@@ -648,13 +1139,15 @@ def create_folder(body: CreateFolderBody):
 
 
 @router.post("/files/", summary="Upload nhiều file vào folder path (upload xong -> sync Mongo -> sync Postgre)")
-async def upload_files_to_path(
+def upload_files_to_path(
     request: Request,
     path: str = Form(..., description="Ví dụ: images hoặc documents/class-10/tin-hoc/chunk"),
+    upload_id: str = Form("", description="ID tiến trình upload để frontend poll"),
     files: List[UploadFile] = File(...),
 ):
     client, default_bucket, public_base = _runtime()
     actor = _get_actor(request)
+    upload_id = (upload_id or "").strip() or uuid.uuid4().hex
 
     bucket, rel = _split_virtual(path, default_bucket, client, allow_empty_key=True)
     p = clean_path(rel)
@@ -663,40 +1156,58 @@ async def upload_files_to_path(
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
 
+    total_files = len(files)
+    _init_upload_progress(upload_id, path=path, total_files=total_files)
+
     uploaded, failed = [], []
     seen = set()
 
     try:
-        for f in files:
+        for index, f in enumerate(files, start=1):
+            current_name = os.path.basename(getattr(f, "filename", "") or "")
+            current_virtual_key = _to_virtual(default_bucket, bucket, prefix + current_name) if current_name else ""
+
             if not f.filename:
-                failed.append({"filename": None, "error": "Missing filename"})
+                error_msg = "Missing filename"
+                failed.append({"filename": None, "error": error_msg})
+                _append_upload_error(upload_id, {"filename": None, "error": error_msg})
+                _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name="", stage="failed", stage_label="Thiếu tên file", file_percent=1.0, message=error_msg, status="processing")
                 continue
 
             filename = os.path.basename(f.filename)
             object_key = prefix + filename
+            current_virtual_key = _to_virtual(default_bucket, bucket, object_key)
 
             if object_key in seen:
-                failed.append({"filename": filename, "object_key": object_key, "error": "Duplicate in request batch"})
-                await f.close()
+                error_msg = "Duplicate in request batch"
+                failed.append({"filename": filename, "object_key": current_virtual_key, "error": error_msg})
+                _append_upload_error(upload_id, {"filename": filename, "object_key": current_virtual_key, "error": error_msg})
+                _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="failed", stage_label="Trùng file trong batch", file_percent=1.0, message=error_msg, status="processing")
+                try:
+                    f.file.close()
+                except Exception:
+                    pass
                 continue
             seen.add(object_key)
 
-            # check exists
             try:
                 client.stat_object(bucket, object_key)
-                failed.append({
-                    "filename": filename,
-                    "object_key": _to_virtual(default_bucket, bucket, object_key),
-                    "error": "Already exists"
-                })
-                await f.close()
+                error_msg = "Already exists"
+                failed.append({"filename": filename, "object_key": current_virtual_key, "error": error_msg})
+                _append_upload_error(upload_id, {"filename": filename, "object_key": current_virtual_key, "error": error_msg})
+                _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="failed", stage_label="File đã tồn tại", file_percent=1.0, message=error_msg, status="processing")
+                try:
+                    f.file.close()
+                except Exception:
+                    pass
                 continue
             except S3Error:
                 pass
 
             try:
-                # upload minio
-                result = client.put_object(
+                _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="uploading_minio", stage_label="Đang upload lên MinIO", file_percent=0.18, message=f"Đang upload {filename} lên MinIO")
+
+                client.put_object(
                     bucket_name=bucket,
                     object_name=object_key,
                     data=f.file,
@@ -705,7 +1216,8 @@ async def upload_files_to_path(
                     content_type=f.content_type or "application/octet-stream",
                 )
 
-                # ====== SYNC MongoDB ======
+                _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="syncing_mongo", stage_label="Đang sync MongoDB", file_percent=0.36, message=f"Đang đồng bộ {filename} vào MongoDB")
+
                 try:
                     sync_res = sync_minio_object_to_mongo(
                         bucket=bucket,
@@ -718,16 +1230,38 @@ async def upload_files_to_path(
                         client.remove_object(bucket, object_key)
                     except Exception:
                         pass
-                    failed.append({
-                        "filename": filename,
-                        "object_key": _to_virtual(default_bucket, bucket, object_key),
-                        "error": f"Mongo sync failed: {e}",
-                    })
+                    error_msg = f"Mongo sync failed: {e}"
+                    failed.append({"filename": filename, "object_key": current_virtual_key, "error": error_msg})
+                    _append_upload_error(upload_id, {"filename": filename, "object_key": current_virtual_key, "error": error_msg})
+                    _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="syncing_mongo", stage_label="MongoDB lỗi", file_percent=1.0, message=error_msg, status="processing")
                     continue
 
-                # ====== SYNC Postgre FROM Mongo ======
+                _set_hierarchy_sync_status(
+                    sync_res,
+                    minio_ok=True,
+                    mongo_ok=True,
+                    postgre_ok=False,
+                    neo4j_ok=False,
+                    actor=actor,
+                    error="Đã sync MongoDB, đang chờ PostgreSQL/Neo4j",
+                )
+
+                _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="rebuilding_hierarchy", stage_label="Đang cập nhật mô tả/keyword", file_percent=0.54, message=f"Đang dựng mô tả và keyword cho {filename}")
+
                 try:
-                    sync_postgre_from_mongo_auto_ids(
+                    rebuild_hierarchy_descriptions_and_keywords(
+                        subject_map=sync_res.subject_map,
+                        topic_map=sync_res.topic_map or "",
+                        lesson_map=sync_res.lesson_map or "",
+                        chunk_map=sync_res.chunk_map or "",
+                    )
+                except Exception:
+                    pass
+
+                _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="syncing_postgre", stage_label="Đang import PostgreSQL", file_percent=0.72, message=f"Đang sync {filename} vào PostgreSQL")
+
+                try:
+                    pg_ids = sync_postgre_from_mongo_auto_ids(
                         class_map=sync_res.class_map,
                         subject_map=sync_res.subject_map,
                         topic_map=sync_res.topic_map or "",
@@ -735,64 +1269,152 @@ async def upload_files_to_path(
                         chunk_map=sync_res.chunk_map or "",
                     )
                 except Exception as e:
-                    # rollback file + ẩn chunk mongo
+                    _set_hierarchy_sync_status(
+                        sync_res,
+                        minio_ok=True,
+                        mongo_ok=True,
+                        postgre_ok=False,
+                        neo4j_ok=False,
+                        actor=actor,
+                        error=f"Postgre sync failed: {e}",
+                    )
                     try:
                         client.remove_object(bucket, object_key)
                     except Exception:
                         pass
                     _hide_mongo_chunk(str(sync_res.chunk_id), actor=actor)
-
-                    failed.append({
-                        "filename": filename,
-                        "object_key": _to_virtual(default_bucket, bucket, object_key),
-                        "error": f"Postgre sync failed: {e}",
-                    })
+                    error_msg = f"Postgre sync failed: {e}"
+                    failed.append({"filename": filename, "object_key": current_virtual_key, "error": error_msg})
+                    _append_upload_error(upload_id, {"filename": filename, "object_key": current_virtual_key, "error": error_msg})
+                    _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="syncing_postgre", stage_label="PostgreSQL lỗi", file_percent=1.0, message=error_msg, status="processing")
                     continue
+
+                _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="syncing_neo4j", stage_label="Đang sync Neo4j", file_percent=0.88, message=f"Đang đồng bộ {filename} sang Neo4j")
+
+                try:
+                    sync_neo4j_from_maps_and_pg_ids(
+                        class_map=sync_res.class_map,
+                        subject_map=sync_res.subject_map,
+                        topic_map=sync_res.topic_map or "",
+                        lesson_map=sync_res.lesson_map or "",
+                        chunk_map=sync_res.chunk_map or "",
+                        pg_ids=pg_ids,
+                        actor=actor,
+                    )
+                except Exception as e:
+                    _set_hierarchy_sync_status(
+                        sync_res,
+                        minio_ok=True,
+                        mongo_ok=True,
+                        postgre_ok=True,
+                        neo4j_ok=False,
+                        actor=actor,
+                        error=f"Neo4j sync failed: {e}",
+                    )
+                    error_msg = f"Neo4j sync failed: {e}"
+                    failed.append({"filename": filename, "object_key": current_virtual_key, "error": error_msg})
+                    _append_upload_error(upload_id, {"filename": filename, "object_key": current_virtual_key, "error": error_msg})
+                    _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="syncing_neo4j", stage_label="Neo4j lỗi", file_percent=1.0, message=error_msg, status="processing")
+                    continue
+
+                _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="verifying", stage_label="Đang kiểm tra đồng bộ", file_percent=0.96, message=f"Đang kiểm tra 4 hệ cho {filename}")
+
+                sync_status = _verify_hierarchy_sync(
+                    client=client,
+                    bucket=bucket,
+                    object_key=object_key,
+                    sync_res=sync_res,
+                    pg_ids=pg_ids,
+                )
+                if not sync_status.get("isFullySynced"):
+                    msg = _sync_error_message(sync_status)
+                    _set_hierarchy_sync_status(
+                        sync_res,
+                        minio_ok=bool(sync_status.get("minio")),
+                        mongo_ok=bool(sync_status.get("mongo")),
+                        postgre_ok=bool(sync_status.get("postgre")),
+                        neo4j_ok=bool(sync_status.get("neo4j")),
+                        actor=actor,
+                        error=msg,
+                        verify=sync_status,
+                    )
+                    failed.append({"filename": filename, "object_key": current_virtual_key, "error": msg})
+                    _append_upload_error(upload_id, {"filename": filename, "object_key": current_virtual_key, "error": msg})
+                    _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="verifying", stage_label="Kiểm tra chưa đạt", file_percent=1.0, message=msg, status="processing")
+                    continue
+
+                _set_hierarchy_sync_status(
+                    sync_res,
+                    minio_ok=True,
+                    mongo_ok=True,
+                    postgre_ok=True,
+                    neo4j_ok=True,
+                    actor=actor,
+                    error=None,
+                    verify=sync_status,
+                )
 
                 uploaded.append({
                     "filename": filename,
-                    "object_key": _to_virtual(default_bucket, bucket, object_key),
-                    "etag": getattr(result, "etag", None),
-                    "url": _backend_open_url(request, _to_virtual(default_bucket, bucket, object_key)),
+                    "object_key": current_virtual_key,
+                    "etag": getattr(getattr(client, 'stat_object', lambda *_args, **_kwargs: None)(bucket, object_key), 'etag', None),
+                    "url": _backend_open_url(request, current_virtual_key),
+                    "syncStatus": sync_status,
                 })
 
+                _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="completed", stage_label="Đã hoàn tất file", file_percent=1.0, message=f"Đã xử lý xong {filename}", completed_files=len(uploaded))
+            except HTTPException:
+                raise
             except S3Error as e:
-                failed.append({
-                    "filename": filename,
-                    "object_key": _to_virtual(default_bucket, bucket, object_key),
-                    "error": str(e)
-                })
-
+                error_msg = f"MinIO error: {e}"
+                failed.append({"filename": filename, "object_key": current_virtual_key, "error": error_msg})
+                _append_upload_error(upload_id, {"filename": filename, "object_key": current_virtual_key, "error": error_msg})
+                _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="failed", stage_label="MinIO lỗi", file_percent=1.0, message=error_msg, status="processing")
             finally:
-                await f.close()
+                try:
+                    f.file.close()
+                except Exception:
+                    pass
+
+        status = "completed" if not failed else ("failed" if not uploaded else "completed_with_errors")
+        message = "Hoàn tất toàn bộ" if status == "completed" else ("Tất cả file đều lỗi" if status == "failed" else "Hoàn tất nhưng có file lỗi")
+        _finish_upload_progress(upload_id, total_files=total_files, completed_files=len(uploaded), status=status, message=message, stage="completed", stage_label="Hoàn tất")
 
         return {
+            "status": "done",
             "bucket": bucket,
             "path": _to_virtual(default_bucket, bucket, p) if p else (bucket if not default_bucket else ""),
-            "uploaded_count": len(uploaded),
-            "failed_count": len(failed),
             "uploaded": uploaded,
             "failed": failed,
+            "uploaded_count": len(uploaded),
+            "failed_count": len(failed),
+            "upload_id": upload_id,
         }
 
+    except HTTPException:
+        raise
     except S3Error as e:
+        _finish_upload_progress(upload_id, total_files=total_files, completed_files=len(uploaded), status="failed", message=f"MinIO error: {e}", stage="failed", stage_label="Lỗi")
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
 
 
 @router.post("/objects/", summary="Insert 1 item (có thể có file hoặc không) - insert xong -> sync Mongo -> sync Postgre")
-async def insert_item(
+def insert_item(
     request: Request,
     path: str = Form(...),
+    upload_id: str = Form("", description="ID tiến trình upload để frontend poll"),
     name: str = Form("", description="Tên file nếu không upload file"),
     meta_json: str = Form("", description="JSON string metadata (tuỳ chọn)"),
     file: UploadFile | None = File(None),
 ):
     client, default_bucket, public_base = _runtime()
     actor = _get_actor(request)
+    upload_id = (upload_id or "").strip() or uuid.uuid4().hex
     meta = _parse_meta_json(meta_json)
-    category = _infer_category_from_path(path)
+    resolved_virtual_path = _remap_virtual_path_by_meta(path, meta)
+    category = _infer_category_from_path(resolved_virtual_path or path)
 
-    bucket, rel = _split_virtual(path, default_bucket, client, allow_empty_key=True)
+    bucket, rel = _split_virtual(resolved_virtual_path or path, default_bucket, client, allow_empty_key=True)
     p = clean_path(rel)
     prefix = folder_marker(p)
 
@@ -803,25 +1425,46 @@ async def insert_item(
         if "/" in filename or "\\" in filename:
             raise HTTPException(status_code=400, detail="name must not contain '/' or '\\'")
 
+
     object_key = prefix + filename
+    virtual_object_key = _to_virtual(default_bucket, bucket, object_key)
+    temp_file_path = ""
+
+    _init_upload_progress(upload_id, path=resolved_virtual_path or path, total_files=1)
+    _mark_file_progress(upload_id, file_index=1, total_files=1, file_name=filename, stage="preparing", stage_label="Đang chuẩn bị xử lý", file_percent=0.12, message=f"Đang chuẩn bị xử lý {filename}")
 
     try:
         client.stat_object(bucket, object_key)
+        _append_upload_error(upload_id, {"filename": filename, "object_key": virtual_object_key, "error": "Object already exists"})
+        _finish_upload_progress(upload_id, total_files=1, completed_files=0, status="failed", message="Object already exists", stage="failed", stage_label="File đã tồn tại")
         raise HTTPException(status_code=409, detail="Object already exists")
     except S3Error:
         pass
 
     try:
+        _ensure_folder_markers(client, bucket, p)
+
+        _mark_file_progress(upload_id, file_index=1, total_files=1, file_name=filename, stage="uploading_minio", stage_label="Đang upload lên MinIO", file_percent=0.20, message=f"Đang upload {filename} lên MinIO")
+
         if file:
+            file_bytes = file.file.read()
+            suffix = os.path.splitext(filename)[1] or ""
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            try:
+                tmp.write(file_bytes)
+                tmp.flush()
+                temp_file_path = tmp.name
+            finally:
+                tmp.close()
+
             client.put_object(
                 bucket,
                 object_key,
-                data=file.file,
-                length=-1,
+                data=io.BytesIO(file_bytes),
+                length=len(file_bytes),
                 part_size=10 * 1024 * 1024,
                 content_type=file.content_type or "application/octet-stream",
             )
-            await file.close()
         else:
             client.put_object(
                 bucket,
@@ -832,6 +1475,7 @@ async def insert_item(
             )
 
         if category in ("image", "video"):
+            _mark_file_progress(upload_id, file_index=1, total_files=1, file_name=filename, stage="syncing_mongo", stage_label="Đang sync MongoDB", file_percent=0.40, message=f"Đang đồng bộ media {filename} vào MongoDB")
             try:
                 media_res = sync_minio_media_to_mongo(
                     bucket=bucket,
@@ -844,8 +1488,11 @@ async def insert_item(
                     client.remove_object(bucket, object_key)
                 except Exception:
                     pass
+                _append_upload_error(upload_id, {"filename": filename, "object_key": virtual_object_key, "error": f"Mongo media sync failed: {e}"})
+                _finish_upload_progress(upload_id, total_files=1, completed_files=0, status="failed", message=f"Mongo media sync failed: {e}", stage="failed", stage_label="MongoDB lỗi")
                 raise HTTPException(status_code=500, detail=f"Mongo media sync failed: {e}") from e
 
+            _mark_file_progress(upload_id, file_index=1, total_files=1, file_name=filename, stage="syncing_postgre", stage_label="Đang import PostgreSQL", file_percent=0.72, message=f"Đang sync media {filename} vào PostgreSQL")
             try:
                 pg_media = sync_postgre_media_from_mongo(
                     media_type=media_res.media_type,
@@ -857,8 +1504,11 @@ async def insert_item(
                 except Exception:
                     pass
                 _hide_mongo_media(media_res.collection, str(media_res.mongo_id), actor=actor)
+                _append_upload_error(upload_id, {"filename": filename, "object_key": virtual_object_key, "error": f"Postgre media sync failed: {e}"})
+                _finish_upload_progress(upload_id, total_files=1, completed_files=0, status="failed", message=f"Postgre media sync failed: {e}", stage="failed", stage_label="PostgreSQL lỗi")
                 raise HTTPException(status_code=500, detail=f"Postgre media sync failed: {e}") from e
 
+            _mark_file_progress(upload_id, file_index=1, total_files=1, file_name=filename, stage="syncing_neo4j", stage_label="Đang sync Neo4j", file_percent=0.88, message=f"Đang đồng bộ media {filename} sang Neo4j")
             neo_info: Dict[str, Any] = {"synced": False, "error": None}
             try:
                 neo_res = sync_media_to_neo4j(
@@ -876,12 +1526,21 @@ async def insert_item(
             except Exception as e:
                 neo_info = {"synced": False, "error": str(e)}
 
+            if not neo_info.get("synced"):
+                _append_upload_error(upload_id, {"filename": filename, "object_key": virtual_object_key, "error": neo_info.get("error") or "Neo4j media sync failed"})
+                _finish_upload_progress(upload_id, total_files=1, completed_files=0, status="failed", message=neo_info.get("error") or "Neo4j media sync failed", stage="failed", stage_label="Neo4j lỗi")
+                raise HTTPException(status_code=500, detail=neo_info.get("error") or "Neo4j media sync failed")
+
+            _mark_file_progress(upload_id, file_index=1, total_files=1, file_name=filename, stage="verifying", stage_label="Đang kiểm tra đồng bộ", file_percent=0.96, message=f"Đang hoàn tất media {filename}")
+            _finish_upload_progress(upload_id, total_files=1, completed_files=1, status="completed", message="Hoàn tất", stage="completed", stage_label="Hoàn tất")
+
             return {
                 "status": "inserted",
                 "bucket": bucket,
+                "requested_path": clean_path(path),
                 "path": _to_virtual(default_bucket, bucket, p) if p else (bucket if not default_bucket else ""),
-                "object_key": _to_virtual(default_bucket, bucket, object_key),
-                "url": _backend_open_url(request, _to_virtual(default_bucket, bucket, object_key)),
+                "object_key": virtual_object_key,
+                "url": _backend_open_url(request, virtual_object_key),
                 "meta_json": meta_json or "",
                 "mongo": {
                     "collection": media_res.collection,
@@ -899,13 +1558,15 @@ async def insert_item(
                     "followType": pg_media.follow_type,
                 },
                 "neo4j": neo_info,
+                "upload_id": upload_id,
             }
 
+        _mark_file_progress(upload_id, file_index=1, total_files=1, file_name=filename, stage="syncing_mongo", stage_label="Đang sync MongoDB", file_percent=0.40, message=f"Đang đồng bộ {filename} vào MongoDB")
         try:
             sync_res = sync_minio_object_to_mongo(
                 bucket=bucket,
                 object_key=object_key,
-                meta=meta,
+                meta={**meta, "__local_file_path": temp_file_path},
                 actor=actor,
             )
         except Exception as e:
@@ -913,9 +1574,22 @@ async def insert_item(
                 client.remove_object(bucket, object_key)
             except Exception:
                 pass
+            _append_upload_error(upload_id, {"filename": filename, "object_key": virtual_object_key, "error": f"Mongo sync failed: {e}"})
+            _finish_upload_progress(upload_id, total_files=1, completed_files=0, status="failed", message=f"Mongo sync failed: {e}", stage="failed", stage_label="MongoDB lỗi")
             raise HTTPException(status_code=500, detail=f"Mongo sync failed: {e}") from e
 
+        _set_hierarchy_sync_status(
+            sync_res,
+            minio_ok=True,
+            mongo_ok=True,
+            postgre_ok=False,
+            neo4j_ok=False,
+            actor=actor,
+            error="Đã sync MongoDB, đang chờ PostgreSQL/Neo4j",
+        )
+
         hierarchy_info: Dict[str, Any] = {"updated": False, "details": None, "error": None}
+        _mark_file_progress(upload_id, file_index=1, total_files=1, file_name=filename, stage="rebuilding_hierarchy", stage_label="Đang cập nhật mô tả/keyword", file_percent=0.56, message=f"Đang dựng mô tả và keyword cho {filename}")
         try:
             hierarchy_details = rebuild_hierarchy_descriptions_and_keywords(
                 subject_map=sync_res.subject_map,
@@ -927,6 +1601,7 @@ async def insert_item(
         except Exception as e:
             hierarchy_info = {"updated": False, "details": None, "error": str(e)}
 
+        _mark_file_progress(upload_id, file_index=1, total_files=1, file_name=filename, stage="syncing_postgre", stage_label="Đang import PostgreSQL", file_percent=0.74, message=f"Đang sync {filename} vào PostgreSQL")
         try:
             pg_ids = sync_postgre_from_mongo_auto_ids(
                 class_map=sync_res.class_map,
@@ -936,14 +1611,26 @@ async def insert_item(
                 chunk_map=sync_res.chunk_map or "",
             )
         except Exception as e:
+            _set_hierarchy_sync_status(
+                sync_res,
+                minio_ok=True,
+                mongo_ok=True,
+                postgre_ok=False,
+                neo4j_ok=False,
+                actor=actor,
+                error=f"Postgre sync failed: {e}",
+            )
             try:
                 client.remove_object(bucket, object_key)
             except Exception:
                 pass
             if sync_res.chunk_map:
                 _hide_mongo_chunk_by_map(sync_res.chunk_map, actor=actor)
+            _append_upload_error(upload_id, {"filename": filename, "object_key": virtual_object_key, "error": f"Postgre sync failed: {e}"})
+            _finish_upload_progress(upload_id, total_files=1, completed_files=0, status="failed", message=f"Postgre sync failed: {e}", stage="failed", stage_label="PostgreSQL lỗi")
             raise HTTPException(status_code=500, detail=f"Postgre sync failed: {e}") from e
 
+        _mark_file_progress(upload_id, file_index=1, total_files=1, file_name=filename, stage="syncing_neo4j", stage_label="Đang sync Neo4j", file_percent=0.90, message=f"Đang đồng bộ {filename} sang Neo4j")
         neo_info: Dict[str, Any] = {"synced": False, "error": None}
         try:
             neo_res = sync_neo4j_from_maps_and_pg_ids(
@@ -964,12 +1651,71 @@ async def insert_item(
         except Exception as e:
             neo_info = {"synced": False, "error": str(e)}
 
+        _mark_file_progress(upload_id, file_index=1, total_files=1, file_name=filename, stage="verifying", stage_label="Đang kiểm tra đồng bộ", file_percent=0.97, message=f"Đang kiểm tra 4 hệ cho {filename}")
+        sync_status = _verify_hierarchy_sync(
+            client=client,
+            bucket=bucket,
+            object_key=object_key,
+            sync_res=sync_res,
+            pg_ids=pg_ids,
+        )
+        if not sync_status.get("isFullySynced"):
+            msg = _sync_error_message(sync_status)
+            _set_hierarchy_sync_status(
+                sync_res,
+                minio_ok=bool(sync_status.get("minio")),
+                mongo_ok=bool(sync_status.get("mongo")),
+                postgre_ok=bool(sync_status.get("postgre")),
+                neo4j_ok=bool(sync_status.get("neo4j")),
+                actor=actor,
+                error=msg,
+                verify=sync_status,
+            )
+            _append_upload_error(upload_id, {"filename": filename, "object_key": virtual_object_key, "error": msg})
+            _finish_upload_progress(upload_id, total_files=1, completed_files=0, status="failed", message=msg, stage="failed", stage_label="Kiểm tra chưa đạt")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": msg,
+                    "mongo": {
+                        "folderType": sync_res.folder_type,
+                        "classMap": sync_res.class_map,
+                        "subjectMap": sync_res.subject_map,
+                        "topicMap": sync_res.topic_map,
+                        "lessonMap": sync_res.lesson_map,
+                        "chunkMap": sync_res.chunk_map,
+                    },
+                    "postgre": {
+                        "classId": pg_ids.class_id,
+                        "subjectId": pg_ids.subject_id,
+                        "topicId": pg_ids.topic_id,
+                        "lessonId": pg_ids.lesson_id,
+                        "chunkId": pg_ids.chunk_id,
+                    },
+                    "neo4j": neo_info,
+                    "syncStatus": sync_status,
+                },
+            )
+
+        _set_hierarchy_sync_status(
+            sync_res,
+            minio_ok=True,
+            mongo_ok=True,
+            postgre_ok=True,
+            neo4j_ok=True,
+            actor=actor,
+            error=None,
+            verify=sync_status,
+        )
+        _finish_upload_progress(upload_id, total_files=1, completed_files=1, status="completed", message="Hoàn tất", stage="completed", stage_label="Hoàn tất")
+
         return {
             "status": "inserted",
             "bucket": bucket,
+            "requested_path": clean_path(path),
             "path": _to_virtual(default_bucket, bucket, p) if p else (bucket if not default_bucket else ""),
-            "object_key": _to_virtual(default_bucket, bucket, object_key),
-            "url": _backend_open_url(request, _to_virtual(default_bucket, bucket, object_key)),
+            "object_key": virtual_object_key,
+            "url": _backend_open_url(request, virtual_object_key),
             "meta_json": meta_json or "",
             "mongo": {
                 "folderType": sync_res.folder_type,
@@ -994,12 +1740,27 @@ async def insert_item(
                 "keywordIds": pg_ids.keyword_ids,
             },
             "neo4j": neo_info,
+            "syncStatus": sync_status,
+            "upload_id": upload_id,
         }
 
     except HTTPException:
         raise
     except S3Error as e:
+        _append_upload_error(upload_id, {"filename": filename, "object_key": virtual_object_key, "error": f"MinIO error: {e}"})
+        _finish_upload_progress(upload_id, total_files=1, completed_files=0, status="failed", message=f"MinIO error: {e}", stage="failed", stage_label="MinIO lỗi")
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
+    finally:
+        if temp_file_path:
+            try:
+                os.remove(temp_file_path)
+            except Exception:
+                pass
+        if file:
+            try:
+                file.file.close()
+            except Exception:
+                pass
 
 
 # =================== DELETE =================== #

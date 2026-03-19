@@ -117,6 +117,32 @@ function parseMediaMapID(mapID = "") {
   };
 }
 
+
+function deriveResolvedPath(folderName = "", meta = {}, category = "document") {
+  if (category === "image" || category === "video") return folderName || "";
+  const parts = splitPath(folderName);
+  if (!parts.length) return folderName || "";
+
+  const folderType = normalizeFolderType(meta.folderType || inferFolderType(folderName));
+  const classNo = extractLastNumber(
+    meta.class_map || meta.classMap || meta.subject_map || meta.subjectMap || meta.topic_map || meta.topicMap || meta.lesson_map || meta.lessonMap || meta.chunk_map || meta.chunkMap || ""
+  );
+  if (!classNo || !["subject", "topic", "lesson", "chunk"].includes(folderType)) {
+    return folderName || "";
+  }
+
+  const next = [...parts];
+  if (next.length >= 2) next[1] = `class-${classNo}`;
+  else next.push(`class-${classNo}`);
+
+  const wantedTail = `${folderType}s`;
+  const tail = (next[next.length - 1] || "").toLowerCase();
+  if (["subjects", "topics", "lessons", "chunks"].includes(tail)) {
+    next[next.length - 1] = wantedTail;
+  }
+  return next.join("/");
+}
+
 function defaultMeta(folderType, category) {
   return {
     name: "",
@@ -185,11 +211,15 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
 
   const [meta, setMeta] = useState(() => defaultMeta(folderType, category));
   const [file, setFile] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [progress, setProgress] = useState(null);
 
   useEffect(() => {
     if (!open) return;
     setMeta(defaultMeta(folderType, category));
     setFile(null);
+    setSubmitting(false);
+    setProgress(null);
   }, [open, folderType, category]);
 
   useEffect(() => {
@@ -222,6 +252,11 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
     if (!isMedia || !meta.mapID) return null;
     return parseMediaMapID(meta.mapID);
   }, [isMedia, meta.mapID]);
+
+  const targetPath = useMemo(() => {
+    const payload = isMedia ? { ...meta, ...(mediaDerived || {}) } : meta;
+    return deriveResolvedPath(folderName, payload, category);
+  }, [folderName, meta, mediaDerived, isMedia, category]);
 
   if (!open) return null;
 
@@ -274,19 +309,32 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
     return true;
   }
 
-  function submit(e) {
+  async function submit(e) {
     e.preventDefault();
-    if (isMedia) {
-      if (!validateMedia()) return;
-      onInsert({ meta: toMediaPayload(meta, category, file), file });
-      return;
+    if (submitting) return;
+
+    try {
+      if (isMedia) {
+        if (!validateMedia()) return;
+        setSubmitting(true);
+        setProgress({ percent: 0, stageLabel: "Đang chuẩn bị upload", message: "Đang chuẩn bị upload" });
+        await onInsert(
+          { meta: toMediaPayload(meta, category, file), file },
+          { onProgress: (payload) => setProgress(payload) }
+        );
+        return;
+      }
+
+      if (!validateDocument()) return;
+      setSubmitting(true);
+      setProgress({ percent: 0, stageLabel: "Đang chuẩn bị upload", message: "Đang chuẩn bị upload" });
+      await onInsert(
+        { meta: toDocumentPayload(meta), file },
+        { onProgress: (payload) => setProgress(payload) }
+      );
+    } finally {
+      setSubmitting(false);
     }
-    if (!validateDocument()) return;
-    if (folderType === "chunk" && !String(meta.keywords || "").trim()) {
-      const ok = window.confirm("Bạn chưa nhập keywords. Vẫn tiếp tục insert?");
-      if (!ok) return;
-    }
-    onInsert({ meta: toDocumentPayload(meta), file });
   }
 
   const mapFieldByType = {
@@ -344,12 +392,12 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
           onChange={(e) => change(key, e.target.value)}
           placeholder={
             key === "keywords"
-              ? "CPU, RAM, Mainboard"
+              ? "Để trống để hệ thống tự lấy 5 keyword phù hợp"
               : key === "imgDescription"
                 ? "Mô tả ảnh"
                 : key === "videoDescription"
                   ? "Mô tả video"
-                  : "Mô tả"
+                  : "Để trống để hệ thống tự sinh mô tả chunk"
           }
           rows={4}
         />
@@ -372,7 +420,7 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
   }
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
+    <div className="modal-overlay" onClick={() => { if (!submitting) onClose(); }}>
       <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <h3 className="modal-title">{titleMap[folderType] || "Insert"}</h3>
@@ -387,11 +435,35 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
                     ? "Chỉ cần nhập lesson_map (VD TH10_CD1_B1)."
                     : "Chỉ cần nhập chunk_map (VD TH10_CD1_B1_C1). Lesson sẽ suy ra (TH10_CD1_B1)."}
           </p>
-          <button className="modal-close" onClick={onClose}>×</button>
+          <button className="modal-close" onClick={onClose} disabled={submitting}>×</button>
         </div>
 
         <form className="modal-form" onSubmit={submit}>
           <div className="modal-body">
+
+            {progress ? (
+              <div className="upload-progress-card">
+                <div className="upload-progress-head">
+                  <div>
+                    <div className="upload-progress-title">{progress.stageLabel || "Đang xử lý"}</div>
+                    <div className="upload-progress-text">
+                      {progress.message || "Đang đồng bộ dữ liệu"}
+                      {progress.currentFileName ? ` • ${progress.currentFileName}` : ""}
+                    </div>
+                  </div>
+                  <div className="upload-progress-percent">{Math.round(progress.percent || 0)}%</div>
+                </div>
+                <div className="upload-progress-bar">
+                  <div className="upload-progress-bar-fill" style={{ width: `${Math.max(0, Math.min(100, progress.percent || 0))}%` }} />
+                </div>
+                <div className="upload-progress-meta">
+                  <span>Stage: {progress.stage || "processing"}</span>
+                  <span>
+                    File {progress.currentFileIndex || (submitting ? 1 : 0)}/{progress.totalFiles || 1}
+                  </span>
+                </div>
+              </div>
+            ) : null}
             <div className="modal-note" style={{ marginTop: 0 }}>
               <div><strong>Đang ở:</strong> {folderName || "(root)"}</div>
               <div><strong>Folder type:</strong> {folderType}</div>
@@ -432,6 +504,11 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
                   {isMedia && mediaDerived?.followType ? (
                     <div style={{ fontFamily: "monospace", fontSize: 12 }}>follow_type: {mediaDerived.followType}</div>
                   ) : null}
+                  {!!targetPath && targetPath !== folderName && (
+                    <div style={{ fontFamily: "monospace", fontSize: 12, marginTop: 6 }}>
+                      target_path: {targetPath}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -471,6 +548,7 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
                 {infoFields.includes("chunkDescription") && (
                   <div className="field" style={{ marginTop: 16 }}>
                     <label htmlFor="chunkDescription">chunkDescription</label>
+                    <div style={{ marginTop: 4, marginBottom: 6, fontSize: 12, color: "#64748b" }}>Để trống thì backend sẽ tự sinh mô tả và keyword từ nội dung file.</div>
                     {renderInput("chunkDescription")}
                   </div>
                 )}
@@ -488,7 +566,7 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
 
             <div className="field">
               <label htmlFor="file">Chọn file (tuỳ chọn)</label>
-              <input id="file" type="file" onChange={(e) => setFile(e.target.files?.[0] || null)} />
+              <input id="file" type="file" onChange={(e) => setFile(e.target.files?.[0] || null)} disabled={submitting} />
               {file && (
                 <div className="file-info">
                   <strong>Đã chọn:</strong> {file.name} ({Math.round(file.size / 1024)} KB)
@@ -505,8 +583,8 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
           </div>
 
           <div className="modal-footer">
-            <button className="btn" type="button" onClick={onClose}>Huỷ</button>
-            <button className="btn btn-primary" type="submit">Insert</button>
+            <button className="btn" type="button" onClick={onClose} disabled={submitting}>Huỷ</button>
+            <button className="btn btn-primary" type="submit" disabled={submitting}>{submitting ? "Đang xử lý..." : "Insert"}</button>
           </div>
         </form>
       </div>

@@ -678,3 +678,70 @@ select.kv-input option {
     flex-direction: column;
   }
 }
+
+
+.upload-progress-card {
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  border: 1px solid #dbeafe;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #f8fbff 0%, #eff6ff 100%);
+}
+
+.upload-progress-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.upload-progress-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.upload-progress-text {
+  margin-top: 4px;
+  font-size: 13px;
+  color: #475569;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.upload-progress-percent {
+  font-size: 18px;
+  font-weight: 700;
+  color: #0369a1;
+  white-space: nowrap;
+}
+
+.upload-progress-bar {
+  margin-top: 12px;
+  height: 10px;
+  border-radius: 999px;
+  background: #dbeafe;
+  overflow: hidden;
+}
+
+.upload-progress-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #38bdf8 0%, #2563eb 100%);
+  transition: width 0.25s ease;
+}
+
+.upload-progress-meta {
+  margin-top: 10px;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.modal-close:disabled,
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

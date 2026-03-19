@@ -66,12 +66,34 @@ class NeoSyncResult:
     keyword_count: int = 0
 
 
+def _ensure_thing_root_links_all_classes(tx):
+    tx.run(
+        """
+        MERGE (root:Thing {pg_id: 'THING'})
+        SET root.name = 'Thing'
+        REMOVE root.neo_id
+
+        WITH root
+        MATCH (c:Class)
+        MERGE (root)-[:has_class]->(c)
+        """
+    )
+
+
+
 def _merge_class(tx, *, pg_id: str, name: str):
     tx.run(
         """
+        MERGE (root:Thing {pg_id: 'THING'})
+        SET root.name = 'Thing'
+        REMOVE root.neo_id
+
         MERGE (c:Class {pg_id: $pg_id})
         SET c.name = $name
         REMOVE c.neo_id
+
+        WITH root, c
+        MERGE (root)-[:has_class]->(c)
         """,
         pg_id=pg_id,
         name=name,
@@ -420,7 +442,7 @@ def sync_neo4j_from_maps_and_pg_ids(
     lesson_embedding = _embed_name(lesson_name) if lesson_pg_id else None
     chunk_embedding = _embed_name(chunk_name) if chunk_pg_id else None
 
-    created_or_updated = {"Class": 0, "Subject": 0, "Topic": 0, "Lesson": 0, "Chunk": 0}
+    created_or_updated = {"Thing": 0, "Class": 0, "Subject": 0, "Topic": 0, "Lesson": 0, "Chunk": 0}
     keyword_count = 0
 
     driver = neo4j_driver()
@@ -428,7 +450,10 @@ def sync_neo4j_from_maps_and_pg_ids(
         db_name = (os.getenv("NEO4J_DATABASE") or "").strip() or None
 
         with driver.session(database=db_name) as session:  # type: ignore[arg-type]
+            session.execute_write(_ensure_thing_root_links_all_classes)
             session.execute_write(_merge_class, pg_id=class_pg_id, name=class_name)
+            session.execute_write(_ensure_thing_root_links_all_classes)
+            created_or_updated["Thing"] = 1
             created_or_updated["Class"] = 1
 
             if subject_pg_id:

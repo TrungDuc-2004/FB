@@ -11,6 +11,12 @@ from bson import ObjectId
 
 from .mongo_client import get_mongo_client
 from .keyword_embedding import embed_keyword_cached, get_keyword_embedder
+from .chunk_content_ai import (
+    generate_chunk_description_and_keywords,
+    generate_lesson_description_and_keywords,
+    generate_topic_description_and_keywords,
+    generate_subject_description_and_keywords,
+)
 
 _WORD_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
 _CHUNK_STOPWORDS = {
@@ -371,12 +377,7 @@ def sync_minio_object_to_mongo(
     chunk_name = _pick(meta, "chunkName", "chunk", "chunk_name") or (filename.rsplit(".", 1)[0] if filename else (chunk_map or ""))
     chunk_type = _pick(meta, "chunkType", "chunk_type") or lesson_type
     chunk_desc = _pick(meta, "chunkDescription", "description", "chunk_description")
-    keywords = _prepare_chunk_keywords(
-        _parse_keywords(_pick(meta, "keywords", "keyword")),
-        chunk_name,
-        chunk_desc,
-        limit=5,
-    )
+    keywords = _parse_keywords(_pick(meta, "keywords", "keyword"))
 
     subject_desc = _pick(meta, "subjectDescription", "subject_description")
     topic_desc = _pick(meta, "topicDescription", "topic_description")
@@ -384,6 +385,50 @@ def sync_minio_object_to_mongo(
     subject_keywords = _parse_keywords(_pick(meta, "keywordSubject", "subjectKeywords", "subject_keywords"))
     topic_keywords = _parse_keywords(_pick(meta, "keywordTopic", "topicKeywords", "topic_keywords"))
     lesson_keywords = _parse_keywords(_pick(meta, "keywordLesson", "lessonKeywords", "lesson_keywords"))
+
+    local_file_path = _clean_str(meta.get("__local_file_path"))
+    topic_doc_for_level = db["topics"].find_one({"topicID": topic_map}) if topic_map else None
+    subject_doc_for_level = db["subjects"].find_one({"subjectID": subject_map}) if subject_map else None
+
+    if folder_type == "chunk":
+        lesson_doc_for_chunk = db["lessons"].find_one({"lessonID": lesson_map}) if lesson_map else None
+        chunk_desc, keywords, _chunk_ai_meta = generate_chunk_description_and_keywords(
+            chunk_name=chunk_name,
+            explicit_description=chunk_desc,
+            explicit_keywords=keywords,
+            lesson_name=_clean_str((lesson_doc_for_chunk or {}).get("lessonName") or lesson_name),
+            topic_name=_clean_str((topic_doc_for_level or {}).get("topicName") or topic_name),
+            subject_name=_clean_str((subject_doc_for_level or {}).get("subjectName") or subject_name),
+            file_path=local_file_path,
+            limit=5,
+        )
+    elif folder_type == "lesson":
+        lesson_desc, lesson_keywords, _lesson_ai_meta = generate_lesson_description_and_keywords(
+            lesson_name=lesson_name or lesson_map or "",
+            explicit_description=lesson_desc,
+            explicit_keywords=lesson_keywords,
+            topic_name=_clean_str((topic_doc_for_level or {}).get("topicName") or topic_name),
+            subject_name=_clean_str((subject_doc_for_level or {}).get("subjectName") or subject_name),
+            file_path=local_file_path,
+            limit=15,
+        )
+    elif folder_type == "topic":
+        topic_desc, topic_keywords, _topic_ai_meta = generate_topic_description_and_keywords(
+            topic_name=topic_name or topic_map or "",
+            explicit_description=topic_desc,
+            explicit_keywords=topic_keywords,
+            subject_name=_clean_str((subject_doc_for_level or {}).get("subjectName") or subject_name),
+            file_path=local_file_path,
+            limit=48,
+        )
+    else:
+        subject_desc, subject_keywords, _subject_ai_meta = generate_subject_description_and_keywords(
+            subject_name=subject_name or subject_title or subject_map or "",
+            explicit_description=subject_desc,
+            explicit_keywords=subject_keywords,
+            file_path=local_file_path,
+            limit=80,
+        )
 
     # ====== Collections ======
     COL_CLASSES = "classes"

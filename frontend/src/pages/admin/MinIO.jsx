@@ -419,11 +419,18 @@ export default function MinIO() {
     return isFileView;
   }
 
-  async function uploadFile(file) {
+  async function uploadFile(file, { onProgress } = {}) {
     if (!canUploadHere()) return;
 
     try {
-      await minioApi.uploadFiles(currentPath, [file]);
+      const res = await minioApi.uploadFiles(currentPath, [file], onProgress);
+      if (res?.failed_count > 0) {
+        const msg = (res.failed || [])
+          .map((item) => `${item?.filename || item?.object_key || "file"}: ${item?.error || "Upload chưa sync đủ 4 hệ"}`)
+          .join("\n");
+        throw new Error(msg || "Upload chưa sync đủ MinIO / MongoDB / PostgreSQL / Neo4j");
+      }
+
       setOpenUpload(false);
 
       const data = await minioApi.minioList(currentPath);
@@ -433,15 +440,29 @@ export default function MinIO() {
     }
   }
 
-  async function insertItem({ meta, file }) {
+  async function insertItem({ meta, file }, { onProgress } = {}) {
     if (!canUploadHere()) return;
 
     try {
-      await minioApi.insertItem(currentPath, meta || {}, file || null);
+      const res = await minioApi.insertItem(currentPath, meta || {}, file || null, onProgress);
+      if (res?.syncStatus && !res.syncStatus.isFullySynced) {
+        const parts = res.syncStatus.missing || [];
+        throw new Error(parts.length ? parts.join("\n") : "Upload chưa sync đủ MinIO / MongoDB / PostgreSQL / Neo4j");
+      }
+
       setOpenInsert(false);
 
-      const data = await minioApi.minioList(currentPath);
+      const nextPath = res?.path || currentPath;
+      if (nextPath !== currentPath) {
+        setCurrentPath(nextPath);
+      }
+
+      const data = await minioApi.minioList(nextPath);
       setRemote({ folders: data.folders || [], files: data.files || [] });
+
+      if (res?.requested_path && res?.path && res.path !== res.requested_path) {
+        alert(`Đã tự chuyển dữ liệu sang đúng lớp: ${res.path}`);
+      }
     } catch (e) {
       alert(String(e?.message || e));
     }
@@ -560,7 +581,7 @@ export default function MinIO() {
         </div>
       </div>
 
-      <div className="table-wrapper">
+      <div className="table-wrapper minio-table-wrapper">
         {loading ? (
           <div className="empty-state">
             <p>Đang tải...</p>
