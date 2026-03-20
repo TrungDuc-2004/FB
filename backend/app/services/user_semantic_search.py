@@ -16,7 +16,7 @@ from .gemini_topic_expander import expand_topic_keywords_debug
 from .keyword_embedding import embed_keyword_cached
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
-_SERVICE_VERSION = "search_structured_hierarchy_neo_name_keyword_v6_semantic_parts_anchor"
+_SERVICE_VERSION = "search_hierarchical_keyword_neo4j_only_v2"
 _LABEL_RE = re.compile(
     r"(?P<class>\b(?:lớp|lop|class)\b)|"
     r"(?P<topic>\b(?:chủ\s*đề|chu\s*de|topic)\b)|"
@@ -714,7 +714,51 @@ def _load_keyword_rows(neo, pg: Session, cand_chunks: Optional[List[str]]) -> Tu
     return pg_rows, "postgresql", neo_error
 
 
-def _load_keyword_rows_by_map_ids(pg: Session, map_ids: List[str]) -> List[Tuple[str, str, str, List[float]]]:
+def _load_keyword_rows_by_map_ids_from_neo(
+    neo,
+    *,
+    owner_label: str,
+    map_ids: List[str],
+) -> Tuple[List[Tuple[str, str, str, List[float]]], Optional[str]]:
+    clean_map_ids = [str(mid).strip() for mid in map_ids if str(mid).strip()]
+    if not clean_map_ids:
+        return [], None
+    if neo is None:
+        return [], "neo_session_unavailable"
+    if owner_label not in {"Subject", "Topic", "Lesson", "Chunk"}:
+        return [], f"unsupported_owner_label:{owner_label}"
+    try:
+        records = neo.run(
+            f"""
+            MATCH (owner:{owner_label})-[:HAS_KEYWORD]->(keyword:Keyword)
+            WHERE owner.pg_id IN $map_ids
+              AND keyword.embedding IS NOT NULL
+              AND keyword.pg_id IS NOT NULL
+            RETURN keyword.pg_id AS keyword_id,
+                   owner.pg_id AS map_id,
+                   coalesce(keyword.name, keyword.pg_id) AS keyword_name,
+                   keyword.embedding AS keyword_embedding
+            """,
+            map_ids=clean_map_ids,
+        )
+        rows: List[Tuple[str, str, str, List[float]]] = []
+        for record in records:
+            keyword_id = str(record.get("keyword_id") or "").strip()
+            map_id = str(record.get("map_id") or "").strip()
+            keyword_name = str(record.get("keyword_name") or "").strip()
+            embedding = record.get("keyword_embedding")
+            if not keyword_id or not map_id or not keyword_name or not embedding:
+                continue
+            try:
+                rows.append((keyword_id, map_id, keyword_name, [float(x) for x in list(embedding)]))
+            except Exception:
+                continue
+        return rows, None
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _load_keyword_rows_by_map_ids_pg(pg: Session, map_ids: List[str]) -> List[Tuple[str, str, str, List[float]]]:
     clean_map_ids = [str(mid).strip() for mid in map_ids if str(mid).strip()]
     if not clean_map_ids:
         return []
@@ -1319,8 +1363,11 @@ def semantic_search(
     current_topic_ids = _dedupe_keep_order([str(row.get("topicID") or "") for row in filtered_chunk_rows if str(row.get("topicID") or "")])
     current_lesson_ids = _dedupe_keep_order([str(row.get("lessonID") or "") for row in filtered_chunk_rows if str(row.get("lessonID") or "")])
 
-    subject_keyword_rows = _load_keyword_rows_by_map_ids(pg, current_subject_ids)
+    subject_keyword_rows, subject_keyword_error = _load_keyword_rows_by_map_ids_from_neo(neo, owner_label="Subject", map_ids=current_subject_ids)
     hierarchy_dbg["subject_keyword_rows"] = len(subject_keyword_rows)
+    hierarchy_dbg["subject_keyword_source"] = "neo4j"
+    if subject_keyword_error:
+        hierarchy_dbg["subject_keyword_error"] = subject_keyword_error
     if not subjectID and len(current_subject_ids) > 1 and subject_keyword_rows:
         matched_subject_ids, subject_scores, subject_kw, subject_match_dbg = _score_entity_keyword_rows(keyword_query or generic_query or query, subject_keyword_rows)
         hierarchy_dbg["subject_match"] = subject_match_dbg
@@ -1335,8 +1382,11 @@ def semantic_search(
         current_topic_ids = _dedupe_keep_order([str(row.get("topicID") or "") for row in filtered_chunk_rows if str(row.get("topicID") or "")])
         current_lesson_ids = _dedupe_keep_order([str(row.get("lessonID") or "") for row in filtered_chunk_rows if str(row.get("lessonID") or "")])
 
-    topic_keyword_rows = _load_keyword_rows_by_map_ids(pg, current_topic_ids)
+    topic_keyword_rows, topic_keyword_error = _load_keyword_rows_by_map_ids_from_neo(neo, owner_label="Topic", map_ids=current_topic_ids)
     hierarchy_dbg["topic_keyword_rows"] = len(topic_keyword_rows)
+    hierarchy_dbg["topic_keyword_source"] = "neo4j"
+    if topic_keyword_error:
+        hierarchy_dbg["topic_keyword_error"] = topic_keyword_error
     if not topic_scope_active and len(current_topic_ids) > 1 and topic_keyword_rows:
         matched_topic_ids, topic_scores, topic_kw, topic_match_dbg = _score_entity_keyword_rows(keyword_query or generic_query or query, topic_keyword_rows)
         hierarchy_dbg["topic_match"] = topic_match_dbg
@@ -1350,8 +1400,11 @@ def semantic_search(
         filtered_chunk_rows = [row for row in filtered_chunk_rows if str(row.get("topicID") or "") in set(matched_topic_ids)]
         current_lesson_ids = _dedupe_keep_order([str(row.get("lessonID") or "") for row in filtered_chunk_rows if str(row.get("lessonID") or "")])
 
-    lesson_keyword_rows = _load_keyword_rows_by_map_ids(pg, current_lesson_ids)
+    lesson_keyword_rows, lesson_keyword_error = _load_keyword_rows_by_map_ids_from_neo(neo, owner_label="Lesson", map_ids=current_lesson_ids)
     hierarchy_dbg["lesson_keyword_rows"] = len(lesson_keyword_rows)
+    hierarchy_dbg["lesson_keyword_source"] = "neo4j"
+    if lesson_keyword_error:
+        hierarchy_dbg["lesson_keyword_error"] = lesson_keyword_error
     if not lesson_scope_active and len(current_lesson_ids) > 1 and lesson_keyword_rows:
         matched_lesson_ids, lesson_scores, lesson_kw, lesson_match_dbg = _score_entity_keyword_rows(keyword_query or generic_query or query, lesson_keyword_rows)
         hierarchy_dbg["lesson_match"] = lesson_match_dbg
@@ -1384,9 +1437,11 @@ def semantic_search(
     dbg["gemini_mode"] = gem_dbg.get("mode") if gem_dbg else None
     dbg["gemini_terms_after_strict_filter"] = gemini_terms
 
-    keyword_rows = _load_keyword_rows_by_map_ids(pg, chunk_ids)
+    keyword_rows, keyword_rows_error = _load_keyword_rows_by_map_ids_from_neo(neo, owner_label="Chunk", map_ids=chunk_ids)
     dbg["keyword_rows"] = len(keyword_rows)
-    dbg["keyword_embedding_source"] = "postgresql_map_id"
+    dbg["keyword_embedding_source"] = "neo4j_map_id"
+    if keyword_rows_error:
+        dbg["keyword_embedding_error"] = keyword_rows_error
     if not keyword_rows:
         res = {"total": 0, "items": []}
         if debug:
