@@ -66,7 +66,6 @@ function normalizeFolderType(x = "") {
   return s;
 }
 
-
 export default function MinIO() {
   const [currentPath, setCurrentPath] = useState(""); // "" = root
   const [q, setQ] = useState("");
@@ -98,11 +97,19 @@ export default function MinIO() {
   // A) <bucket>/<class>/<subject>/<category>  (len 4, category = topics/lessons/chunks)
   // B) <bucket>/<class>/<category>            (len 3, category = topics/lessons/chunks)
   const isClassLevel = isStorage && parts.length === 2;
-  const isSubjectLevel = isStorage && parts.length === 3 && !isTypeFolder; // <bucket>/<class>/<subject>
+  const isSubjectLevel = isStorage && parts.length === 3 && !isTypeFolder;
   const isCategoryLevel =
     isStorage &&
     ((parts.length === 3 && isTypeFolder) || (parts.length === 4 && isTypeFolder));
-  const isDirectMediaFilePath = isMediaStorage && parts.length >= 2;
+
+  // Với images/video:
+  // - nếu backend còn trả folder con => vẫn là folder view
+  // - chỉ khi đã đi sâu và không còn folder con nữa => mới là file view
+  const hasRemoteFolders = (remote.folders || []).length > 0;
+  const isDirectMediaFilePath =
+    isMediaStorage &&
+    parts.length >= 2 &&
+    !hasRemoteFolders;
 
   const isFileView = isCategoryLevel || isDirectMediaFilePath;
   const isFolderView = isRoot || (isStorage && !isFileView);
@@ -167,8 +174,10 @@ export default function MinIO() {
       id: `f-${f.fullPath}`,
       name: f.name,
       fullPath: f.fullPath,
-      isCategory: isSubjectLevel || isClassLevel, // folder con của subject => category
-      isFixed: (isSubjectLevel || isClassLevel) && fixedCats.includes(normalizeFolderType(f.name || "")),
+      isCategory: isSubjectLevel || isClassLevel,
+      isFixed:
+        (isSubjectLevel || isClassLevel) &&
+        fixedCats.includes(normalizeFolderType(f.name || "")),
     }));
 
     const filtered = !s ? rows : rows.filter((x) => x.name.toLowerCase().includes(s));
@@ -182,13 +191,13 @@ export default function MinIO() {
     const list = (remote.files || []).map((x) => {
       const fullName = x.name || "";
       const baseName = stripExt(fullName);
-      const loai = getLoai(fullName); // document/image/video
-      const type = getTypeExt(fullName); // pdf/docx/...
+      const loai = getLoai(fullName);
+      const type = getTypeExt(fullName);
 
       return {
         id: x.object_key,
-        name: baseName, // hiển thị không đuôi
-        fullName, // giữ để tooltip
+        name: baseName,
+        fullName,
         loai,
         type,
         size: x.size || 0,
@@ -198,13 +207,9 @@ export default function MinIO() {
       };
     });
 
-    // filter theo LOẠI
     const byLoai = filters.loai === "all" ? list : list.filter((r) => r.loai === filters.loai);
-
-    // filter theo TYPE (đuôi)
     const byType = filters.type === "all" ? byLoai : byLoai.filter((r) => r.type === filters.type);
 
-    // search theo tên không đuôi
     const s = q.trim().toLowerCase();
     const searched = !s ? byType : byType.filter((r) => r.name.toLowerCase().includes(s));
 
@@ -263,8 +268,7 @@ export default function MinIO() {
       key: "loai",
       label: "LOẠI",
       render: (r) => {
-        // để đỡ “vỡ CSS” nếu bạn chưa có class .document
-        const cls = r.loai === "document" ? "other" : r.loai; // image/video dùng class cũ
+        const cls = r.loai === "document" ? "other" : r.loai;
         return <span className={`file-type-badge ${cls}`}>{r.loai}</span>;
       },
     },
@@ -273,8 +277,14 @@ export default function MinIO() {
       key: "type",
       label: "TYPE",
       render: (r) => {
-        // giữ style pdf nếu bạn đã có class pdf
-        const cls = r.type === "pdf" ? "pdf" : r.loai === "image" ? "image" : r.loai === "video" ? "video" : "other";
+        const cls =
+          r.type === "pdf"
+            ? "pdf"
+            : r.loai === "image"
+            ? "image"
+            : r.loai === "video"
+            ? "video"
+            : "other";
         return <span className={`file-type-badge ${cls}`}>{r.type}</span>;
       },
     },
@@ -301,7 +311,6 @@ export default function MinIO() {
   function canCreateFolderHere() {
     if (!isStorage) return false;
     if (isCategoryLevel) return false;
-    // tạo được ở: <bucket>(1), <bucket>/<class>(2), <bucket>/<class>/<subject>(3)
     return parts.length === 1 || parts.length === 2 || parts.length === 3;
   }
 
@@ -323,7 +332,6 @@ export default function MinIO() {
     try {
       await minioApi.createFolder(fullPath);
 
-      // vừa tạo SUBJECT (level 3) => auto tạo topic/lesson/chunk
       if (splitPath(fullPath).length === 3) {
         const defaults = ["topic", "lesson", "chunk"];
         for (const d of defaults) {
@@ -345,14 +353,12 @@ export default function MinIO() {
   }
 
   function canEditDeleteFolder(row) {
-  // OPTION 1: cho phép sửa/xoá tất cả folder (kể cả subjects/topics/lessons/chunks)
-  if (!row?.fullPath) return false;
-  if (!section) return false;
+    if (!row?.fullPath) return false;
+    if (!section) return false;
 
-  // chỉ cần đảm bảo folder nằm trong bucket hiện tại
-  const inThisBucket = row.fullPath === section || row.fullPath.startsWith(section + "/");
-  return inThisBucket;
-}
+    const inThisBucket = row.fullPath === section || row.fullPath.startsWith(section + "/");
+    return inThisBucket;
+  }
 
   async function editFolder(row) {
     const oldPath = row.fullPath;
@@ -411,7 +417,6 @@ export default function MinIO() {
 
   // ====== File actions ======
   function canUploadHere() {
-    // Upload metadata/document chỉ giữ cho luồng documents cũ
     return isStorage && (parts.length === 3 || parts.length === 4);
   }
 
@@ -469,9 +474,8 @@ export default function MinIO() {
   }
 
   async function editFile(row) {
-    // prompt chỉ hiện tên không đuôi
     const oldBase = row.name || "";
-    const ext = row.type; // giữ đuôi cũ
+    const ext = row.type;
 
     const input = window.prompt("Đổi tên file:", oldBase);
     if (input == null) return;

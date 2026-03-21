@@ -394,9 +394,9 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
             key === "keywords"
               ? "Để trống để hệ thống tự lấy 5 keyword phù hợp"
               : key === "imgDescription"
-                ? "Mô tả ảnh"
+                ? "Để trống để hệ thống tự lấy mô tả từ ảnh"
                 : key === "videoDescription"
-                  ? "Mô tả video"
+                  ? "Để trống để hệ thống tự lấy mô tả từ video"
                   : "Để trống để hệ thống tự sinh mô tả chunk"
           }
           rows={4}
@@ -532,6 +532,9 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
                   <label htmlFor={category === "image" ? "imgDescription" : "videoDescription"}>
                     {category === "image" ? "Mô tả ảnh" : "Mô tả video"}
                   </label>
+                  <div style={{ marginTop: 4, marginBottom: 6, fontSize: 12, color: "#64748b" }}>
+                    Để trống thì backend sẽ tự gọi Gemini để sinh mô tả ngắn cho ảnh/video trước khi sync dữ liệu.
+                  </div>
                   {renderInput(category === "image" ? "imgDescription" : "videoDescription")}
                 </div>
               </>
