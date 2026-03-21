@@ -165,7 +165,7 @@ export default function UserLayout() {
 
   const navItems = useMemo(
     () => [
-      { to: "/user", label: "Khám phá", icon: IHome, end: true },
+      { to: "/user", label: "Trang chủ", icon: IHome, end: true },
       { to: "/user/search", label: "Tìm kiếm", icon: ISearch },
       { to: "/user/history", label: "Lịch sử", icon: <HistoryIcon /> },
       { to: "/user/library", label: "Thư viện", icon: IBook },

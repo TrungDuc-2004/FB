@@ -55,6 +55,30 @@ def _pick(meta: Dict[str, Any], *keys: str) -> str:
     return ""
 
 
+def _first_non_empty(*values: Any) -> str:
+    for value in values:
+        s = _clean_str(value)
+        if s:
+            return s
+    return ""
+
+
+def _resolve_name(*, incoming: Any, existing: Any, fallback: Any) -> str:
+    incoming_s = _clean_str(incoming)
+    existing_s = _clean_str(existing)
+    fallback_s = _clean_str(fallback)
+
+    # Nếu request hiện tại thiếu name thật và chỉ còn map/id fallback,
+    # phải giữ name cũ để tránh ghi đè dữ liệu đẹp thành ID.
+    if incoming_s and (not fallback_s or incoming_s.casefold() != fallback_s.casefold()):
+        return incoming_s
+    if existing_s:
+        return existing_s
+    if incoming_s:
+        return incoming_s
+    return fallback_s
+
+
 def _parse_keywords(v: Any) -> List[str]:
     if v is None:
         return []
@@ -367,14 +391,12 @@ def sync_minio_object_to_mongo(
     now = _now()
 
     # ====== Names (giảm bắt buộc, cho phép rỗng) ======
-    subject_name = _pick(meta, "subjectName", "subject", "subject_name") or subject_map
-    subject_title = _pick(meta, "subjectTitle", "title", "subject_title")
-
-    topic_name = _pick(meta, "topicName", "topic", "topic_name") or (topic_map or "")
-    lesson_name = _pick(meta, "lessonName", "lesson", "lesson_name") or (lesson_map or "")
+    raw_subject_name = _pick(meta, "subjectName", "subject", "subject_name")
+    raw_subject_title = _pick(meta, "subjectTitle", "title", "subject_title")
+    raw_topic_name = _pick(meta, "topicName", "topic", "topic_name")
+    raw_lesson_name = _pick(meta, "lessonName", "lesson", "lesson_name")
     lesson_type = _pick(meta, "lessonType", "lesson_type")
-
-    chunk_name = _pick(meta, "chunkName", "chunk", "chunk_name") or (filename.rsplit(".", 1)[0] if filename else (chunk_map or ""))
+    raw_chunk_name = _pick(meta, "chunkName", "chunk", "chunk_name")
     chunk_type = _pick(meta, "chunkType", "chunk_type") or lesson_type
     chunk_desc = _pick(meta, "chunkDescription", "description", "chunk_description")
     keywords = _parse_keywords(_pick(meta, "keywords", "keyword"))
@@ -389,14 +411,40 @@ def sync_minio_object_to_mongo(
     local_file_path = _clean_str(meta.get("__local_file_path"))
     topic_doc_for_level = db["topics"].find_one({"topicID": topic_map}) if topic_map else None
     subject_doc_for_level = db["subjects"].find_one({"subjectID": subject_map}) if subject_map else None
+    lesson_doc_for_level = db["lessons"].find_one({"lessonID": lesson_map}) if lesson_map else None
+    chunk_doc_for_level = db["chunks"].find_one({"chunkID": chunk_map, "chunkCategory": category}) if chunk_map else None
+
+    subject_name = _resolve_name(
+        incoming=raw_subject_name,
+        existing=_first_non_empty(
+            (subject_doc_for_level or {}).get("subjectName"),
+            (subject_doc_for_level or {}).get("subjectTitle"),
+        ),
+        fallback=subject_map,
+    )
+    subject_title = _first_non_empty(raw_subject_title, (subject_doc_for_level or {}).get("subjectTitle"))
+    topic_name = _resolve_name(
+        incoming=raw_topic_name,
+        existing=(topic_doc_for_level or {}).get("topicName"),
+        fallback=topic_map or "",
+    )
+    lesson_name = _resolve_name(
+        incoming=raw_lesson_name,
+        existing=(lesson_doc_for_level or {}).get("lessonName"),
+        fallback=lesson_map or "",
+    )
+    chunk_name = _resolve_name(
+        incoming=raw_chunk_name,
+        existing=(chunk_doc_for_level or {}).get("chunkName"),
+        fallback=(filename.rsplit(".", 1)[0] if filename else (chunk_map or "")),
+    )
 
     if folder_type == "chunk":
-        lesson_doc_for_chunk = db["lessons"].find_one({"lessonID": lesson_map}) if lesson_map else None
         chunk_desc, keywords, _chunk_ai_meta = generate_chunk_description_and_keywords(
             chunk_name=chunk_name,
             explicit_description=chunk_desc,
             explicit_keywords=keywords,
-            lesson_name=_clean_str((lesson_doc_for_chunk or {}).get("lessonName") or lesson_name),
+            lesson_name=_clean_str((lesson_doc_for_level or {}).get("lessonName") or lesson_name),
             topic_name=_clean_str((topic_doc_for_level or {}).get("topicName") or topic_name),
             subject_name=_clean_str((subject_doc_for_level or {}).get("subjectName") or subject_name),
             file_path=local_file_path,

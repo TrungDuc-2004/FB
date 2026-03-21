@@ -1,7 +1,9 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import DocumentCard from "../../components/DocumentCard";
+import { getHomeFeed, toggleSave } from "../../services/userDocsApi";
 import "../../styles/admin/page.css";
-import { HOME_PRESETS } from "../../data/userPresets";
+import "../../styles/user/home.css";
 
 function buildSearchUrl({ q = "", classID = "", subjectID = "", topicID = "", lessonID = "" } = {}) {
   const sp = new URLSearchParams();
@@ -13,139 +15,239 @@ function buildSearchUrl({ q = "", classID = "", subjectID = "", topicID = "", le
   return `/user/search${sp.toString() ? `?${sp.toString()}` : ""}`;
 }
 
+function SectionHeader({ title, subtitle, actionLabel, onAction }) {
+  return (
+    <div className="user-home-section-head">
+      <div>
+        <div className="user-home-section-title">{title}</div>
+        {subtitle ? <div className="user-home-section-subtitle">{subtitle}</div> : null}
+      </div>
+      {actionLabel ? (
+        <button className="btn" type="button" onClick={onAction}>
+          {actionLabel}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function EmptyBlock({ text }) {
+  return <div className="user-home-empty">{text}</div>;
+}
+
 export default function UserHome() {
   const navigate = useNavigate();
   const [q, setQ] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [feed, setFeed] = useState({
+    stats: {},
+    documents: [],
+    images: [],
+    videos: [],
+  });
 
-  const quickStats = useMemo(
+  const quickLinks = useMemo(
     () => [
-      { label: "Tra cứu nhanh", value: "Tìm theo câu hỏi hoặc từ khóa" },
-      { label: "Duyệt theo danh mục", value: "Lớp → Môn → Chủ đề → Bài" },
-      { label: "Lưu lại", value: "Giữ tài liệu quan trọng để xem lại" },
+      {
+        label: "Thư viện",
+        hint: "Duyệt theo lớp · môn · chủ đề · bài",
+        onClick: () => navigate("/user/library"),
+      },
+      {
+        label: "Tìm kiếm",
+        hint: "Gõ câu hỏi tự nhiên hoặc từ khóa",
+        onClick: () => navigate("/user/search"),
+      },
+      {
+        label: "Đã lưu",
+        hint: "Xem lại những nội dung quan trọng",
+        onClick: () => navigate("/user/saved"),
+      },
     ],
-    []
+    [navigate]
   );
+
+  async function loadFeed() {
+    try {
+      setLoading(true);
+      setError("");
+      const res = await getHomeFeed({ limit: 4 });
+      setFeed({
+        stats: res?.stats || {},
+        documents: Array.isArray(res?.documents) ? res.documents : [],
+        images: Array.isArray(res?.images) ? res.images : [],
+        videos: Array.isArray(res?.videos) ? res.videos : [],
+      });
+    } catch (e) {
+      setError(String(e?.message || e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadFeed();
+  }, []);
+
+  async function handleToggleSave(doc) {
+    try {
+      if (!doc?.chunkID) return;
+      const category = doc?.category || doc?.itemType || "document";
+      const res = await toggleSave(doc.chunkID, category);
+
+      setFeed((prev) => ({
+        ...prev,
+        documents: (prev.documents || []).map((item) =>
+          item.chunkID === doc.chunkID ? { ...item, isSaved: !!res.saved } : item
+        ),
+        images: (prev.images || []).map((item) =>
+          item.chunkID === doc.chunkID ? { ...item, isSaved: !!res.saved } : item
+        ),
+        videos: (prev.videos || []).map((item) =>
+          item.chunkID === doc.chunkID ? { ...item, isSaved: !!res.saved } : item
+        ),
+      }));
+    } catch (e) {
+      setError(String(e?.message || e));
+    }
+  }
 
   function goSearch(e) {
     e?.preventDefault?.();
-    const s = q.trim();
-    if (!s) return;
-    navigate(buildSearchUrl({ q: s }));
+    const value = q.trim();
+    if (!value) return;
+    navigate(buildSearchUrl({ q: value }));
   }
 
+  const stats = [
+    { label: "Tài liệu", value: feed?.stats?.documents ?? 0 },
+    { label: "Hình ảnh", value: feed?.stats?.images ?? 0 },
+    { label: "Video", value: feed?.stats?.videos ?? 0 },
+  ];
+
   return (
-    <div style={{ display: "grid", gap: 16 }}>
-      <div
-        className="page-header"
-        style={{
-          background: "linear-gradient(135deg, #0f172a 0%, #1d4ed8 55%, #38bdf8 100%)",
-          color: "#fff",
-          overflow: "hidden",
-          position: "relative",
-        }}
-      >
-        <div style={{ position: "absolute", inset: 0, opacity: 0.14, background: "radial-gradient(circle at top right, #ffffff 0, transparent 32%)" }} />
-        <div style={{ position: "relative", display: "grid", gridTemplateColumns: "minmax(0, 1.7fr) minmax(280px, 1fr)", gap: 20 }}>
-          <div>
-            <div style={{ fontSize: 13, fontWeight: 700, opacity: 0.9, letterSpacing: 0.3, marginBottom: 10 }}>KHO TÀI LIỆU NGƯỜI DÙNG</div>
-            <div style={{ fontSize: 30, fontWeight: 800, lineHeight: 1.2, marginBottom: 10 }}>Tra cứu, duyệt danh mục và lưu tài liệu ở cùng một nơi.</div>
-            <div style={{ maxWidth: 720, lineHeight: 1.7, color: "rgba(255,255,255,0.9)", marginBottom: 16 }}>
-              Bạn có thể tìm theo câu hỏi tự nhiên, mở nhanh các danh sách mẫu hoặc đi vào thư viện để chọn theo lớp, môn, chủ đề và bài học.
-            </div>
+    <div className="user-home-page">
+      <section className="user-home-hero">
+        <div className="user-home-hero-copy">
+          <div className="user-home-eyebrow">TRANG CHỦ HỌC LIỆU</div>
+          <h1>Tra cứu nhanh và mở ngay những nội dung đang có.</h1>
+          <p>
+            Toàn bộ tài liệu, hình ảnh và video mới nhất được gom ngay tại đây để bạn vào là thấy
+            ngay, không cần đi vòng qua nhiều màn hình.
+          </p>
 
-            <form onSubmit={goSearch} style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 14 }}>
-              <input
-                value={q}
-                onChange={(e) => setQ(e.target.value)}
-                placeholder="Ví dụ: cấu trúc dữ liệu hàng đợi, nghị luận xã hội, ôn tập hình học..."
-                style={{
-                  flex: "1 1 360px",
-                  height: 46,
-                  borderRadius: 14,
-                  border: "1px solid rgba(255,255,255,0.24)",
-                  background: "rgba(255,255,255,0.16)",
-                  color: "#fff",
-                  padding: "0 14px",
-                  outline: "none",
-                }}
-              />
-              <button className="btn" type="submit" style={{ height: 46, background: "#fff", color: "#0f172a", borderColor: "#fff" }}>
-                Tìm kiếm ngay
-              </button>
-              <button className="btn" type="button" style={{ height: 46, background: "transparent", color: "#fff", borderColor: "rgba(255,255,255,0.32)" }} onClick={() => navigate("/user/library")}>
-                Mở thư viện
-              </button>
-            </form>
+          <form className="user-home-search" onSubmit={goSearch}>
+            <input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Ví dụ: phần mềm máy tính, mạng máy tính, dữ liệu ảnh số..."
+            />
+            <button className="btn btn-primary" type="submit">
+              Tìm kiếm
+            </button>
+            <button className="btn" type="button" onClick={() => navigate("/user/library")}>
+              Mở thư viện
+            </button>
+          </form>
 
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              {["Tìm theo câu hỏi", "Có danh sách mẫu", "Lưu tài liệu 1 chạm"].map((item) => (
-                <span key={item} style={{ padding: "7px 10px", borderRadius: 999, background: "rgba(255,255,255,0.14)", border: "1px solid rgba(255,255,255,0.16)", fontSize: 12.5, fontWeight: 700 }}>
-                  {item}
-                </span>
-              ))}
-            </div>
-          </div>
-
-          <div style={{ display: "grid", gap: 10 }}>
-            {quickStats.map((item) => (
-              <div key={item.label} style={{ background: "rgba(255,255,255,0.12)", border: "1px solid rgba(255,255,255,0.16)", borderRadius: 16, padding: 14 }}>
-                <div style={{ fontSize: 12.5, opacity: 0.86, marginBottom: 6 }}>{item.label}</div>
-                <div style={{ fontSize: 16, fontWeight: 800 }}>{item.value}</div>
+          <div className="user-home-stat-row">
+            {stats.map((item) => (
+              <div key={item.label} className="user-home-stat-card">
+                <span>{item.label}</span>
+                <strong>{item.value}</strong>
               </div>
             ))}
           </div>
         </div>
-      </div>
 
-      <div className="page-header">
-        <div className="page-header-top">
-          <div className="title-row" style={{ justifyContent: "space-between", alignItems: "center" }}>
-            <div>
-              <div className="page-title">Danh sách gợi ý có sẵn</div>
-              <div className="breadcrumb">
-                <span className="crumb">User</span>
-                <span className="crumb">Trang chủ</span>
-                <span className="crumb">Gợi ý nhanh</span>
-              </div>
-            </div>
+        <div className="user-home-hero-side">
+          {quickLinks.map((item) => (
+            <button
+              key={item.label}
+              className="user-home-quick-link"
+              type="button"
+              onClick={item.onClick}
+            >
+              <strong>{item.label}</strong>
+              <span>{item.hint}</span>
+            </button>
+          ))}
+        </div>
+      </section>
+
+      {error ? <div className="user-home-inline-error">Lỗi: {error}</div> : null}
+
+      <section className="user-home-section-shell">
+        <SectionHeader
+          title="Tài liệu đang có"
+          subtitle="Các tài liệu mới cập nhật để mở nhanh từ trang chủ."
+          actionLabel="Xem thư viện"
+          onAction={() => navigate("/user/library")}
+        />
+
+        {loading && !feed.documents.length ? (
+          <EmptyBlock text="Đang tải danh sách tài liệu..." />
+        ) : null}
+
+        {!loading && !feed.documents.length ? (
+          <EmptyBlock text="Hiện chưa có tài liệu hiển thị trên trang chủ." />
+        ) : null}
+
+        <div className="user-home-card-list">
+          {feed.documents.map((doc) => (
+            <DocumentCard key={`doc-${doc.chunkID}`} doc={doc} onToggleSave={handleToggleSave} />
+          ))}
+        </div>
+      </section>
+
+      <section className="user-home-media-grid">
+        <div className="user-home-section-shell compact">
+          <SectionHeader
+            title="Hình ảnh sẵn có"
+            subtitle="Ảnh liên quan đã được đồng bộ và có thể mở trực tiếp."
+            actionLabel="Tìm ảnh"
+            onAction={() => navigate(buildSearchUrl({ q: "hình ảnh" }))}
+          />
+
+          {loading && !feed.images.length ? <EmptyBlock text="Đang tải ảnh..." /> : null}
+
+          {!loading && !feed.images.length ? (
+            <EmptyBlock text="Hiện chưa có hình ảnh hiển thị." />
+          ) : null}
+
+          <div className="user-home-card-list small">
+            {feed.images.map((doc) => (
+              <DocumentCard key={`img-${doc.chunkID}`} doc={doc} onToggleSave={handleToggleSave} />
+            ))}
           </div>
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(250px, 1fr))", gap: 14 }}>
-          {HOME_PRESETS.map((preset) => (
-            <div key={preset.id} style={{ border: "1px solid #dbeafe", background: "linear-gradient(180deg, #f8fbff 0%, #ffffff 100%)", borderRadius: 18, padding: 16, display: "grid", gap: 12 }}>
-              <div>
-                <div style={{ fontSize: 18, fontWeight: 800, color: "#0f172a", marginBottom: 8 }}>{preset.title}</div>
-                <div style={{ color: "#475569", lineHeight: 1.6 }}>{preset.description}</div>
-              </div>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                {preset.chips.map((chip) => (
-                  <span key={chip} className="crumb">
-                    {chip}
-                  </span>
-                ))}
-              </div>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                <button className="btn btn-primary" type="button" onClick={() => navigate(`/user/library?preset=${encodeURIComponent(preset.libraryPresetId)}`)}>
-                  Mở danh sách này
-                </button>
-                <button className="btn" type="button" onClick={() => navigate(buildSearchUrl({ q: preset.searchQuery }))}>
-                  Tìm tương tự
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
+        <div className="user-home-section-shell compact">
+          <SectionHeader
+            title="Video sẵn có"
+            subtitle="Video học liệu đang có trong hệ thống."
+            actionLabel="Tìm video"
+            onAction={() => navigate(buildSearchUrl({ q: "video" }))}
+          />
 
-      <div className="table-wrapper" style={{ padding: 18 }}>
-        <div style={{ color: "#475569", lineHeight: 1.75 }}>
-          <div style={{ fontWeight: 800, color: "#0f172a", marginBottom: 10 }}>Luồng dùng gọn nhất</div>
-          <div>1. Chọn một danh sách mẫu để vào nhanh.</div>
-          <div>2. Nếu cần chính xác hơn, sang <b>Danh sách</b> để duyệt theo lớp → môn → chủ đề → bài.</div>
-          <div>3. Khi gặp tài liệu quan trọng, dùng nút <b>Lưu</b> để xem lại trong mục <b>Đã lưu</b>.</div>
+          {loading && !feed.videos.length ? <EmptyBlock text="Đang tải video..." /> : null}
+
+          {!loading && !feed.videos.length ? (
+            <EmptyBlock text="Hiện chưa có video hiển thị." />
+          ) : null}
+
+          <div className="user-home-card-list small">
+            {feed.videos.map((doc) => (
+              <DocumentCard
+                key={`video-${doc.chunkID}`}
+                doc={doc}
+                onToggleSave={handleToggleSave}
+              />
+            ))}
+          </div>
         </div>
-      </div>
+      </section>
     </div>
   );
 }

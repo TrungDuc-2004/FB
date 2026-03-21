@@ -57,9 +57,9 @@
   display: grid;
   place-items: center;
   overflow: hidden;
-  background: linear-gradient(135deg, #dff5ea 0%, #f7faf8 100%);
-  color: #116149;
-  border: 1px solid rgba(17, 97, 73, 0.12);
+  background: linear-gradient(135deg, var(--brand-primary-soft) 0%, #ffffff 100%);
+  color: var(--brand-primary);
+  border: 1px solid rgba(18, 72, 116, 0.14);
   font-size: 34px;
   font-weight: 800;
 }
@@ -97,12 +97,12 @@
 
 .user-profile-status.active {
   background: #dcfce7;
-  color: #166534;
+  color: var(--brand-primary);
 }
 
 .user-profile-status.inactive {
   background: #fee2e2;
-  color: #991b1b;
+  color: var(--brand-highlight);
 }
 
 .user-profile-avatar-actions {
@@ -132,19 +132,19 @@
 .user-profile-secondary-btn:hover,
 .user-profile-ghost-btn:hover {
   background: #f8fafc;
-  border-color: rgba(17, 97, 73, 0.18);
+  border-color: rgba(18, 72, 116, 0.18);
   transform: translateY(-1px);
 }
 
 .user-profile-primary-btn {
-  background: #2563eb;
-  border-color: #2563eb;
+  background: var(--brand-primary);
+  border-color: var(--brand-primary);
   color: #fff;
 }
 
 .user-profile-primary-btn:hover {
-  background: #1d4ed8;
-  border-color: #1d4ed8;
+  background: var(--brand-primary-dark);
+  border-color: var(--brand-primary-dark);
   transform: translateY(-1px);
 }
 
@@ -214,13 +214,13 @@
 .user-profile-message.error {
   background: #fef2f2;
   border: 1px solid #fecaca;
-  color: #991b1b;
+  color: var(--brand-highlight);
 }
 
 .user-profile-message.success {
   background: #f0fdf4;
   border: 1px solid #bbf7d0;
-  color: #166534;
+  color: var(--brand-primary);
 }
 
 .user-profile-actions {

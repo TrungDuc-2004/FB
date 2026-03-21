@@ -1,6 +1,12 @@
 :root {
   --app-font: "Segoe UI", Inter, Roboto, Arial, sans-serif;
   --heading-font: var(--app-font);
+  --brand-primary: #124874;
+  --brand-primary-dark: #102a44;
+  --brand-primary-soft: #e8f0f7;
+  --brand-primary-border: #b9cde0;
+  --brand-highlight: #cf373d;
+  --brand-highlight-soft: #fde9ea;
 
   color-scheme: light;
   font-family: var(--app-font);
@@ -76,11 +82,11 @@ button {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #dbeafe;
-  color: #1d4ed8;
+  background: var(--brand-primary-soft);
+  color: var(--brand-primary);
   font-size: 28px;
   font-weight: 800;
-  border: 1px solid #bfdbfe;
+  border: 1px solid var(--brand-primary-border);
 }
 
 .user-doc-preview-link {
@@ -118,7 +124,7 @@ button {
 }
 
 .user-doc-card-title.link:hover {
-  color: #1d4ed8;
+  color: var(--brand-primary);
 }
 
 .user-doc-card-badges {
@@ -135,7 +141,7 @@ button {
   padding: 5px 10px;
   border-radius: 999px;
   background: #eff6ff;
-  color: #1d4ed8;
+  color: var(--brand-primary);
   font-size: 12px;
   font-weight: 700;
 }
@@ -220,7 +226,7 @@ button {
 }
 
 .user-doc-media-block-title span {
-  color: #1d4ed8;
+  color: var(--brand-primary);
 }
 
 .user-doc-media-block-list {
@@ -241,8 +247,8 @@ button {
 }
 
 .user-doc-media-chip:hover {
-  border-color: #93c5fd;
-  color: #1d4ed8;
+  border-color: var(--brand-primary-border);
+  color: var(--brand-primary);
 }
 
 .user-doc-view-shell {
@@ -319,8 +325,8 @@ button {
 }
 
 .user-doc-related-link:hover {
-  border-color: #93c5fd;
-  color: #1d4ed8;
+  border-color: var(--brand-primary-border);
+  color: var(--brand-primary);
 }
 
 .user-doc-empty {
@@ -366,23 +372,23 @@ button {
 }
 
 .btn:hover {
-  border-color: #93c5fd;
-  color: #1d4ed8;
+  border-color: var(--brand-primary-border);
+  color: var(--brand-primary);
 }
 
 .btn-primary {
-  background: #2563eb;
+  background: var(--brand-primary);
   color: #fff;
-  border-color: #2563eb;
+  border-color: var(--brand-primary);
 }
 
 .btn-primary:hover {
   color: #fff;
-  background: #1d4ed8;
-  border-color: #1d4ed8;
+  background: var(--brand-primary-dark);
+  border-color: var(--brand-primary);
 }
 .user-doc-inline-meta.is-link:hover {
-  border-color: #93c5fd;
+  border-color: var(--brand-primary-border);
 }
 
 .user-doc-inline-meta-value-link {
@@ -391,7 +397,7 @@ button {
 }
 
 .user-doc-inline-meta-value-link:hover {
-  color: #1d4ed8;
+  color: var(--brand-primary);
 }
 
 .user-doc-mapping-preview {
@@ -427,8 +433,8 @@ button {
 }
 
 .user-doc-mapping-chip:hover {
-  color: #1d4ed8;
-  border-color: #93c5fd;
+  color: var(--brand-primary);
+  border-color: var(--brand-primary-border);
 }
 
 .user-doc-mapping-chip-muted {
@@ -443,7 +449,7 @@ button {
 .user-doc-card-search-list:hover,
 .user-doc-card-search-grid:hover {
   transform: translateY(-2px);
-  border-color: rgba(17, 97, 73, 0.18);
+  border-color: rgba(18, 72, 116, 0.18);
   box-shadow: 0 22px 34px rgba(15, 23, 42, 0.08);
 }
 
@@ -899,25 +905,6 @@ button {
 .doc-side-meta-list strong {
   color: #101828;
   font-size: 15px;
-}
-
-.doc-keyword-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.doc-keyword-chip {
-  display: inline-flex;
-  align-items: center;
-  min-height: 30px;
-  padding: 0 12px;
-  border-radius: 999px;
-  background: #eef4ff;
-  border: 1px solid #d0d5dd;
-  color: #1d2939;
-  font-size: 13px;
-  font-weight: 600;
 }
 
 .doc-viewer-panel {

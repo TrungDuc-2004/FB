@@ -35,33 +35,152 @@ function safeText(...values) {
   return "";
 }
 
-function buildHierarchy(doc) {
-  return [
-    doc?.lesson?.lessonID
-      ? {
-          kind: "lesson",
-          id: doc.lesson.lessonID,
-          title: safeText(doc?.lesson?.lessonName, doc?.lesson?.lessonID),
-          subtitle: "Bài học",
-        }
-      : null,
-    doc?.topic?.topicID
-      ? {
-          kind: "topic",
-          id: doc.topic.topicID,
-          title: safeText(doc?.topic?.topicName, doc?.topic?.topicID),
-          subtitle: "Chủ đề",
-        }
-      : null,
-    doc?.subject?.subjectID
-      ? {
-          kind: "subject",
-          id: doc.subject.subjectID,
-          title: safeText(doc?.subject?.subjectName, doc?.subject?.subjectID),
-          subtitle: "Môn học",
-        }
-      : null,
-  ].filter(Boolean);
+function normalizeText(value = "") {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+function looksLikeRawId(value = "") {
+  const text = safeText(value);
+  if (!text) return false;
+  return /^(TH\d{1,2}(?:[-_][A-Z0-9]+)+|[A-Z]{2,}\d*(?:[-_][A-Z0-9]+)+)$/i.test(text);
+}
+
+function extractSuffixNumber(value = "", key = "") {
+  const text = String(value || "").toUpperCase();
+  if (!text || !key) return "";
+  const match = text.match(new RegExp(`(?:^|[_-])${key}(\\d+)`, "i"));
+  return match?.[1] || "";
+}
+
+function humanizeChunkType(value = "") {
+  const text = normalizeText(value);
+  if (!text) return "—";
+  if (text.includes("ly thuyet")) return "Lý thuyết";
+  if (text.includes("bai tap")) return "Bài tập";
+  if (text.includes("thuc hanh")) return "Thực hành";
+  if (text === "lesson") return "Bài học";
+  if (text === "topic") return "Chủ đề";
+  if (text === "subject") return "Môn học";
+  if (text === "class") return "Lớp";
+  return safeText(value, "—");
+}
+
+function formatClassName(classInfo = {}) {
+  const rawName = safeText(classInfo?.className);
+  const rawId = safeText(classInfo?.classID);
+  if (rawName && normalizeText(rawName) !== normalizeText(rawId) && !looksLikeRawId(rawName)) {
+    return rawName;
+  }
+  const num = extractSuffixNumber(rawId || rawName, "TH");
+  return num ? `Lớp ${num}` : safeText(rawName, rawId, "—");
+}
+
+function formatSubjectName(subjectInfo = {}) {
+  const rawName = safeText(subjectInfo?.subjectName);
+  const rawId = safeText(subjectInfo?.subjectID, rawName);
+
+  if (rawName && normalizeText(rawName) !== normalizeText(rawId) && !looksLikeRawId(rawName)) {
+    return rawName;
+  }
+
+  const match = String(rawId || "").toUpperCase().match(/^TH(\d{1,2})(?:-(UD|KHMT))?$/i);
+  if (!match) return safeText(rawName, rawId, "—");
+
+  const grade = match[1];
+  const branch = (match[2] || "").toUpperCase();
+  if (branch === "UD") return `Tin học ${grade} - Ứng dụng`;
+  if (branch === "KHMT") return `Tin học ${grade} - Khoa học máy tính`;
+  return `Tin học ${grade}`;
+}
+
+function formatTopicName(topicInfo = {}) {
+  const rawName = safeText(topicInfo?.topicName);
+  const rawId = safeText(topicInfo?.topicID, rawName);
+
+  if (rawName && normalizeText(rawName) !== normalizeText(rawId) && !looksLikeRawId(rawName)) {
+    return rawName;
+  }
+
+  const num = extractSuffixNumber(rawId || rawName, "CD") || extractSuffixNumber(rawId || rawName, "T");
+  return num ? `Chủ đề ${num}` : safeText(rawName, rawId, "—");
+}
+
+function formatLessonName(lessonInfo = {}) {
+  const rawName = safeText(lessonInfo?.lessonName);
+  const rawId = safeText(lessonInfo?.lessonID, rawName);
+
+  if (rawName && normalizeText(rawName) !== normalizeText(rawId) && !looksLikeRawId(rawName)) {
+    return rawName;
+  }
+
+  const num = extractSuffixNumber(rawId || rawName, "B");
+  return num ? `Bài ${num}` : safeText(rawName, rawId, "—");
+}
+
+function formatChunkName(doc = {}) {
+  const rawName = safeText(doc?.chunkName);
+  const rawId = safeText(doc?.chunkID, rawName);
+
+  if (rawName && normalizeText(rawName) !== normalizeText(rawId) && !looksLikeRawId(rawName)) {
+    return rawName;
+  }
+
+  const lessonLabel = formatLessonName(doc?.lesson || {});
+  const chunkNum = extractSuffixNumber(rawId || rawName, "C");
+  if (lessonLabel !== "—" && chunkNum) return `${lessonLabel} · Mục ${chunkNum}`;
+  if (chunkNum) return `Mục ${chunkNum}`;
+  return safeText(rawName, rawId, "Chi tiết tài liệu");
+}
+
+function getCurrentTitle(doc = {}, itemType = "document", fallbackId = "") {
+  switch (itemType) {
+    case "subject":
+      return formatSubjectName({ subjectID: doc?.chunkID, subjectName: doc?.chunkName || doc?.subject?.subjectName });
+    case "topic":
+      return formatTopicName({ topicID: doc?.chunkID, topicName: doc?.chunkName || doc?.topic?.topicName });
+    case "lesson":
+      return formatLessonName({ lessonID: doc?.chunkID, lessonName: doc?.chunkName || doc?.lesson?.lessonName });
+    case "class":
+      return formatClassName({ classID: doc?.chunkID, className: doc?.chunkName || doc?.class?.className });
+    case "chunk":
+    case "document":
+      return formatChunkName(doc);
+    default:
+      return safeText(doc?.chunkName, doc?.chunkID, fallbackId, "Chi tiết tài liệu");
+  }
+}
+
+function getResolvedItemType(doc = {}, currentType = "document") {
+  const raw = String(doc?.itemType || currentType || "document").toLowerCase();
+  return raw === "document" ? "chunk" : raw;
+}
+
+function buildHierarchy(doc = {}, itemType = "chunk") {
+  const items = [];
+  const addItem = (kind, id, title, subtitle) => {
+    const safeId = safeText(id);
+    const safeTitle = safeText(title);
+    if (!safeId || !safeTitle) return;
+    items.push({ kind, id: safeId, title: safeTitle, subtitle });
+  };
+
+  if (itemType === "chunk") {
+    addItem("lesson", doc?.lesson?.lessonID, formatLessonName(doc?.lesson), "Bài học");
+  }
+
+  if (itemType === "chunk" || itemType === "lesson") {
+    addItem("topic", doc?.topic?.topicID, formatTopicName(doc?.topic), "Chủ đề");
+  }
+
+  if (itemType === "chunk" || itemType === "lesson" || itemType === "topic") {
+    addItem("subject", doc?.subject?.subjectID, formatSubjectName(doc?.subject), "Môn học");
+  }
+
+  return items;
 }
 
 function buildMedia(doc) {
@@ -88,6 +207,71 @@ function buildMedia(doc) {
     : [];
 
   return [...images, ...videos];
+}
+
+function buildKeywords(doc = {}) {
+  const rawKeywords = [
+    ...(Array.isArray(doc?.keywords) ? doc.keywords : []),
+    ...(Array.isArray(doc?.keywordItems)
+      ? doc.keywordItems.map((item) => item?.keywordName || item?.keyword_name || item?.name || item?.keyword)
+      : []),
+  ];
+
+  const seen = new Set();
+  return rawKeywords
+    .map((item) => safeText(item))
+    .filter((item) => {
+      if (!item) return false;
+      const key = normalizeText(item);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function buildInfoRows(doc = {}, itemType = "chunk") {
+  const className = formatClassName(doc?.class);
+  const subjectName = formatSubjectName(doc?.subject);
+  const topicName = formatTopicName(doc?.topic);
+  const lessonName = formatLessonName(doc?.lesson);
+  const currentTitle = getCurrentTitle(doc, itemType, doc?.chunkID);
+
+  if (itemType === "lesson") {
+    return [
+      { label: "Tên bài học", value: currentTitle },
+      { label: "Bài", value: lessonName },
+      { label: "Chủ đề", value: topicName },
+      { label: "Sách", value: subjectName },
+    ];
+  }
+
+  if (itemType === "topic") {
+    return [
+      { label: "Tên chủ đề", value: currentTitle },
+      { label: "Chủ đề", value: topicName },
+      { label: "Sách", value: subjectName },
+      { label: "Lớp", value: className },
+    ];
+  }
+
+  if (itemType === "subject") {
+    return [
+      { label: "Tên sách", value: currentTitle },
+      { label: "Lớp", value: className },
+    ];
+  }
+
+  if (itemType === "class") {
+    return [{ label: "Lớp", value: currentTitle }];
+  }
+
+  return [
+    { label: "Loại", value: humanizeChunkType(doc?.chunkType || itemType) },
+    { label: "Lớp", value: className },
+    { label: "Sách", value: subjectName },
+    { label: "Chủ đề", value: topicName },
+    { label: "Bài học", value: lessonName },
+  ];
 }
 
 export default function UserDocDetail() {
@@ -131,8 +315,8 @@ export default function UserDocDetail() {
     }
   }
 
-  const itemType = String(doc?.itemType || currentType || "document").toLowerCase();
-  const mappedFallbackUrl = Array.isArray(doc?.mappedDocuments) && ["chunk", "document", "image", "video"].includes(itemType)
+  const itemType = getResolvedItemType(doc, currentType);
+  const mappedFallbackUrl = Array.isArray(doc?.mappedDocuments) && ["chunk", "image", "video"].includes(itemType)
     ? doc.mappedDocuments.find((item) => item?.chunkUrl)?.chunkUrl || ""
     : "";
 
@@ -140,7 +324,7 @@ export default function UserDocDetail() {
   const viewUrl = view?.viewUrl || originalUrl;
   const ext = useMemo(() => getExt(viewUrl || originalUrl), [viewUrl, originalUrl]);
   const kindLabel = useMemo(() => getTypeLabel(doc?.itemType || currentType), [doc, currentType]);
-  const title = safeText(doc?.chunkName, doc?.chunkID, chunkID, "Chi tiết tài liệu");
+  const title = getCurrentTitle(doc || {}, itemType, chunkID);
   const description = safeText(
     doc?.chunkDescription,
     doc?.lesson?.lessonDescription,
@@ -154,8 +338,11 @@ export default function UserDocDetail() {
   const canVideo = ["mp4", "webm", "ogg"].includes(ext);
   const isClass = itemType === "class";
 
-  const hierarchyItems = buildHierarchy(doc || {});
+  const hierarchyItems = buildHierarchy(doc || {}, itemType);
   const mediaItems = buildMedia(doc || {});
+  const keywords = buildKeywords(doc || {});
+  const infoRows = buildInfoRows(doc || {}, itemType).filter((row) => safeText(row?.value) && row.value !== "—");
+  const showKeywords = itemType === "chunk" && keywords.length > 0;
 
   if (loading) return <div className="user-doc-empty">Đang tải chi tiết tài liệu...</div>;
   if (error) return <div className="user-doc-empty">{error}</div>;
@@ -191,12 +378,26 @@ export default function UserDocDetail() {
           <div className="doc-side-section">
             <h3>Thông tin</h3>
             <div className="doc-side-meta-list">
-              <div><span>ID</span><strong>{doc?.chunkID || "—"}</strong></div>
-              <div><span>Loại</span><strong>{doc?.chunkType || kindLabel}</strong></div>
-              <div><span>Lớp</span><strong>{doc?.class?.className || doc?.class?.classID || "—"}</strong></div>
-              <div><span>Môn</span><strong>{doc?.subject?.subjectName || doc?.subject?.subjectID || "—"}</strong></div>
-              <div><span>Chủ đề</span><strong>{doc?.topic?.topicName || doc?.topic?.topicID || "—"}</strong></div>
-              <div><span>Bài</span><strong>{doc?.lesson?.lessonName || doc?.lesson?.lessonID || "—"}</strong></div>
+              {infoRows.map((row) => (
+                <div key={row.label}>
+                  <span>{row.label}</span>
+                  <strong>{row.value}</strong>
+                </div>
+              ))}
+              {itemType === "chunk" ? (
+                <div>
+                  <span>Keyword</span>
+                  {showKeywords ? (
+                    <div className="doc-keyword-list">
+                      {keywords.map((keyword) => (
+                        <span key={keyword} className="doc-keyword-chip">{keyword}</span>
+                      ))}
+                    </div>
+                  ) : (
+                    <strong>Chưa có keyword</strong>
+                  )}
+                </div>
+              ) : null}
             </div>
           </div>
         </aside>
@@ -232,7 +433,7 @@ export default function UserDocDetail() {
 
         <aside className="doc-side-card doc-side-right">
           <div className="doc-side-section">
-            <h3>Lesson · Topic · Subject</h3>
+            <h3>Tài liệu liên quan</h3>
             <div className="doc-related-list hierarchy-only">
               {hierarchyItems.length ? (
                 hierarchyItems.map((item) => (
@@ -242,7 +443,7 @@ export default function UserDocDetail() {
                   </Link>
                 ))
               ) : (
-                <div className="doc-related-empty">Chưa có lesson, topic hoặc subject liên quan.</div>
+                <div className="doc-related-empty">Chưa có mục liên quan để hiển thị.</div>
               )}
             </div>
           </div>

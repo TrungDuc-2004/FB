@@ -131,6 +131,13 @@ export function listChunks({
   return httpJson(url.toString(), { method: "GET" });
 }
 
+export function getHomeFeed({ limit = 6 } = {}) {
+  const url = new URL(`${API_BASE}/user/docs/home`);
+  url.searchParams.set("limit", String(limit));
+  url.searchParams.set("_ts", String(Date.now()));
+  return httpJson(url.toString(), { method: "GET" });
+}
+
 export function searchDocs({
   q = "",
   classID = "",

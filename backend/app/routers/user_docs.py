@@ -23,6 +23,7 @@ from ..services.mongo_client import get_mongo_client
 from ..services.neo_client import get_neo4j_session
 from ..services.postgre_client import get_db
 from ..services.user_semantic_search import semantic_search
+from ..services.postgre_media_sync import _media_id_from_map_id
 
 router = APIRouter(prefix="/user/docs", tags=["UserDocs"])
 
@@ -122,6 +123,53 @@ def _pretty_class_name(doc: dict) -> str:
 def _sort_key_by_number(s: str):
     m = re.search(r"(\d{1,2})", str(s or ""))
     return (int(m.group(1)) if m else 999, str(s or ""))
+
+
+def _home_sort_spec(name_field: str):
+    return [("updatedAt", -1), ("createdAt", -1), (name_field, 1)]
+
+
+def _load_home_bucket_docs(*, username: str, limit: int) -> list[dict]:
+    cur = db_mongo[COL_CHUNKS].find({"status": _not_hidden_q()}, {"_id": 0}).sort(_home_sort_spec("chunkName")).limit(max(limit * 3, limit))
+    items: list[dict] = []
+    seen: set[str] = set()
+    for raw in cur:
+        chunk_id = str(_get_any(raw, ["chunkID", "chunkId", "chunk_id"], "") or "").strip()
+        if not chunk_id or chunk_id in seen:
+            continue
+        seen.add(chunk_id)
+        items.append(_get_chunk_full(raw, category="document", username=username))
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _load_home_bucket_media(*, kind: str, username: str, limit: int, pg: Optional[Session]) -> list[dict]:
+    collection = COL_IMAGES if kind == "image" else COL_VIDEOS
+    name_keys = ["imgName", "name", "title"] if kind == "image" else ["videoName", "name", "title"]
+    cur = db_mongo[collection].find({"status": _not_hidden_q()}, {"_id": 0}).sort(_home_sort_spec(name_keys[0])).limit(max(limit * 4, limit))
+
+    items: list[dict] = []
+    seen: set[str] = set()
+    for raw in cur:
+        entity_id = str(_get_any(raw, [f"{kind}ID", f"{kind}Id", f"{kind}_id"], "") or "").strip()
+        if not entity_id:
+            map_id = str(_get_any(raw, ["mapID", "mapId", "map_id"], "") or "").strip()
+            if map_id:
+                try:
+                    entity_id = _media_id_from_map_id(map_id)
+                except Exception:
+                    entity_id = ""
+        if not entity_id or entity_id in seen:
+            continue
+        doc = _resolve_entity_doc(entity_id, category=kind, username=username, pg=pg)
+        if not doc:
+            continue
+        seen.add(entity_id)
+        items.append(doc)
+        if len(items) >= limit:
+            break
+    return items
 
 
 def _ensure_user_indexes():
@@ -1016,6 +1064,31 @@ def _attach_related_media(doc: dict, *, pg: Optional[Session]) -> dict:
     doc["videos"] = videos
     doc["mediaStats"] = {"totalImages": len(images), "totalVideos": len(videos)}
     return doc
+
+
+@router.get("/home")
+def list_home_feed(
+    request: Request,
+    limit: int = Query(6, ge=1, le=24),
+    pg: Session = Depends(get_db),
+):
+    username = _actor(request)
+    docs = _load_home_bucket_docs(username=username, limit=limit)
+    images = _load_home_bucket_media(kind="image", username=username, limit=limit, pg=pg)
+    videos = _load_home_bucket_media(kind="video", username=username, limit=limit, pg=pg)
+
+    stats = {
+        "documents": db_mongo[COL_CHUNKS].count_documents({"status": _not_hidden_q()}),
+        "images": db_mongo[COL_IMAGES].count_documents({"status": _not_hidden_q()}),
+        "videos": db_mongo[COL_VIDEOS].count_documents({"status": _not_hidden_q()}),
+    }
+
+    return {
+        "stats": stats,
+        "documents": docs,
+        "images": images,
+        "videos": videos,
+    }
 
 
 @router.get("/classes")
