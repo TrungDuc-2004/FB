@@ -16,7 +16,7 @@ from .gemini_topic_expander import expand_topic_keywords_debug
 from .keyword_embedding import embed_keyword_cached
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
-_SERVICE_VERSION = "search_hierarchical_keyword_neo4j_graph_gate_v6_alias_safe"
+_SERVICE_VERSION = "search_hierarchical_keyword_neo4j_branch_gate_v7_exact_pg_id"
 _LABEL_RE = re.compile(
     r"(?P<class>\b(?:lớp|lop|class)\b)|"
     r"(?P<topic>\b(?:chủ\s*đề|chu\s*de|topic)\b)|"
@@ -131,10 +131,11 @@ def _norm_keyword_text(text: str) -> str:
 
 
 def _entity_alias_key(*values: str) -> str:
-    merged = " ".join(str(value or "") for value in values if str(value or "").strip())
-    merged = _strip_accents(merged).upper()
-    merged = re.sub(r"[^0-9A-Z]+", "", merged)
-    return merged
+    for value in values:
+        clean = str(value or "").strip()
+        if clean:
+            return clean.upper()
+    return ""
 
 
 def _alias_list_for_value(value: str) -> List[str]:
@@ -147,12 +148,9 @@ def _alias_map_for_rows(rows: List[dict], *, id_key: str, name_key: str) -> Tupl
     ids_by_alias: Dict[str, List[str]] = defaultdict(list)
     for row in rows:
         row_id = str(row.get(id_key) or "").strip()
-        row_name = str(row.get(name_key) or "").strip()
         if not row_id:
             continue
-        alias = _entity_alias_key(row_id, row_name) or _entity_alias_key(row_id) or _entity_alias_key(row_name)
-        if not alias:
-            alias = row_id
+        alias = _entity_alias_key(row_id)
         alias_by_id[row_id] = alias
         bucket = ids_by_alias.setdefault(alias, [])
         if row_id not in bucket:
@@ -166,8 +164,7 @@ def _filter_rows_by_alias(rows: List[dict], *, id_key: str, name_key: str, allow
     out: List[dict] = []
     for row in rows:
         row_id = str(row.get(id_key) or "").strip()
-        row_name = str(row.get(name_key) or "").strip()
-        alias = _entity_alias_key(row_id, row_name) or _entity_alias_key(row_id) or _entity_alias_key(row_name)
+        alias = _entity_alias_key(row_id)
         if alias in allowed_aliases:
             out.append(row)
     return out
@@ -419,15 +416,13 @@ def _load_media_map_for_targets(*, pg: Session, mongo_db, targets: List[tuple[st
 def _load_topic_rows_neo(*, neo, class_id: str, subject_id: str, topic_id: str) -> Tuple[List[dict], Optional[str]]:
     if neo is None:
         return [], "neo_session_unavailable"
-    subject_aliases = _alias_list_for_value(subject_id)
-    topic_aliases = _alias_list_for_value(topic_id)
     try:
         records = neo.run(
             """
             MATCH (class:Class)-[:HAS_SUBJECT]->(subject:Subject)-[:HAS_TOPIC]->(topic:Topic)
             WHERE ($class_id = '' OR class.pg_id = $class_id)
-              AND ($subject_aliases IS NULL OR size($subject_aliases) = 0 OR toUpper(replace(replace(replace(coalesce(subject.pg_id, ''), '-', ''), '_', ''), ' ', '')) IN $subject_aliases OR toUpper(replace(replace(replace(coalesce(subject.name, ''), '-', ''), '_', ''), ' ', '')) IN $subject_aliases)
-              AND ($topic_aliases IS NULL OR size($topic_aliases) = 0 OR toUpper(replace(replace(replace(coalesce(topic.pg_id, ''), '-', ''), '_', ''), ' ', '')) IN $topic_aliases OR toUpper(replace(replace(replace(coalesce(topic.name, ''), '-', ''), '_', ''), ' ', '')) IN $topic_aliases)
+              AND ($subject_id = '' OR subject.pg_id = $subject_id)
+              AND ($topic_id = '' OR topic.pg_id = $topic_id)
             RETURN topic.pg_id AS topic_id,
                    coalesce(topic.topic_name, topic.name, topic.pg_id) AS topic_name,
                    topic.topic_number AS topic_number,
@@ -438,8 +433,8 @@ def _load_topic_rows_neo(*, neo, class_id: str, subject_id: str, topic_id: str) 
             ORDER BY class.pg_id, subject.pg_id, topic.topic_number, topic.pg_id
             """,
             class_id=(class_id or "").strip(),
-            subject_aliases=subject_aliases,
-            topic_aliases=topic_aliases,
+            subject_id=(subject_id or "").strip(),
+            topic_id=(topic_id or "").strip(),
         )
         rows: List[dict] = []
         for r in records:
@@ -464,9 +459,6 @@ def _load_lesson_rows_neo(*, neo, class_id: str, subject_id: str, topic_ids: Opt
     if neo is None:
         return [], "neo_session_unavailable"
     clean_topic_ids = _dedupe_keep_order_ids(topic_ids or []) if topic_ids is not None else None
-    topic_aliases = _dedupe_keep_order_ids([alias for topic_id in (clean_topic_ids or []) for alias in _alias_list_for_value(topic_id)]) if clean_topic_ids is not None else None
-    subject_aliases = _alias_list_for_value(subject_id)
-    lesson_aliases = _alias_list_for_value(lesson_id)
     if topic_ids is not None and clean_topic_ids is not None and not clean_topic_ids:
         return [], None
     try:
@@ -474,9 +466,9 @@ def _load_lesson_rows_neo(*, neo, class_id: str, subject_id: str, topic_ids: Opt
             """
             MATCH (class:Class)-[:HAS_SUBJECT]->(subject:Subject)-[:HAS_TOPIC]->(topic:Topic)-[:HAS_LESSON]->(lesson:Lesson)
             WHERE ($class_id = '' OR class.pg_id = $class_id)
-              AND ($subject_aliases IS NULL OR size($subject_aliases) = 0 OR toUpper(replace(replace(replace(coalesce(subject.pg_id, ''), '-', ''), '_', ''), ' ', '')) IN $subject_aliases OR toUpper(replace(replace(replace(coalesce(subject.name, ''), '-', ''), '_', ''), ' ', '')) IN $subject_aliases)
-              AND ($topic_aliases IS NULL OR size($topic_aliases) = 0 OR toUpper(replace(replace(replace(coalesce(topic.pg_id, ''), '-', ''), '_', ''), ' ', '')) IN $topic_aliases OR toUpper(replace(replace(replace(coalesce(topic.name, ''), '-', ''), '_', ''), ' ', '')) IN $topic_aliases)
-              AND ($lesson_aliases IS NULL OR size($lesson_aliases) = 0 OR toUpper(replace(replace(replace(coalesce(lesson.pg_id, ''), '-', ''), '_', ''), ' ', '')) IN $lesson_aliases OR toUpper(replace(replace(replace(coalesce(lesson.name, ''), '-', ''), '_', ''), ' ', '')) IN $lesson_aliases)
+              AND ($subject_id = '' OR subject.pg_id = $subject_id)
+              AND ($topic_ids IS NULL OR size($topic_ids) = 0 OR topic.pg_id IN $topic_ids)
+              AND ($lesson_id = '' OR lesson.pg_id = $lesson_id)
             RETURN lesson.pg_id AS lesson_id,
                    coalesce(lesson.lesson_name, lesson.name, lesson.pg_id) AS lesson_name,
                    lesson.lesson_number AS lesson_number,
@@ -487,12 +479,12 @@ def _load_lesson_rows_neo(*, neo, class_id: str, subject_id: str, topic_ids: Opt
                    coalesce(subject.name, subject.pg_id) AS subject_name,
                    class.pg_id AS class_id,
                    coalesce(class.name, class.pg_id) AS class_name
-            ORDER BY class.pg_id, subject.pg_id, topic.topic_number, lesson.lesson_number, lesson.pg_id
+            ORDER BY class.pg_id, subject.pg_id, topic.topic_number, topic.pg_id, lesson.lesson_number, lesson.pg_id
             """,
             class_id=(class_id or "").strip(),
-            subject_aliases=subject_aliases,
-            topic_aliases=topic_aliases,
-            lesson_aliases=lesson_aliases,
+            subject_id=(subject_id or "").strip(),
+            topic_ids=clean_topic_ids,
+            lesson_id=(lesson_id or "").strip(),
         )
         rows: List[dict] = []
         for r in records:
@@ -521,9 +513,6 @@ def _load_chunk_rows_neo(*, neo, class_id: str, subject_id: str, topic_ids: Opti
         return [], "neo_session_unavailable"
     clean_topic_ids = _dedupe_keep_order_ids(topic_ids or []) if topic_ids is not None else None
     clean_lesson_ids = _dedupe_keep_order_ids(lesson_ids or []) if lesson_ids is not None else None
-    topic_aliases = _dedupe_keep_order_ids([alias for topic_id in (clean_topic_ids or []) for alias in _alias_list_for_value(topic_id)]) if clean_topic_ids is not None else None
-    lesson_aliases = _dedupe_keep_order_ids([alias for lesson_id in (clean_lesson_ids or []) for alias in _alias_list_for_value(lesson_id)]) if clean_lesson_ids is not None else None
-    subject_aliases = _alias_list_for_value(subject_id)
     if topic_ids is not None and clean_topic_ids is not None and not clean_topic_ids:
         return [], None
     if lesson_ids is not None and clean_lesson_ids is not None and not clean_lesson_ids:
@@ -533,9 +522,9 @@ def _load_chunk_rows_neo(*, neo, class_id: str, subject_id: str, topic_ids: Opti
             """
             MATCH (class:Class)-[:HAS_SUBJECT]->(subject:Subject)-[:HAS_TOPIC]->(topic:Topic)-[:HAS_LESSON]->(lesson:Lesson)-[:HAS_CHUNK]->(chunk:Chunk)
             WHERE ($class_id = '' OR class.pg_id = $class_id)
-              AND ($subject_aliases IS NULL OR size($subject_aliases) = 0 OR toUpper(replace(replace(replace(coalesce(subject.pg_id, ''), '-', ''), '_', ''), ' ', '')) IN $subject_aliases OR toUpper(replace(replace(replace(coalesce(subject.name, ''), '-', ''), '_', ''), ' ', '')) IN $subject_aliases)
-              AND ($topic_aliases IS NULL OR size($topic_aliases) = 0 OR toUpper(replace(replace(replace(coalesce(topic.pg_id, ''), '-', ''), '_', ''), ' ', '')) IN $topic_aliases OR toUpper(replace(replace(replace(coalesce(topic.name, ''), '-', ''), '_', ''), ' ', '')) IN $topic_aliases)
-              AND ($lesson_aliases IS NULL OR size($lesson_aliases) = 0 OR toUpper(replace(replace(replace(coalesce(lesson.pg_id, ''), '-', ''), '_', ''), ' ', '')) IN $lesson_aliases OR toUpper(replace(replace(replace(coalesce(lesson.name, ''), '-', ''), '_', ''), ' ', '')) IN $lesson_aliases)
+              AND ($subject_id = '' OR subject.pg_id = $subject_id)
+              AND ($topic_ids IS NULL OR size($topic_ids) = 0 OR topic.pg_id IN $topic_ids)
+              AND ($lesson_ids IS NULL OR size($lesson_ids) = 0 OR lesson.pg_id IN $lesson_ids)
             RETURN chunk.pg_id AS chunk_id,
                    coalesce(chunk.chunk_name, chunk.name, chunk.pg_id) AS chunk_name,
                    chunk.chunk_number AS chunk_number,
@@ -549,12 +538,12 @@ def _load_chunk_rows_neo(*, neo, class_id: str, subject_id: str, topic_ids: Opti
                    coalesce(subject.name, subject.pg_id) AS subject_name,
                    class.pg_id AS class_id,
                    coalesce(class.name, class.pg_id) AS class_name
-            ORDER BY class.pg_id, subject.pg_id, topic.topic_number, lesson.lesson_number, chunk.chunk_number, chunk.pg_id
+            ORDER BY class.pg_id, subject.pg_id, topic.topic_number, topic.pg_id, lesson.lesson_number, lesson.pg_id, chunk.chunk_number, chunk.pg_id
             """,
             class_id=(class_id or "").strip(),
-            subject_aliases=subject_aliases,
-            topic_aliases=topic_aliases,
-            lesson_aliases=lesson_aliases,
+            subject_id=(subject_id or "").strip(),
+            topic_ids=clean_topic_ids,
+            lesson_ids=clean_lesson_ids,
         )
         rows: List[dict] = []
         for r in records:
@@ -726,19 +715,14 @@ def _load_entity_keyword_rows_from_neo(
         return [], "neo_session_unavailable"
 
     clean_owner_ids = _dedupe_keep_order_ids(owner_ids)
-    owner_aliases = _dedupe_keep_order_ids([alias for owner_id in clean_owner_ids for alias in _alias_list_for_value(owner_id)])
-    if not clean_owner_ids and not owner_aliases:
+    if not clean_owner_ids:
         return [], None
 
     try:
         cypher = f"""
-        UNWIND $owner_aliases AS owner_alias
-        MATCH (owner:{owner_label})-[:HAS_KEYWORD]->(keyword:Keyword)
+        UNWIND $owner_ids AS owner_id
+        MATCH (owner:{owner_label} {{pg_id: owner_id}})-[:HAS_KEYWORD]->(keyword:Keyword)
         WHERE keyword.embedding IS NOT NULL
-          AND (
-            toUpper(replace(replace(replace(coalesce(owner.pg_id, ''), '-', ''), '_', ''), ' ', '')) = owner_alias
-            OR toUpper(replace(replace(replace(coalesce(owner.name, ''), '-', ''), '_', ''), ' ', '')) = owner_alias
-          )
         RETURN DISTINCT owner.pg_id AS owner_id,
                keyword.pg_id AS keyword_id,
                coalesce(keyword.name, keyword.pg_id) AS keyword_name,
@@ -746,7 +730,7 @@ def _load_entity_keyword_rows_from_neo(
         """
 
         rows: List[Tuple[str, str, str, List[float]]] = []
-        for record in neo.run(cypher, owner_aliases=owner_aliases):
+        for record in neo.run(cypher, owner_ids=clean_owner_ids):
             owner_id = str(record.get("owner_id") or "").strip()
             keyword_id = str(record.get("keyword_id") or "").strip()
             keyword_name = str(record.get("keyword_name") or "").strip()
@@ -814,11 +798,11 @@ def _filter_gemini_terms_strict(base_query: str, gemini_terms: List[str]) -> Lis
 
 
 def _split_keyword_query_parts(raw_query: str, core_query: str) -> List[str]:
-    raw = _strip_keyword_filler(raw_query or "")
-    pieces = re.split(r"[,;\n]+|\b(?:va|và|hoặc|hay|and|or)\b", raw)
+    raw = _strip_query_filler_phrases(raw_query or "")
+    pieces = re.split(r"\s*(?:[,;\n/]+|\b(?:va|và|hoặc|hay|and|or)\b)\s*", raw, flags=re.IGNORECASE)
     parts = [_strip_keyword_filler(piece) for piece in pieces]
     parts = [part for part in parts if part]
-    if parts:
+    if len(parts) >= 2:
         return _dedupe_keep_order(parts)
     core = _strip_keyword_filler(core_query or raw_query or "")
     return [core] if core else []
@@ -953,18 +937,36 @@ def _score_entity_keyword_rows(
     rows: List[Tuple[str, str, str, List[float]]],
     *,
     owner_alias_by_id: Optional[Dict[str, str]] = None,
-    keep_ratio: float = 0.93,
-    absolute_floor: float = 0.72,
-    keep_limit: int = 8,
+    keep_ratio: Optional[float] = None,
+    absolute_floor: Optional[float] = None,
+    keep_limit: Optional[int] = None,
 ) -> Tuple[List[str], Dict[str, float], Dict[str, List[Tuple[float, str]]], Dict[str, object]]:
     clean_query = _strip_keyword_filler(query_text or "")
     if not clean_query or not rows:
         return [], {}, {}, {"keyword_rows": len(rows)}
 
     query_embedding = embed_keyword_cached(clean_query)
-    score_by_owner: Dict[str, float] = {}
+    q_tokens = _dedupe_keep_order(_tokens_no_stop(clean_query))
+    q_token_set = set(q_tokens)
+    token_count = len(q_tokens)
+    norm_q = _norm_keyword_text(clean_query)
+
+    if keep_ratio is None:
+        keep_ratio = 0.96 if token_count <= 1 else (0.91 if token_count == 2 else 0.89)
+    if absolute_floor is None:
+        absolute_floor = 0.82 if token_count <= 1 else (0.75 if token_count == 2 else 0.72)
+    if keep_limit is None:
+        keep_limit = 4 if token_count <= 1 else (10 if token_count == 2 else 14)
+
+    best_score_by_owner: Dict[str, float] = {}
+    final_score_by_owner: Dict[str, float] = {}
     matched_keywords: Dict[str, List[Tuple[float, str]]] = defaultdict(list)
     owner_ids_by_alias: Dict[str, List[str]] = defaultdict(list)
+    owner_token_hits: Dict[str, set[str]] = defaultdict(set)
+    owner_keyword_hit_count: Dict[str, int] = defaultdict(int)
+    owner_phrase_hits: Dict[str, int] = defaultdict(int)
+    owner_exact_or_phrase: Dict[str, bool] = defaultdict(bool)
+
     for keyword_id, owner_id, keyword_name, keyword_embedding in rows:
         owner_key = (owner_alias_by_id or {}).get(owner_id) or _entity_alias_key(owner_id) or owner_id
         if not owner_key:
@@ -972,44 +974,236 @@ def _score_entity_keyword_rows(
         owner_ids = owner_ids_by_alias.setdefault(owner_key, [])
         if owner_id not in owner_ids:
             owner_ids.append(owner_id)
+
         cosine = _cosine(query_embedding, keyword_embedding)
         overlap = _token_overlap_ratio(clean_query, keyword_name)
-        exact_bonus = 0.0
-        norm_q = _norm_keyword_text(clean_query)
         norm_kw = _norm_keyword_text(keyword_name)
+        kw_tokens = set(_tokens_no_stop(keyword_name or ""))
+        shared_tokens = q_token_set & kw_tokens
+
+        exact_bonus = 0.0
+        phrase_hit = False
+        partial_phrase_hit = False
+        shared_ratio = float(len(shared_tokens) / token_count) if token_count > 0 else 0.0
         if norm_kw and norm_q:
             if norm_kw == norm_q:
+                exact_bonus = 0.16
+                phrase_hit = True
+            elif norm_q in norm_kw:
                 exact_bonus = 0.12
-            elif norm_q in norm_kw or norm_kw in norm_q:
-                exact_bonus = 0.08
-        score = float(cosine + 0.08 * overlap + exact_bonus)
-        current = score_by_owner.get(owner_key)
-        if current is None or score > current:
-            score_by_owner[owner_key] = score
-        bucket = matched_keywords[owner_key]
-        if not any(existing_name == keyword_name for _existing_score, existing_name in bucket):
-            bucket.append((score, keyword_name))
-            bucket.sort(key=lambda item: item[0], reverse=True)
-            matched_keywords[owner_key] = bucket[:5]
+                phrase_hit = True
+            elif norm_kw in norm_q:
+                if shared_ratio >= 0.75:
+                    exact_bonus = 0.08
+                    phrase_hit = True
+                else:
+                    exact_bonus = 0.02
+                    partial_phrase_hit = True
 
-    ranked = sorted(score_by_owner.items(), key=lambda item: item[1], reverse=True)
+        if token_count >= 2:
+            if len(shared_tokens) >= min(token_count, 2):
+                exact_bonus += 0.06
+            elif overlap >= 0.5:
+                exact_bonus += 0.04
+
+        score = float(cosine + 0.10 * overlap + exact_bonus)
+        current_best = best_score_by_owner.get(owner_key)
+        if current_best is None or score > current_best:
+            best_score_by_owner[owner_key] = score
+
+        keyword_is_relevant = bool(shared_tokens or phrase_hit or partial_phrase_hit or overlap >= 0.34)
+        if keyword_is_relevant:
+            owner_token_hits[owner_key].update(shared_tokens)
+            owner_keyword_hit_count[owner_key] += 1
+        if phrase_hit:
+            owner_phrase_hits[owner_key] += 1
+            owner_exact_or_phrase[owner_key] = True
+
+        if keyword_is_relevant:
+            bucket = matched_keywords[owner_key]
+            if not any(existing_name == keyword_name for _existing_score, existing_name in bucket):
+                bucket.append((score, keyword_name))
+                bucket.sort(key=lambda item: item[0], reverse=True)
+                matched_keywords[owner_key] = bucket[:5]
+
+    for owner_key, best_score in best_score_by_owner.items():
+        token_hits = owner_token_hits.get(owner_key) or set()
+        coverage = float(len(token_hits) / token_count) if token_count > 0 else 0.0
+        keyword_hit_count = int(owner_keyword_hit_count.get(owner_key) or 0)
+        phrase_hits = int(owner_phrase_hits.get(owner_key) or 0)
+        support_bonus = 0.0
+        support_bonus += 0.05 * min(4, max(0, keyword_hit_count - 1))
+        support_bonus += 0.08 * coverage
+        if keyword_hit_count >= 3:
+            support_bonus += 0.03
+        if phrase_hits > 0:
+            support_bonus += 0.03
+        final_score_by_owner[owner_key] = float(best_score + support_bonus)
+
+    ranked = sorted(final_score_by_owner.items(), key=lambda item: item[1], reverse=True)
     if not ranked:
-        return [], score_by_owner, matched_keywords, {"keyword_rows": len(rows)}
+        return [], final_score_by_owner, matched_keywords, {"keyword_rows": len(rows)}
 
     top_score = float(ranked[0][1])
-    min_score = max(absolute_floor, top_score * keep_ratio)
-    matched_aliases = [owner_key for owner_key, score in ranked if float(score) >= min_score][:keep_limit]
+    min_score = max(float(absolute_floor), top_score * float(keep_ratio))
+    matched_aliases: List[str] = []
+    evidence_by_owner: Dict[str, dict] = {}
+
+    for owner_key, score in ranked:
+        token_hits = owner_token_hits.get(owner_key) or set()
+        coverage = float(len(token_hits) / token_count) if token_count > 0 else 0.0
+        keyword_hit_count = int(owner_keyword_hit_count.get(owner_key) or 0)
+        phrase_hits = int(owner_phrase_hits.get(owner_key) or 0)
+        has_phrase = bool(owner_exact_or_phrase.get(owner_key))
+        keep_by_threshold = float(score) >= min_score
+        keep_by_evidence = False
+        if token_count <= 1:
+            keep_by_evidence = has_phrase
+        else:
+            keep_by_evidence = has_phrase or coverage >= 0.50 or keyword_hit_count >= 2
+        evidence_by_owner[owner_key] = {
+            "score": float(score),
+            "coverage": coverage,
+            "keyword_hits": keyword_hit_count,
+            "phrase_hits": phrase_hits,
+            "keep_by_threshold": keep_by_threshold,
+            "keep_by_evidence": keep_by_evidence,
+        }
+        if keep_by_threshold or keep_by_evidence:
+            matched_aliases.append(owner_key)
+
     if not matched_aliases and ranked:
         matched_aliases = [ranked[0][0]]
+    if keep_limit and keep_limit > 0:
+        matched_aliases = matched_aliases[:keep_limit]
+
     debug = {
         "keyword_rows": len(rows),
+        "query_token_count": token_count,
         "top_score": top_score,
         "min_score": min_score,
         "matched_count": len(matched_aliases),
-        "matched_aliases": matched_aliases[:10],
-        "owner_ids_by_alias": {alias: ids[:5] for alias, ids in list(owner_ids_by_alias.items())[:10]},
+        "matched_aliases": matched_aliases[:20],
+        "owner_ids_by_alias": {alias: ids[:5] for alias, ids in list(owner_ids_by_alias.items())[:20]},
+        "owner_evidence": {alias: evidence_by_owner.get(alias) for alias in matched_aliases[:20]},
     }
-    return matched_aliases, score_by_owner, matched_keywords, debug
+    return matched_aliases, final_score_by_owner, matched_keywords, debug
+
+
+def _merge_keyword_buckets(
+    base: Dict[str, List[Tuple[float, str]]],
+    incoming: Dict[str, List[Tuple[float, str]]],
+    *,
+    limit: int = 5,
+) -> Dict[str, List[Tuple[float, str]]]:
+    for owner_key, bucket in (incoming or {}).items():
+        target = list(base.get(owner_key) or [])
+        for score, keyword_name in bucket or []:
+            if any(existing_name == keyword_name for _existing_score, existing_name in target):
+                continue
+            target.append((float(score), keyword_name))
+        target.sort(key=lambda item: item[0], reverse=True)
+        base[owner_key] = target[:limit]
+    return base
+
+
+
+def _score_entity_keyword_rows_multi(
+    query_parts: List[str],
+    rows: List[Tuple[str, str, str, List[float]]],
+    *,
+    owner_alias_by_id: Optional[Dict[str, str]] = None,
+    keep_ratio: Optional[float] = None,
+    absolute_floor: Optional[float] = None,
+    keep_limit: Optional[int] = None,
+) -> Tuple[List[str], Dict[str, float], Dict[str, List[Tuple[float, str]]], Dict[str, object]]:
+    clean_parts = _dedupe_keep_order([
+        _strip_keyword_filler(part or "")
+        for part in (query_parts or [])
+        if _strip_keyword_filler(part or "")
+    ])
+    if not clean_parts:
+        return [], {}, {}, {"keyword_rows": len(rows), "query_parts": []}
+    if len(clean_parts) == 1:
+        matched_aliases, score_by_owner, matched_keywords, debug = _score_entity_keyword_rows(
+            clean_parts[0],
+            rows,
+            owner_alias_by_id=owner_alias_by_id,
+            keep_ratio=keep_ratio,
+            absolute_floor=absolute_floor,
+            keep_limit=keep_limit,
+        )
+        debug = dict(debug or {})
+        debug["query_parts"] = clean_parts
+        debug["multi_mode"] = False
+        return matched_aliases, score_by_owner, matched_keywords, debug
+
+    combined_scores: Dict[str, float] = {}
+    combined_keywords: Dict[str, List[Tuple[float, str]]] = {}
+    matched_parts_by_alias: Dict[str, List[str]] = defaultdict(list)
+    owner_ids_by_alias: Dict[str, List[str]] = defaultdict(list)
+    part_debugs: List[Dict[str, object]] = []
+
+    part_keep_limit = max(6, keep_limit or 0)
+    for part in clean_parts:
+        matched_aliases, part_scores, part_keywords, part_debug = _score_entity_keyword_rows(
+            part,
+            rows,
+            owner_alias_by_id=owner_alias_by_id,
+            keep_ratio=keep_ratio,
+            absolute_floor=absolute_floor,
+            keep_limit=part_keep_limit,
+        )
+        part_debugs.append({
+            "query_part": part,
+            **(part_debug or {}),
+        })
+        for owner_key, score in (part_scores or {}).items():
+            current = combined_scores.get(owner_key)
+            score_v = float(score)
+            if current is None or score_v > current:
+                combined_scores[owner_key] = score_v
+        combined_keywords = _merge_keyword_buckets(combined_keywords, part_keywords, limit=5)
+        alias_owner_map = (part_debug or {}).get("owner_ids_by_alias") or {}
+        for alias, owner_ids in alias_owner_map.items():
+            target = owner_ids_by_alias.setdefault(alias, [])
+            for owner_id in owner_ids or []:
+                owner_id_s = str(owner_id or "").strip()
+                if owner_id_s and owner_id_s not in target:
+                    target.append(owner_id_s)
+        for owner_key in matched_aliases or []:
+            if part not in matched_parts_by_alias[owner_key]:
+                matched_parts_by_alias[owner_key].append(part)
+
+    if not combined_scores:
+        return [], {}, combined_keywords, {
+            "keyword_rows": len(rows),
+            "query_parts": clean_parts,
+            "multi_mode": True,
+            "per_part": part_debugs,
+        }
+
+    ranked = sorted(
+        combined_scores.items(),
+        key=lambda item: (float(item[1]) + 0.04 * len(matched_parts_by_alias.get(item[0], [])), item[0]),
+        reverse=True,
+    )
+    matched_aliases = [owner_key for owner_key, _score in ranked if matched_parts_by_alias.get(owner_key)]
+    final_keep_limit = keep_limit if keep_limit is not None else max(10, 6 * len(clean_parts))
+    if final_keep_limit > 0:
+        matched_aliases = matched_aliases[: max(final_keep_limit, len(clean_parts) * 4)]
+    debug = {
+        "keyword_rows": len(rows),
+        "query_parts": clean_parts,
+        "multi_mode": True,
+        "per_part": part_debugs,
+        "matched_count": len(matched_aliases),
+        "matched_aliases": matched_aliases[:20],
+        "matched_parts_by_alias": {alias: parts[:8] for alias, parts in list(matched_parts_by_alias.items())[:20]},
+        "owner_ids_by_alias": {alias: ids[:5] for alias, ids in list(owner_ids_by_alias.items())[:20]},
+        "top_score": float(ranked[0][1]) if ranked else 0.0,
+    }
+    return matched_aliases, combined_scores, combined_keywords, debug
 
 
 def _exact_keyword_hits(keyword_query: str, rows: List[Tuple[str, str, str, List[float]]]) -> List[dict]:
@@ -1353,7 +1547,8 @@ def _build_chunk_items(
         if _valid_object_id_hex(pg_base.get("chunkMongoId") or ""):
             chunk_doc = mongo_chunks_by_oid.get(pg_base["chunkMongoId"])
         if chunk_doc and not _status_visible(chunk_doc):
-            dbg.setdefault("item_build", {}).setdefault("non_blocking_flags", []).append({"chunkID": chunk_id, "reason": "mongo_hidden"})
+            dbg.setdefault("item_build", {}).setdefault("blocked_hidden", []).append({"chunkID": chunk_id, "reason": "chunk_hidden"})
+            continue
         if category and category != "all":
             chunk_category = (chunk_doc or {}).get("chunkCategory") or ""
             if chunk_category and chunk_category != category:
@@ -1365,6 +1560,16 @@ def _build_chunk_items(
         lesson_doc = mongo_lessons_by_oid.get(lesson_oid) if _valid_object_id_hex(lesson_oid) else None
         topic_doc = mongo_topics_by_oid.get(topic_oid) if _valid_object_id_hex(topic_oid) else None
         subject_doc = mongo_subjects_by_oid.get(subject_oid) if _valid_object_id_hex(subject_oid) else None
+
+        if lesson_doc and not _status_visible(lesson_doc):
+            dbg.setdefault("item_build", {}).setdefault("blocked_hidden", []).append({"chunkID": chunk_id, "reason": "lesson_hidden"})
+            continue
+        if topic_doc and not _status_visible(topic_doc):
+            dbg.setdefault("item_build", {}).setdefault("blocked_hidden", []).append({"chunkID": chunk_id, "reason": "topic_hidden"})
+            continue
+        if subject_doc and not _status_visible(subject_doc):
+            dbg.setdefault("item_build", {}).setdefault("blocked_hidden", []).append({"chunkID": chunk_id, "reason": "subject_hidden"})
+            continue
 
         lesson_name = (neo_base.get("lesson") or {}).get("lessonName") or (pg_base.get("lesson") or {}).get("lessonName") or ""
         topic_name = (neo_base.get("topic") or {}).get("topicName") or (pg_base.get("topic") or {}).get("topicName") or ""
@@ -1472,7 +1677,7 @@ def semantic_search(
     dbg: Dict[str, object] = {
         "service_version": _SERVICE_VERSION,
         "category": category,
-        "search_mode": "neo4j_graph_hierarchical_keyword_alias_gate",
+        "search_mode": "neo4j_graph_hierarchical_keyword_branch_gate_exact_pg_id",
         "raw_query": query,
     }
 
@@ -1573,6 +1778,9 @@ def semantic_search(
     if not keyword_query:
         keyword_query = _core_query_text(query)
     dbg["keyword_query"] = keyword_query
+    query_parts = _split_keyword_query_parts(query, keyword_query)
+    dbg["query_parts"] = query_parts
+    dbg["branch_mode"] = "keep_enough_correct_branches"
 
     if not keyword_query:
         return_mode = _pick_return_mode(ctx, topicID=topicID, lessonID=lessonID)
@@ -1652,12 +1860,10 @@ def semantic_search(
             dbg["reason"] = "subject_keywords_not_found_in_neo4j"
             res["debug"] = dbg
         return res
-    matched_subject_aliases, subject_scores, subject_kw, subject_match_dbg = _score_entity_keyword_rows(
-        keyword_query or query,
+    matched_subject_aliases, subject_scores, subject_kw, subject_match_dbg = _score_entity_keyword_rows_multi(
+        query_parts or [keyword_query or query],
         subject_keyword_rows,
         owner_alias_by_id=subject_alias_by_id,
-        keep_ratio=0.90,
-        absolute_floor=0.70,
         keep_limit=12,
     )
     hierarchy_dbg["subject_match"] = subject_match_dbg
@@ -1707,13 +1913,11 @@ def semantic_search(
             dbg["reason"] = "topic_keywords_not_found_in_neo4j"
             res["debug"] = dbg
         return res
-    matched_topic_aliases, topic_scores, topic_kw, topic_match_dbg = _score_entity_keyword_rows(
-        keyword_query or query,
+    matched_topic_aliases, topic_scores, topic_kw, topic_match_dbg = _score_entity_keyword_rows_multi(
+        query_parts or [keyword_query or query],
         topic_keyword_rows,
         owner_alias_by_id=topic_alias_by_id,
-        keep_ratio=0.91,
-        absolute_floor=0.70,
-        keep_limit=12,
+        keep_limit=16,
     )
     hierarchy_dbg["topic_match"] = topic_match_dbg
     hierarchy_dbg["topic_matched_aliases"] = matched_topic_aliases
@@ -1762,13 +1966,11 @@ def semantic_search(
             dbg["reason"] = "lesson_keywords_not_found_in_neo4j"
             res["debug"] = dbg
         return res
-    matched_lesson_aliases, lesson_scores, lesson_kw, lesson_match_dbg = _score_entity_keyword_rows(
-        keyword_query or query,
+    matched_lesson_aliases, lesson_scores, lesson_kw, lesson_match_dbg = _score_entity_keyword_rows_multi(
+        query_parts or [keyword_query or query],
         lesson_keyword_rows,
         owner_alias_by_id=lesson_alias_by_id,
-        keep_ratio=0.92,
-        absolute_floor=0.70,
-        keep_limit=12,
+        keep_limit=20,
     )
     hierarchy_dbg["lesson_match"] = lesson_match_dbg
     hierarchy_dbg["lesson_matched_aliases"] = matched_lesson_aliases
@@ -1817,13 +2019,11 @@ def semantic_search(
             res["debug"] = dbg
         return res
 
-    matched_chunk_aliases, chunk_scores, chunk_kw, chunk_match_dbg = _score_entity_keyword_rows(
-        keyword_query or query,
+    matched_chunk_aliases, chunk_scores, chunk_kw, chunk_match_dbg = _score_entity_keyword_rows_multi(
+        query_parts or [keyword_query or query],
         chunk_keyword_rows,
         owner_alias_by_id=chunk_alias_by_id,
-        keep_ratio=0.94,
-        absolute_floor=0.72,
-        keep_limit=max(limit * 4, 20),
+        keep_limit=max(limit * 5, 30),
     )
     hierarchy_dbg["chunk_match"] = chunk_match_dbg
     hierarchy_dbg["chunk_matched_aliases"] = matched_chunk_aliases[:20]
@@ -1837,7 +2037,14 @@ def semantic_search(
         return res
 
     ranked_chunks = sorted(
-        [(chunk_id, float(chunk_scores.get(chunk_alias_by_id.get(chunk_id) or chunk_id, 0.0))) for chunk_id in _expand_ids_for_aliases(chunk_ids_by_alias, matched_chunk_aliases)],
+        [
+            (
+                chunk_id,
+                float(chunk_scores.get(chunk_alias_by_id.get(chunk_id) or chunk_id, 0.0))
+                + 0.035 * len(chunk_kw.get(chunk_alias_by_id.get(chunk_id) or chunk_id, []))
+            )
+            for chunk_id in _expand_ids_for_aliases(chunk_ids_by_alias, matched_chunk_aliases)
+        ],
         key=lambda item: item[1],
         reverse=True,
     )
