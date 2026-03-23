@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 from bson import ObjectId
 from sqlalchemy import text
@@ -109,7 +109,9 @@ def sync_postgre_media_from_mongo(*, media_type: str, mongo_id: str) -> PgMediaS
     if not map_id:
         raise ValueError("Mongo media missing mapID")
 
-    media_id = _media_id_from_map_id(map_id)
+    stored_media_id = _clean(mongo_doc.get("imgID" if media_type == "image" else "videoID"))
+    media_id = stored_media_id or _media_id_from_map_id(map_id)
+
     if media_type == "image":
         media_name = _clean(mongo_doc.get("imgName")) or media_id
     else:

@@ -37,6 +37,15 @@ def _extract_last_number(s: str) -> str:
     return nums[-1] if nums else ""
 
 
+def _filename_without_ext(filename: str) -> str:
+    s = _clean(filename)
+    if not s:
+        return ""
+    base = os.path.basename(s)
+    stem, _ = os.path.splitext(base)
+    return _clean(stem)
+
+
 def _derive_class_map_from_subject_map(subject_map: str) -> str:
     n = _extract_last_number(subject_map)
     return f"L{n}" if n else ""
@@ -181,11 +190,17 @@ def _validate_and_parse_map_id(map_id: str, media_type: str, folder_type: str) -
     return parsed
 
 
+def _new_media_id(media_type: str, mongo_id: ObjectId) -> str:
+    prefix = MEDIA_PREFIX[media_type]
+    return f"{prefix}_{str(mongo_id)}"
+
+
 @dataclass
 class MediaSyncResult:
     media_type: str
     collection: str
     mongo_id: ObjectId
+    media_id: str
     map_id: str
     follow_map: str
     follow_type: str
@@ -222,46 +237,42 @@ def sync_minio_media_to_mongo(
 
     if media_type == "image":
         collection = "images"
+        id_field = "imgID"
         name_field = "imgName"
         desc_field = "imgDescription"
+        url_field = "imgUrl"
     else:
         collection = "videos"
+        id_field = "videoID"
         name_field = "videoName"
         desc_field = "videoDescription"
+        url_field = "videoUrl"
 
-    media_name = _pick(meta, name_field, "name") or filename or map_id
+    media_name = _pick(meta, name_field, "name") or _filename_without_ext(filename) or filename or map_id
     media_desc = _pick(meta, desc_field, "description")
 
+    mongo_id = ObjectId()
+    media_id = _new_media_id(media_type, mongo_id)
+
     doc = {
+        id_field: media_id,
         name_field: media_name,
         desc_field: media_desc,
-        f"{media_type}Url" if media_type == "video" else "imgUrl": media_url,
+        url_field: media_url,
+        "objectKey": key,
         "createdAt": now,
         "createdBy": actor or "system",
         "status": _pick(meta, "status") or "active",
         "mapID": map_id,
     }
 
-    # fix url field name for video/image explicitly
-    if media_type == "video":
-        doc["videoUrl"] = media_url
-    else:
-        doc["imgUrl"] = media_url
-
-    existing = db[collection].find_one({"mapID": map_id})
-    if existing:
-        mongo_id = existing["_id"]
-        db[collection].update_one(
-            {"_id": mongo_id},
-            {"$set": {**doc, "createdAt": existing.get("createdAt") or now, "createdBy": existing.get("createdBy") or actor or "system"}},
-        )
-    else:
-        mongo_id = db[collection].insert_one(doc).inserted_id
+    db[collection].insert_one({"_id": mongo_id, **doc})
 
     return MediaSyncResult(
         media_type=media_type,
         collection=collection,
         mongo_id=mongo_id,
+        media_id=media_id,
         map_id=map_id,
         follow_map=parsed["follow_map"],
         follow_type=parsed["follow_type"],

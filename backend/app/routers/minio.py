@@ -32,7 +32,6 @@ from ..services.media_sync import sync_minio_media_to_mongo
 from ..services.postgre_media_sync import sync_postgre_media_from_mongo
 from ..services.neo_media_sync import sync_media_to_neo4j
 from ..services.media_content_ai import generate_media_description
-
 router = APIRouter(
     prefix="/admin/minio",
     tags=["Minio"]
@@ -1505,16 +1504,7 @@ def insert_item(
                 if generated_desc:
                     meta = {**meta, media_desc_key: generated_desc, "description": generated_desc}
 
-            _mark_file_progress(
-                upload_id,
-                file_index=1,
-                total_files=1,
-                file_name=filename,
-                stage="syncing_mongo",
-                stage_label="Đang sync MongoDB",
-                file_percent=0.40,
-                message=f"Đang đồng bộ media {filename} vào MongoDB",
-            )
+            _mark_file_progress(upload_id, file_index=1, total_files=1, file_name=filename, stage="syncing_mongo", stage_label="Đang sync MongoDB", file_percent=0.40, message=f"Đang đồng bộ media {filename} vào MongoDB")
             try:
                 media_res = sync_minio_media_to_mongo(
                     bucket=bucket,

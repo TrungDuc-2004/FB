@@ -143,6 +143,11 @@ function deriveResolvedPath(folderName = "", meta = {}, category = "document") {
   return next.join("/");
 }
 
+function stripFileExtension(filename = "") {
+  const base = String(filename || "").trim().split(/[\/]/).pop() || "";
+  return base.replace(/\.[^/.]+$/, "").trim();
+}
+
 function defaultMeta(folderType, category) {
   return {
     name: "",
@@ -187,7 +192,10 @@ function toDocumentPayload(meta) {
 }
 
 function toMediaPayload(meta, category, file) {
-  const name = String(meta.name || file?.name || "").trim();
+  const manualName = String(meta.name || "").trim();
+  const inferredName = stripFileExtension(file?.name || "");
+  const name = manualName || inferredName;
+
   const out = {
     name,
     category,
@@ -521,11 +529,14 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
               <>
                 <div className="field">
                   <label htmlFor="name">{category === "image" ? "Tên ảnh" : "Tên video"}</label>
+                  <div style={{ marginTop: 4, marginBottom: 6, fontSize: 12, color: "#64748b" }}>
+                    Để trống thì hệ thống sẽ tự lấy tên file và bỏ phần đuôi như .png, .jpg, .mp4.
+                  </div>
                   <input
                     id="name"
                     value={meta.name}
                     onChange={(e) => change("name", e.target.value)}
-                    placeholder={category === "image" ? "so_do_cpu.png" : "gioi_thieu_cpu.mp4"}
+                    placeholder={category === "image" ? "so_do_cpu" : "gioi_thieu_cpu"}
                   />
                 </div>
                 <div className="field" style={{ marginTop: 16 }}>

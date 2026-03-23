@@ -9,8 +9,29 @@ function safeText(...values) {
   return "";
 }
 
+function normalizeDescriptionText(value = "") {
+  if (value && typeof value === "object") {
+    return normalizeDescriptionText(value.description || value.caption || value.text || "");
+  }
+
+  let text = String(value ?? "").trim();
+  if (!text) return "";
+
+  const match = text.match(/['"]description['"]\s*:\s*['"]([\s\S]*?)['"]\s*[,}]/i);
+  if (match?.[1]) {
+    text = match[1].trim();
+  }
+
+  text = text.replace(/^\s*['"]?description['"]?\s*:\s*/i, "");
+  text = text.replace(/\n/g, " ").replace(/\r/g, " ");
+  text = text.replace(/^\{+|\}+$/g, "").trim();
+  text = text.replace(/\s+/g, " ").trim();
+  text = text.replace(/^['"]+|['"]+$/g, "").trim();
+  return text;
+}
+
 function shortText(value, maxLength = 220) {
-  const text = safeText(value);
+  const text = normalizeDescriptionText(value);
   if (!text) return "";
   return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }

@@ -129,7 +129,7 @@ def _home_sort_spec(name_field: str):
     return [("updatedAt", -1), ("createdAt", -1), (name_field, 1)]
 
 
-def _load_home_bucket_docs(*, username: str, limit: int) -> list[dict]:
+def _load_home_bucket_docs(*, username: str, limit: int, pg: Optional[Session]) -> list[dict]:
     cur = db_mongo[COL_CHUNKS].find({"status": _not_hidden_q()}, {"_id": 0}).sort(_home_sort_spec("chunkName")).limit(max(limit * 3, limit))
     items: list[dict] = []
     seen: set[str] = set()
@@ -138,7 +138,9 @@ def _load_home_bucket_docs(*, username: str, limit: int) -> list[dict]:
         if not chunk_id or chunk_id in seen:
             continue
         seen.add(chunk_id)
-        items.append(_get_chunk_full(raw, category="document", username=username))
+        doc = _get_chunk_full(raw, category="document", username=username)
+        doc = _attach_related_media(doc, pg=pg)
+        items.append(doc)
         if len(items) >= limit:
             break
     return items
@@ -1073,7 +1075,7 @@ def list_home_feed(
     pg: Session = Depends(get_db),
 ):
     username = _actor(request)
-    docs = _load_home_bucket_docs(username=username, limit=limit)
+    docs = _load_home_bucket_docs(username=username, limit=limit, pg=pg)
     images = _load_home_bucket_media(kind="image", username=username, limit=limit, pg=pg)
     videos = _load_home_bucket_media(kind="video", username=username, limit=limit, pg=pg)
 
@@ -1200,6 +1202,7 @@ def _list_chunks_impl(
     limit: int,
     offset: int,
     sort: str,
+    pg: Optional[Session],
 ):
     if not lessonID:
         return {"total": 0, "items": []}
@@ -1223,7 +1226,11 @@ def _list_chunks_impl(
     )
 
     username = _actor(request)
-    items = [_get_chunk_full(c, category=category, username=username) for c in cur]
+    items = []
+    for c in cur:
+        doc = _get_chunk_full(c, category=category, username=username)
+        doc = _attach_related_media(doc, pg=pg)
+        items.append(doc)
     total = db_mongo[COL_CHUNKS].count_documents(q)
     return {"total": total, "items": items}
 
@@ -1236,8 +1243,9 @@ def list_docs_root(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     sort: str = Query("name"),
+    pg: Session = Depends(get_db),
 ):
-    return _list_chunks_impl(request, lessonID, category, limit, offset, sort)
+    return _list_chunks_impl(request, lessonID, category, limit, offset, sort, pg)
 
 
 @router.get("/chunks")
@@ -1248,8 +1256,9 @@ def list_chunks(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     sort: str = Query("name"),
+    pg: Session = Depends(get_db),
 ):
-    return _list_chunks_impl(request, lessonID, category, limit, offset, sort)
+    return _list_chunks_impl(request, lessonID, category, limit, offset, sort, pg)
 
 # lấy dữ liệu search từ người dùng
 @router.get("/search")

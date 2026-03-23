@@ -35,6 +35,27 @@ function safeText(...values) {
   return "";
 }
 
+function normalizeDescriptionText(value = "") {
+  if (value && typeof value === "object") {
+    return normalizeDescriptionText(value.description || value.caption || value.text || "");
+  }
+
+  let text = String(value ?? "").trim();
+  if (!text) return "";
+
+  const match = text.match(/['"]description['"]\s*:\s*['"]([\s\S]*?)['"]\s*[,}]/i);
+  if (match?.[1]) {
+    text = match[1].trim();
+  }
+
+  text = text.replace(/^\s*['"]?description['"]?\s*:\s*/i, "");
+  text = text.replace(/\n/g, " ").replace(/\r/g, " ");
+  text = text.replace(/^\{+|\}+$/g, "").trim();
+  text = text.replace(/\s+/g, " ").trim();
+  text = text.replace(/^['"]+|['"]+$/g, "").trim();
+  return text;
+}
+
 function normalizeText(value = "") {
   return String(value || "")
     .normalize("NFD")
@@ -192,6 +213,10 @@ function buildMedia(doc) {
           id: safeText(item?.id, item?.url, item?.name),
           title: safeText(item?.name, item?.id),
           subtitle: "Hình ảnh",
+          url: safeText(item?.url),
+          description: normalizeDescriptionText(item?.description),
+          followType: safeText(item?.followType).toLowerCase(),
+          followID: safeText(item?.followID),
         }))
     : [];
 
@@ -203,10 +228,33 @@ function buildMedia(doc) {
           id: safeText(item?.id, item?.url, item?.name),
           title: safeText(item?.name, item?.id),
           subtitle: "Video",
+          url: safeText(item?.url),
+          description: normalizeDescriptionText(item?.description),
+          followType: safeText(item?.followType).toLowerCase(),
+          followID: safeText(item?.followID),
         }))
     : [];
 
   return [...images, ...videos];
+}
+
+function groupMediaByFollowType(items = []) {
+  const order = ["chunk", "lesson", "topic", "subject"];
+  const meta = {
+    chunk: { title: "Media của mục này", empty: "Không có media gắn trực tiếp với mục này." },
+    lesson: { title: "Media của bài học", empty: "Không có media ở cấp bài học." },
+    topic: { title: "Media của chủ đề", empty: "Không có media ở cấp chủ đề." },
+    subject: { title: "Media của môn học", empty: "Không có media ở cấp môn học." },
+  };
+
+  return order
+    .map((followType) => ({
+      followType,
+      title: meta[followType].title,
+      empty: meta[followType].empty,
+      items: items.filter((item) => (item.followType || "") === followType),
+    }))
+    .filter((group) => group.items.length > 0);
 }
 
 function buildKeywords(doc = {}) {
@@ -274,6 +322,26 @@ function buildInfoRows(doc = {}, itemType = "chunk") {
   ];
 }
 
+function MediaPreviewCard({ item }) {
+  return (
+    <Link className="doc-media-card" to={detailHref(item.id, item.kind)}>
+      <div className="doc-media-thumb">
+        {item.kind === "image" ? (
+          <img src={item.url} alt={item.title} loading="lazy" />
+        ) : (
+          <video src={item.url} muted playsInline preload="metadata" />
+        )}
+        <span className={`doc-media-kind ${item.kind}`}>{item.kind === "image" ? "Ảnh" : "Video"}</span>
+      </div>
+      <div className="doc-media-body">
+        <strong>{item.title}</strong>
+        <span>{item.subtitle}</span>
+        {item.description ? <p>{item.description}</p> : null}
+      </div>
+    </Link>
+  );
+}
+
 export default function UserDocDetail() {
   const { chunkID } = useParams();
   const [searchParams] = useSearchParams();
@@ -325,7 +393,7 @@ export default function UserDocDetail() {
   const ext = useMemo(() => getExt(viewUrl || originalUrl), [viewUrl, originalUrl]);
   const kindLabel = useMemo(() => getTypeLabel(doc?.itemType || currentType), [doc, currentType]);
   const title = getCurrentTitle(doc || {}, itemType, chunkID);
-  const description = safeText(
+  const description = normalizeDescriptionText(
     doc?.chunkDescription,
     doc?.lesson?.lessonDescription,
     doc?.topic?.topicDescription,
@@ -340,9 +408,11 @@ export default function UserDocDetail() {
 
   const hierarchyItems = buildHierarchy(doc || {}, itemType);
   const mediaItems = buildMedia(doc || {});
+  const mediaGroups = groupMediaByFollowType(mediaItems);
   const keywords = buildKeywords(doc || {});
   const infoRows = buildInfoRows(doc || {}, itemType).filter((row) => safeText(row?.value) && row.value !== "—");
   const showKeywords = itemType === "chunk" && keywords.length > 0;
+  const hasRelatedSection = hierarchyItems.length > 0 || mediaGroups.length > 0;
 
   if (loading) return <div className="user-doc-empty">Đang tải chi tiết tài liệu...</div>;
   if (error) return <div className="user-doc-empty">{error}</div>;
@@ -434,33 +504,36 @@ export default function UserDocDetail() {
         <aside className="doc-side-card doc-side-right">
           <div className="doc-side-section">
             <h3>Tài liệu liên quan</h3>
-            <div className="doc-related-list hierarchy-only">
-              {hierarchyItems.length ? (
-                hierarchyItems.map((item) => (
-                  <Link key={`${item.kind}-${item.id}`} className="doc-related-item" to={detailHref(item.id, item.kind)}>
-                    <strong>{item.title}</strong>
-                    <span>{item.subtitle}</span>
-                  </Link>
-                ))
-              ) : (
-                <div className="doc-related-empty">Chưa có mục liên quan để hiển thị.</div>
-              )}
-            </div>
-          </div>
+            {hasRelatedSection ? (
+              <div className="doc-related-stack">
+                {hierarchyItems.length ? (
+                  <div className="doc-related-block">
+                    <div className="doc-related-list hierarchy-only">
+                      {hierarchyItems.map((item) => (
+                        <Link key={`${item.kind}-${item.id}`} className="doc-related-item" to={detailHref(item.id, item.kind)}>
+                          <strong>{item.title}</strong>
+                          <span>{item.subtitle}</span>
+                        </Link>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
 
-          {mediaItems.length ? (
-            <div className="doc-side-section">
-              <h3>Ảnh · Video liên quan</h3>
-              <div className="doc-related-list">
-                {mediaItems.map((item) => (
-                  <Link key={`${item.kind}-${item.id}`} className="doc-related-item" to={detailHref(item.id, item.kind)}>
-                    <strong>{item.title}</strong>
-                    <span>{item.subtitle}</span>
-                  </Link>
+                {mediaGroups.map((group) => (
+                  <div key={group.followType} className="doc-related-block">
+                    <div className="doc-related-subtitle">{group.title}</div>
+                    <div className="doc-media-list">
+                      {group.items.map((item) => (
+                        <MediaPreviewCard key={`${item.kind}-${item.id}`} item={item} />
+                      ))}
+                    </div>
+                  </div>
                 ))}
               </div>
-            </div>
-          ) : null}
+            ) : (
+              <div className="doc-related-empty">Chưa có mục liên quan để hiển thị.</div>
+            )}
+          </div>
         </aside>
       </div>
     </div>
