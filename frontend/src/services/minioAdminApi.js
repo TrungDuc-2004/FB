@@ -39,6 +39,18 @@ async function getUploadProgress(uploadId) {
   return normalizeProgress(await res.json());
 }
 
+
+function parseErrorPayload(raw) {
+  try {
+    const obj = JSON.parse(raw || "{}");
+    if (obj?.detail) return String(obj.detail);
+    return raw || "Không thể kết nối tới server";
+  } catch (error) {
+    void error;
+    return raw || "Không thể kết nối tới server";
+  }
+}
+
 function uploadWithProgress(url, formData, onProgress) {
   return new Promise((resolve, reject) => {
     const uploadId = formData.get("upload_id") || makeUploadId();
@@ -98,7 +110,7 @@ function uploadWithProgress(url, formData, onProgress) {
       if (settled) return;
       settled = true;
       stopPolling();
-      reject(new Error(message || "Không thể kết nối tới server"));
+      reject(new Error(parseErrorPayload(message || "Không thể kết nối tới server")));
     };
 
     const schedulePoll = (delay = 250) => {
@@ -270,4 +282,13 @@ export async function renameObject(object_key, new_name) {
     method: "PUT",
     body: JSON.stringify({ object_key, new_name }),
   });
+}
+
+export async function uploadAuto(path, file, { bookVariant = "", onProgress } = {}) {
+  const fd = new FormData();
+  fd.append("current_path", path);
+  fd.append("upload_id", makeUploadId());
+  if (bookVariant) fd.append("book_variant", bookVariant);
+  fd.append("file", file);
+  return uploadWithProgress(`${API_BASE}/admin/minio/upload-auto/`, fd, onProgress);
 }

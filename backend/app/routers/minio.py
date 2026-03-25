@@ -5,6 +5,7 @@ import tempfile
 import json
 import threading
 import uuid
+from pathlib import Path
 
 from urllib.parse import quote, quote_plus
 from typing import List, Optional, Tuple, Set, Dict, Any
@@ -32,6 +33,7 @@ from ..services.media_sync import sync_minio_media_to_mongo
 from ..services.postgre_media_sync import sync_postgre_media_from_mongo
 from ..services.neo_media_sync import sync_media_to_neo4j
 from ..services.media_content_ai import generate_media_description
+from ..services.auto_split_upload import extract_and_split_structure, cleanup_split_result
 router = APIRouter(
     prefix="/admin/minio",
     tags=["Minio"]
@@ -825,7 +827,19 @@ def get_upload_progress(upload_id: str):
     with _UPLOAD_PROGRESS_LOCK:
         payload = _UPLOAD_PROGRESS.get((upload_id or "").strip())
         if not payload:
-            raise HTTPException(status_code=404, detail="Upload progress not found")
+            return {
+                "uploadId": (upload_id or "").strip(),
+                "status": "pending",
+                "stage": "waiting",
+                "stageLabel": "Đang chờ bắt đầu",
+                "message": "Đang chờ backend khởi tạo tiến trình",
+                "percent": 0,
+                "totalFiles": 1,
+                "completedFiles": 0,
+                "currentFileIndex": 0,
+                "currentFileName": "",
+                "errors": [],
+            }
         return dict(payload)
 
 @router.get("/open", summary="Mở/Download file (proxy qua backend - copy URL mở được ngay)")
@@ -1853,3 +1867,377 @@ def delete_object(object_key: str = Query(..., min_length=1)):
         raise
     except S3Error as e:
         raise HTTPException(status_code=500, detail=f"MinIO error: {e}") from e
+
+
+# =================== AUTO UPLOAD (subject/topic -> lesson) =================== #
+
+def _extract_class_number_from_virtual_path(path: str) -> int:
+    m = __import__("re").search(r"(?:^|/)class-(\d+)(?:/|$)", clean_path(path), flags=__import__("re").I)
+    if not m:
+        raise HTTPException(status_code=400, detail="Không xác định được lớp từ đường dẫn hiện tại")
+    return int(m.group(1))
+
+
+def _resolve_subject_map_from_variant(class_number: int, book_variant: str) -> str:
+    if class_number == 10:
+        return "TH10"
+    variant = (book_variant or "").strip().upper()
+    if class_number in (11, 12) and variant in {"UD", "KHMT"}:
+        return f"TH{class_number}-{variant}"
+    raise HTTPException(status_code=400, detail="Hãy chọn đúng loại sách UD hoặc KHMT")
+
+
+def _auto_root_for_class(path: str) -> str:
+    parts = [p for p in clean_path(path).split("/") if p]
+    if len(parts) < 2:
+        raise HTTPException(status_code=400, detail="Đường dẫn hiện tại không hợp lệ")
+    return "/".join(parts[:2])
+
+
+def _auto_plural_folder(folder_type: str) -> str:
+    t = _normalize_folder_type(folder_type)
+    return {"subject": "subjects", "topic": "topics", "lesson": "lessons", "chunk": "chunks"}.get(t, f"{t}s")
+
+
+def _slug_filename(text: str, fallback: str) -> str:
+    import re as _re
+    base = _re.sub(r"[^A-Za-z0-9._-]+", "_", (text or "").strip()).strip("_")
+    return base or fallback
+
+
+def _next_topic_number(subject_map: str) -> int:
+    try:
+        db = get_mongo_client()["db"]
+        rows = list(db["topics"].find({"subjectID": subject_map}, {"topicNumber": 1}))
+        nums = [int(row.get("topicNumber")) for row in rows if str(row.get("topicNumber") or "").isdigit()]
+        return (max(nums) + 1) if nums else 1
+    except Exception:
+        return 1
+
+
+def _next_lesson_number_for_topic(topic_map: str) -> int:
+    try:
+        db = get_mongo_client()["db"]
+        rows = list(db["lessons"].find({"topicID": topic_map}, {"lessonNumber": 1}))
+        nums = [int(row.get("lessonNumber")) for row in rows if str(row.get("lessonNumber") or "").isdigit()]
+        return (max(nums) + 1) if nums else 1
+    except Exception:
+        return 1
+
+
+def _put_local_pdf_to_minio(client, bucket: str, object_key: str, local_file_path: str) -> None:
+    file_size = os.path.getsize(local_file_path)
+    with open(local_file_path, "rb") as fh:
+        client.put_object(
+            bucket_name=bucket,
+            object_name=object_key,
+            data=fh,
+            length=file_size,
+            content_type="application/pdf",
+        )
+
+
+def _sync_local_document_to_system(
+    *,
+    request: Request,
+    actor: str,
+    upload_id: str,
+    file_index: int,
+    total_files: int,
+    virtual_folder_path: str,
+    local_file_path: str,
+    target_filename: str,
+    meta: Dict[str, Any],
+) -> Dict[str, Any]:
+    client, default_bucket, _public_base = _runtime()
+    bucket, rel = _split_virtual(virtual_folder_path, default_bucket, client, allow_empty_key=True)
+    prefix = folder_marker(clean_path(rel))
+    object_key = prefix + target_filename
+    virtual_object_key = _to_virtual(default_bucket, bucket, object_key)
+
+    try:
+        client.stat_object(bucket, object_key)
+        raise HTTPException(status_code=400, detail=f"File đã tồn tại: {virtual_object_key}")
+    except S3Error:
+        pass
+
+    _mark_file_progress(upload_id, file_index=file_index, total_files=total_files, file_name=target_filename, stage="uploading_minio", stage_label="Đang upload lên MinIO", file_percent=0.15, message=f"Đang upload {target_filename} lên MinIO")
+    _put_local_pdf_to_minio(client, bucket, object_key, local_file_path)
+
+    _mark_file_progress(upload_id, file_index=file_index, total_files=total_files, file_name=target_filename, stage="syncing_mongo", stage_label="Đang sync MongoDB", file_percent=0.35, message=f"Đang đồng bộ {target_filename} vào MongoDB")
+    sync_res = sync_minio_object_to_mongo(
+        bucket=bucket,
+        object_key=object_key,
+        meta={**meta, "__local_file_path": local_file_path},
+        actor=actor,
+    )
+    _set_hierarchy_sync_status(sync_res, minio_ok=True, mongo_ok=True, postgre_ok=False, neo4j_ok=False, actor=actor, error="Đã sync MongoDB, đang chờ PostgreSQL/Neo4j")
+
+    hierarchy_details = None
+    _mark_file_progress(upload_id, file_index=file_index, total_files=total_files, file_name=target_filename, stage="rebuilding_hierarchy", stage_label="Đang cập nhật mô tả/keyword", file_percent=0.58, message=f"Đang dựng mô tả và keyword cho {target_filename}")
+    try:
+        hierarchy_details = rebuild_hierarchy_descriptions_and_keywords(
+            subject_map=sync_res.subject_map,
+            topic_map=sync_res.topic_map or "",
+            lesson_map=sync_res.lesson_map or "",
+            chunk_map=sync_res.chunk_map or "",
+        )
+    except Exception:
+        hierarchy_details = None
+
+    _mark_file_progress(upload_id, file_index=file_index, total_files=total_files, file_name=target_filename, stage="syncing_postgre", stage_label="Đang import PostgreSQL", file_percent=0.76, message=f"Đang sync {target_filename} vào PostgreSQL")
+    pg_ids = sync_postgre_from_mongo_auto_ids(
+        class_map=sync_res.class_map,
+        subject_map=sync_res.subject_map,
+        topic_map=sync_res.topic_map or "",
+        lesson_map=sync_res.lesson_map or "",
+        chunk_map=sync_res.chunk_map or "",
+    )
+
+    _mark_file_progress(upload_id, file_index=file_index, total_files=total_files, file_name=target_filename, stage="syncing_neo4j", stage_label="Đang sync Neo4j", file_percent=0.9, message=f"Đang đồng bộ {target_filename} sang Neo4j")
+    neo_res = sync_neo4j_from_maps_and_pg_ids(
+        class_map=sync_res.class_map,
+        subject_map=sync_res.subject_map,
+        topic_map=sync_res.topic_map or "",
+        lesson_map=sync_res.lesson_map or "",
+        chunk_map=sync_res.chunk_map or "",
+        pg_ids=pg_ids,
+    )
+    verify = _verify_hierarchy_sync(client=client, bucket=bucket, object_key=object_key, sync_res=sync_res, pg_ids=pg_ids)
+    verify["neo4j"] = bool(getattr(neo_res, "ok", True))
+    verify["isFullySynced"] = bool(verify.get("minio") and verify.get("mongo") and verify.get("postgre") and verify.get("neo4j"))
+    verify["missing"] = verify.get("missing") or []
+    err_msg = None if verify["isFullySynced"] else _sync_status_message(verify)
+    _set_hierarchy_sync_status(
+        sync_res,
+        minio_ok=verify.get("minio", False),
+        mongo_ok=verify.get("mongo", False),
+        postgre_ok=verify.get("postgre", False),
+        neo4j_ok=verify.get("neo4j", False),
+        actor=actor,
+        error=err_msg,
+        verify=verify,
+    )
+    _mark_file_progress(upload_id, file_index=file_index, total_files=total_files, file_name=target_filename, stage="completed_file", stage_label="Hoàn tất file", file_percent=1.0, message=f"Đã xong {target_filename}", completed_files=file_index)
+    return {
+        "filename": target_filename,
+        "virtualObjectKey": virtual_object_key,
+        "syncResult": sync_res,
+        "postgre": pg_ids,
+        "neo4j": getattr(neo_res, "created_or_updated", {}),
+        "hierarchy": hierarchy_details,
+        "verify": verify,
+    }
+
+
+def _analysis_progress_to_upload(upload_id: str, path: str, *, analysis_weight: float = 24.0):
+    def _cb(stage: str, stage_label: str, percent: float, message: str) -> None:
+        p = max(0.0, min(100.0, float(percent)))
+        _update_upload_progress(
+            upload_id,
+            path=path,
+            status="processing",
+            stage=stage,
+            stageLabel=stage_label,
+            message=message or stage_label,
+            percent=max(1, min(30, round(p * analysis_weight / 100.0))),
+        )
+    return _cb
+
+
+@router.post("/upload-auto/", summary="Upload PDF và tự cắt tới lesson rồi sync vào hệ thống")
+def upload_auto_pdf(
+    request: Request,
+    current_path: str = Form(..., description="Ví dụ: documents/class-12/subjects hoặc documents/class-12/topics"),
+    book_variant: str = Form("", description="TH10 bỏ trống; lớp 11/12 chọn UD hoặc KHMT"),
+    upload_id: str = Form("", description="ID tiến trình upload để frontend poll"),
+    file: UploadFile = File(...),
+):
+    actor = _get_actor(request)
+    upload_id = (upload_id or "").strip() or uuid.uuid4().hex
+    path = clean_path(current_path)
+    parts = [p for p in path.split("/") if p]
+    if len(parts) < 3 or parts[0].lower() != "documents":
+        raise HTTPException(status_code=400, detail="Upload auto chỉ dùng cho documents/class-x/subjects hoặc documents/class-x/topics")
+    mode = _normalize_folder_type(parts[-1])
+    if mode not in {"subject", "topic"}:
+        raise HTTPException(status_code=400, detail="Upload auto chỉ hỗ trợ ở thư mục subjects hoặc topics")
+    if not file or not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Chỉ hỗ trợ upload file PDF")
+
+    class_number = _extract_class_number_from_virtual_path(path)
+    subject_map = _resolve_subject_map_from_variant(class_number, book_variant)
+    class_map = f"L{class_number}"
+    root_path = _auto_root_for_class(path)
+
+    _init_upload_progress(upload_id, path=path, total_files=1)
+    _update_upload_progress(upload_id, stage="uploading", stageLabel="Đang nhận file", message="Đang nhận file upload", percent=1)
+
+    temp_src = None
+    split_result = None
+    try:
+        fd, temp_src = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        with open(temp_src, "wb") as out:
+            out.write(file.file.read())
+
+        analysis_cb = _analysis_progress_to_upload(upload_id, path)
+        try:
+            split_result = extract_and_split_structure(temp_src, mode=mode, progress_cb=analysis_cb)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Không tách được bài học từ file upload. Chi tiết: {exc}")
+
+        subject_stem = Path(file.filename).stem
+        tasks = []
+        dirty_topics = set()
+        dirty_subjects = {subject_map}
+
+        if mode == "subject":
+            tasks.append({
+                "folder": f"{root_path}/subjects",
+                "file_path": temp_src,
+                "filename": f"{_slug_filename(subject_map, subject_map)}.pdf",
+                "meta": {
+                    "folderType": "subject",
+                    "classMap": class_map,
+                    "subjectMap": subject_map,
+                    "subjectName": subject_stem,
+                    "subjectTitle": subject_stem,
+                    "name": subject_stem,
+                },
+            })
+            for topic in split_result.get("topics") or []:
+                topic_number = topic.get("number") or _next_topic_number(subject_map)
+                topic_map = f"{subject_map}_CD{int(topic_number)}"
+                dirty_topics.add(topic_map)
+                tasks.append({
+                    "folder": f"{root_path}/topics",
+                    "file_path": topic.get("file_path") or "",
+                    "filename": f"{_slug_filename(topic_map, topic_map)}.pdf",
+                    "meta": {
+                        "folderType": "topic",
+                        "classMap": class_map,
+                        "subjectMap": subject_map,
+                        "topicMap": topic_map,
+                        "topicName": topic.get("title") or topic.get("heading") or topic_map,
+                        "name": topic.get("title") or topic_map,
+                    },
+                })
+            for lesson in split_result.get("lessons") or []:
+                topic_number = lesson.get("topic_number")
+                if not topic_number:
+                    continue
+                topic_map = f"{subject_map}_CD{int(topic_number)}"
+                lesson_number = lesson.get("number") or _next_lesson_number_for_topic(topic_map)
+                lesson_map = f"{topic_map}_B{int(lesson_number)}"
+                dirty_topics.add(topic_map)
+                tasks.append({
+                    "folder": f"{root_path}/lessons",
+                    "file_path": lesson.get("file_path") or "",
+                    "filename": f"{_slug_filename(lesson_map, lesson_map)}.pdf",
+                    "meta": {
+                        "folderType": "lesson",
+                        "classMap": class_map,
+                        "subjectMap": subject_map,
+                        "topicMap": topic_map,
+                        "lessonMap": lesson_map,
+                        "topicName": lesson.get("topic_title") or topic_map,
+                        "lessonName": lesson.get("title") or lesson.get("heading") or lesson_map,
+                        "name": lesson.get("title") or lesson_map,
+                    },
+                })
+        else:
+            topic_info = split_result.get("topic") or {}
+            topic_number = topic_info.get("number") or _next_topic_number(subject_map)
+            topic_map = f"{subject_map}_CD{int(topic_number)}"
+            dirty_topics.add(topic_map)
+            tasks.append({
+                "folder": f"{root_path}/topics",
+                "file_path": temp_src,
+                "filename": f"{_slug_filename(topic_map, topic_map)}.pdf",
+                "meta": {
+                    "folderType": "topic",
+                    "classMap": class_map,
+                    "subjectMap": subject_map,
+                    "topicMap": topic_map,
+                    "topicName": topic_info.get("title") or subject_stem,
+                    "name": topic_info.get("title") or subject_stem,
+                },
+            })
+            for lesson in split_result.get("lessons") or []:
+                lesson_number = lesson.get("number") or _next_lesson_number_for_topic(topic_map)
+                lesson_map = f"{topic_map}_B{int(lesson_number)}"
+                tasks.append({
+                    "folder": f"{root_path}/lessons",
+                    "file_path": lesson.get("file_path") or "",
+                    "filename": f"{_slug_filename(lesson_map, lesson_map)}.pdf",
+                    "meta": {
+                        "folderType": "lesson",
+                        "classMap": class_map,
+                        "subjectMap": subject_map,
+                        "topicMap": topic_map,
+                        "lessonMap": lesson_map,
+                        "topicName": topic_info.get("title") or topic_map,
+                        "lessonName": lesson.get("title") or lesson.get("heading") or lesson_map,
+                        "name": lesson.get("title") or lesson_map,
+                    },
+                })
+
+        tasks = [task for task in tasks if str(task.get("file_path") or "").strip()]
+        if not tasks:
+            raise HTTPException(status_code=400, detail="Không có file nào được tách để sync")
+
+        _update_upload_progress(upload_id, totalFiles=len(tasks), stage="syncing", stageLabel="Đang đồng bộ dữ liệu", message="Đang upload và sync các file đã cắt", percent=1)
+
+        synced = []
+        for idx, task in enumerate(tasks, start=1):
+            synced.append(
+                _sync_local_document_to_system(
+                    request=request,
+                    actor=actor,
+                    upload_id=upload_id,
+                    file_index=idx,
+                    total_files=len(tasks),
+                    virtual_folder_path=task["folder"],
+                    local_file_path=task["file_path"],
+                    target_filename=task["filename"],
+                    meta=task["meta"],
+                )
+            )
+
+        final_rebuild = {"topics": [], "subjects": []}
+        for topic_map in sorted(dirty_topics):
+            try:
+                final_rebuild["topics"].append(rebuild_hierarchy_descriptions_and_keywords(subject_map=subject_map, topic_map=topic_map))
+            except Exception:
+                pass
+        try:
+            final_rebuild["subjects"].append(rebuild_hierarchy_descriptions_and_keywords(subject_map=subject_map))
+        except Exception:
+            pass
+
+        _finish_upload_progress(upload_id, total_files=len(tasks), completed_files=len(tasks), status="completed", message="Hoàn tất", stage="completed", stage_label="Hoàn tất")
+        return {
+            "status": "ok",
+            "upload_id": upload_id,
+            "mode": mode,
+            "subject_map": subject_map,
+            "counts": {
+                "synced": len(synced),
+                "topics": len(split_result.get("topics") or ([] if mode == "topic" else [])),
+                "lessons": len(split_result.get("lessons") or []),
+            },
+            "final_rebuild": final_rebuild,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _finish_upload_progress(upload_id, total_files=1, completed_files=0, status="failed", message=str(exc), stage="failed", stage_label="Lỗi")
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        try:
+            if temp_src and os.path.exists(temp_src):
+                os.remove(temp_src)
+        except Exception:
+            pass
+        cleanup_split_result(split_result)

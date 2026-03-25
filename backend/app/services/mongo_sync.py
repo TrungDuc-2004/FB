@@ -458,10 +458,10 @@ def sync_minio_object_to_mongo(
             topic_name=_clean_str((topic_doc_for_level or {}).get("topicName") or topic_name),
             subject_name=_clean_str((subject_doc_for_level or {}).get("subjectName") or subject_name),
             file_path=local_file_path,
-            limit=15,
+            limit=10,
         )
     elif folder_type == "topic":
-        topic_desc, topic_keywords, _topic_ai_meta = generate_topic_description_and_keywords(
+        topic_desc, _topic_keywords_ai, _topic_ai_meta = generate_topic_description_and_keywords(
             topic_name=topic_name or topic_map or "",
             explicit_description=topic_desc,
             explicit_keywords=topic_keywords,
@@ -469,14 +469,16 @@ def sync_minio_object_to_mongo(
             file_path=local_file_path,
             limit=48,
         )
+        topic_keywords = []
     else:
-        subject_desc, subject_keywords, _subject_ai_meta = generate_subject_description_and_keywords(
+        subject_desc, _subject_keywords_ai, _subject_ai_meta = generate_subject_description_and_keywords(
             subject_name=subject_name or subject_title or subject_map or "",
             explicit_description=subject_desc,
             explicit_keywords=subject_keywords,
             file_path=local_file_path,
             limit=80,
         )
+        subject_keywords = []
 
     # ====== Collections ======
     COL_CLASSES = "classes"
@@ -518,8 +520,6 @@ def sync_minio_object_to_mongo(
         }
         if subject_desc:
             set_fields["subjectDescription"] = subject_desc
-        if subject_keywords:
-            set_fields["keywordSubject"] = subject_keywords
         # chỉ update url khi insert trong folder subjects
         if folder_type == "subject":
             set_fields["subjectUrl"] = file_url
@@ -533,7 +533,7 @@ def sync_minio_object_to_mongo(
                 "subjectTitle": subject_title,
                 "subjectUrl": file_url if folder_type == "subject" else "",
                 "subjectDescription": subject_desc,
-                "keywordSubject": subject_keywords,
+                "keywordSubject": subject_keywords or [],
                 "status": "active",
                 "createdBy": actor or "system",
                 "createdAt": now,
@@ -556,8 +556,6 @@ def sync_minio_object_to_mongo(
             }
             if topic_desc:
                 set_fields["topicDescription"] = topic_desc
-            if topic_keywords:
-                set_fields["keywordTopic"] = topic_keywords
             if folder_type == "topic":
                 set_fields["topicUrl"] = file_url
             db[COL_TOPICS].update_one({"_id": topic_id}, {"$set": set_fields})
@@ -570,7 +568,7 @@ def sync_minio_object_to_mongo(
                     "topicNumber": topic_number,
                     "topicUrl": file_url if folder_type == "topic" else "",
                     "topicDescription": topic_desc,
-                    "keywordTopic": topic_keywords,
+                    "keywordTopic": topic_keywords or [],
                     "status": "active",
                     "createdBy": actor or "system",
                     "createdAt": now,

@@ -411,7 +411,7 @@ export default function UserDocDetail() {
   const mediaGroups = groupMediaByFollowType(mediaItems);
   const keywords = buildKeywords(doc || {});
   const infoRows = buildInfoRows(doc || {}, itemType).filter((row) => safeText(row?.value) && row.value !== "—");
-  const showKeywords = itemType === "chunk" && keywords.length > 0;
+  const showKeywords = keywords.length > 0;
   const hasRelatedSection = hierarchyItems.length > 0 || mediaGroups.length > 0;
 
   if (loading) return <div className="user-doc-empty">Đang tải chi tiết tài liệu...</div>;
@@ -454,20 +454,18 @@ export default function UserDocDetail() {
                   <strong>{row.value}</strong>
                 </div>
               ))}
-              {itemType === "chunk" ? (
-                <div>
-                  <span>Keyword</span>
-                  {showKeywords ? (
-                    <div className="doc-keyword-list">
-                      {keywords.map((keyword) => (
-                        <span key={keyword} className="doc-keyword-chip">{keyword}</span>
-                      ))}
-                    </div>
-                  ) : (
-                    <strong>Chưa có keyword</strong>
-                  )}
-                </div>
-              ) : null}
+              <div>
+                <span>Keyword</span>
+                {showKeywords ? (
+                  <div className="doc-keyword-list">
+                    {keywords.map((keyword) => (
+                      <span key={keyword} className="doc-keyword-chip">{keyword}</span>
+                    ))}
+                  </div>
+                ) : (
+                  <strong>Chưa có keyword</strong>
+                )}
+              </div>
             </div>
           </div>
         </aside>

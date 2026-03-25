@@ -1427,6 +1427,100 @@ def remove_view_history_item(request: Request, chunkID: str, category: str = Que
     return {"removed": res.deleted_count > 0}
 
 
+
+
+def _uniq_keyword_names(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        clean = str(value or '').strip()
+        if not clean:
+            continue
+        key = clean.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(clean)
+    return out
+
+
+def _keyword_items_from_names(values: list[str]) -> list[dict]:
+    return [{"keywordName": value} for value in _uniq_keyword_names(values)]
+
+
+def _aggregate_hierarchy_keywords(kind: str, entity_id: str, pg: Optional[Session]) -> list[str]:
+    entity_id = str(entity_id or '').strip()
+    if not entity_id:
+        return []
+
+    if kind == 'lesson':
+        lesson_doc = _mongo_find_one_by_id(COL_LESSONS, 'lesson', entity_id) or {}
+        names = lesson_doc.get('keywordLesson') or lesson_doc.get('keywords') or []
+        if isinstance(names, str):
+            names = [x.strip() for x in re.split(r'[,;\n\r]+', names) if x.strip()]
+        return _uniq_keyword_names(list(names) if isinstance(names, list) else [])
+
+    if kind == 'topic':
+        lesson_docs = list(db_mongo[COL_LESSONS].find({**_id_match('topic', entity_id), 'status': _not_hidden_q()}, {'_id': 0, 'keywordLesson': 1}))
+        names: list[str] = []
+        for doc in lesson_docs:
+            values = doc.get('keywordLesson') or []
+            if isinstance(values, str):
+                values = [x.strip() for x in re.split(r'[,;\n\r]+', values) if x.strip()]
+            if isinstance(values, list):
+                names.extend([str(x or '').strip() for x in values if str(x or '').strip()])
+        if names:
+            return _uniq_keyword_names(names)
+        if pg is not None:
+            try:
+                lesson_ids = [row.lesson_id for row in pg.query(PgLesson).filter(PgLesson.topic_id == entity_id).all()]
+                for lesson_id in lesson_ids:
+                    lesson_doc = _mongo_find_one_by_id(COL_LESSONS, 'lesson', lesson_id) or {}
+                    values = lesson_doc.get('keywordLesson') or []
+                    if isinstance(values, list):
+                        names.extend([str(x or '').strip() for x in values if str(x or '').strip()])
+                return _uniq_keyword_names(names)
+            except Exception:
+                return _uniq_keyword_names(names)
+        return []
+
+    if kind == 'subject':
+        topic_docs = list(db_mongo[COL_TOPICS].find({**_id_match('subject', entity_id), 'status': _not_hidden_q()}, {'_id': 0, 'keywordTopic': 1}))
+        names: list[str] = []
+        for doc in topic_docs:
+            values = doc.get('keywordTopic') or []
+            if isinstance(values, str):
+                values = [x.strip() for x in re.split(r'[,;\n\r]+', values) if x.strip()]
+            if isinstance(values, list):
+                names.extend([str(x or '').strip() for x in values if str(x or '').strip()])
+        if names:
+            return _uniq_keyword_names(names)
+        if pg is not None:
+            try:
+                topic_ids = [row.topic_id for row in pg.query(PgTopic).filter(PgTopic.subject_id == entity_id).all()]
+                for topic_id in topic_ids:
+                    topic_doc = _mongo_find_one_by_id(COL_TOPICS, 'topic', topic_id) or {}
+                    values = topic_doc.get('keywordTopic') or []
+                    if isinstance(values, list):
+                        names.extend([str(x or '').strip() for x in values if str(x or '').strip()])
+                return _uniq_keyword_names(names)
+            except Exception:
+                return _uniq_keyword_names(names)
+        return []
+
+    if kind == 'class':
+        subject_docs = list(db_mongo[COL_SUBJECTS].find({**_id_match('class', entity_id), 'status': _not_hidden_q()}, {'_id': 0, 'keywordSubject': 1}))
+        names: list[str] = []
+        for doc in subject_docs:
+            values = doc.get('keywordSubject') or []
+            if isinstance(values, str):
+                values = [x.strip() for x in re.split(r'[,;\n\r]+', values) if x.strip()]
+            if isinstance(values, list):
+                names.extend([str(x or '').strip() for x in values if str(x or '').strip()])
+        return _uniq_keyword_names(names)
+
+    return []
+
 @router.get("/{chunkID}")
 def get_doc_detail(
     request: Request,
@@ -1469,11 +1563,11 @@ def get_doc_detail(
                 keyword_items = []
 
         doc["keywordItems"] = keyword_items
-        doc["keywords"] = [
+        doc["keywords"] = _uniq_keyword_names([
             _get_any(item, ["keywordName", "keyword_name", "keyword", "name"], "")
             for item in keyword_items
             if _get_any(item, ["keywordName", "keyword_name", "keyword", "name"], "")
-        ]
+        ])
 
         related = []
         lesson_id = _get_any(doc.get("lesson") or {}, ["lessonID", "lessonId", "lesson_id"], "")
@@ -1505,6 +1599,9 @@ def get_doc_detail(
 
         doc["related"] = related
     else:
+        aggregated_keywords = _aggregate_hierarchy_keywords(doc.get("itemType") or category, chunkID, pg)
+        doc["keywords"] = aggregated_keywords
+        doc["keywordItems"] = _keyword_items_from_names(aggregated_keywords)
         doc.setdefault("related", [])
 
     return doc

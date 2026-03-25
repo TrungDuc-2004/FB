@@ -5,6 +5,7 @@ import DataTable from "../../components/DataTable";
 import CreateFolderModal from "../../components/CreateFolderModal";
 import UploadFileModal from "../../components/UploadFileModal";
 import InsertMetadataModal from "../../components/InsertMetadataModal";
+import UploadAutoModal from "../../components/UploadAutoModal";
 import FilterModal from "../../components/FilterModal";
 
 function getExt(name = "") {
@@ -74,6 +75,7 @@ export default function MinIO() {
   const [openCreateFolder, setOpenCreateFolder] = useState(false);
   const [openUpload, setOpenUpload] = useState(false);
   const [openInsert, setOpenInsert] = useState(false);
+  const [openUploadAuto, setOpenUploadAuto] = useState(false);
   const [openFilter, setOpenFilter] = useState(false);
 
   // filters: loai + type
@@ -424,6 +426,12 @@ export default function MinIO() {
     return isFileView;
   }
 
+  function canUploadAutoHere() {
+    if (!isStorage) return false;
+    const tail = normalizeFolderType(parts[parts.length - 1] || "");
+    return section === "documents" && (tail === "subject" || tail === "topic");
+  }
+
   async function uploadFile(file, { onProgress } = {}) {
     if (!canUploadHere()) return;
 
@@ -470,6 +478,20 @@ export default function MinIO() {
       }
     } catch (e) {
       alert(String(e?.message || e));
+    }
+  }
+
+  async function uploadAuto(file, { bookVariant = "", onProgress } = {}) {
+    if (!canUploadAutoHere()) return;
+
+    try {
+      await minioApi.uploadAuto(currentPath, file, { bookVariant, onProgress });
+      setOpenUploadAuto(false);
+      const data = await minioApi.minioList(currentPath);
+      setRemote({ folders: data.folders || [], files: data.files || [] });
+    } catch (e) {
+      alert(String(e?.message || e));
+      throw e;
     }
   }
 
@@ -568,12 +590,14 @@ export default function MinIO() {
 
             {canUploadHere() && (
               <>
-                {/* <button className="btn btn-primary" onClick={() => setOpenUpload(true)}>
-                  Upload
-                </button> */}
                 <button className="btn btn-primary" onClick={() => setOpenInsert(true)}>
                   Upload
                 </button>
+                {canUploadAutoHere() && (
+                  <button className="btn btn-primary" onClick={() => setOpenUploadAuto(true)}>
+                    Upload auto
+                  </button>
+                )}
               </>
             )}
 
@@ -685,6 +709,13 @@ export default function MinIO() {
         onClose={() => setOpenInsert(false)}
         folderName={currentPath}
         onInsert={insertItem}
+      />
+
+      <UploadAutoModal
+        open={openUploadAuto}
+        onClose={() => setOpenUploadAuto(false)}
+        currentPath={currentPath}
+        onUploadAuto={uploadAuto}
       />
 
       <FilterModal

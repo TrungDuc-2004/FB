@@ -185,7 +185,7 @@ def _chunk_prompt(*, chunk_name: str, lesson_name: str, topic_name: str, subject
     )
 
 
-def _lesson_prompt(*, lesson_name: str, topic_name: str, subject_name: str, num_keywords: int = 15) -> str:
+def _lesson_prompt(*, lesson_name: str, topic_name: str, subject_name: str, num_keywords: int = 10) -> str:
     scope_lines = []
     if subject_name:
         scope_lines.append(f"Môn: {subject_name}")
@@ -389,7 +389,7 @@ def generate_lesson_description_and_keywords(
     topic_name: str = "",
     subject_name: str = "",
     file_path: str = "",
-    limit: int = 15,
+    limit: int = 10,
 ) -> Tuple[str, List[str], Dict[str, Any]]:
     manual_keywords = _normalize_keywords(list(explicit_keywords or []), limit=limit)
     description = _clean(explicit_description)
@@ -414,7 +414,6 @@ def generate_lesson_description_and_keywords(
     final_keywords = _uniq_keep_order([
         *manual_keywords,
         *ai_keywords,
-        *_description_seed_keywords(final_description, limit=limit),
         *_fallback_keywords(lesson_name, final_description, lesson_name, topic_name, limit=limit),
     ], limit=limit)
     return final_description, final_keywords, meta
