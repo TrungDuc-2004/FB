@@ -1,5 +1,5 @@
 // pages/admin/MongoDB.jsx
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "../../styles/admin/page.css";
 import "../../styles/admin/modal.css";
 import DataTable from "../../components/DataTable";
@@ -145,11 +145,7 @@ function defaultPairsForCollection(col) {
 
 /** ===== Mini modal: Create/Rename Collection ===== */
 function CollectionModal({ open, onClose, initialName = "", title, onSubmit }) {
-  const [name, setName] = useState(initialName);
-
-  useEffect(() => {
-    setName(initialName || "");
-  }, [initialName, open]);
+  const [name, setName] = useState(initialName || "");
 
   if (!open) return null;
 
@@ -198,19 +194,11 @@ function CollectionModal({ open, onClose, initialName = "", title, onSubmit }) {
 
 /** ===== Modal: Create/Edit Document (fields động) ===== */
 function DocumentModal({ open, onClose, title, initialDoc, onSave, collectionName }) {
-  const [pairs, setPairs] = useState([]);
-
-  useEffect(() => {
-    if (!open) return;
-
-    if (!initialDoc) {
-      setPairs(defaultPairsForCollection(collectionName));
-      return;
-    }
-
+  const [pairs, setPairs] = useState(() => {
+    if (!initialDoc) return defaultPairsForCollection(collectionName);
     const fields = initialDoc.fields || [];
-    setPairs(fields.length ? fields : defaultPairsForCollection(collectionName));
-  }, [open, initialDoc, collectionName]);
+    return fields.length ? fields : defaultPairsForCollection(collectionName);
+  });
 
   if (!open) return null;
 
@@ -579,7 +567,7 @@ export default function MongoDB() {
 
   const [collections, setCollections] = useState([]);
   const [docs, setDocs] = useState([]);
-  const [totalDocs, setTotalDocs] = useState(0);
+  const [, setTotalDocs] = useState(0);
 
   const [err, setErr] = useState("");
 
@@ -641,12 +629,31 @@ export default function MongoDB() {
   }
 
   useEffect(() => {
-    reloadCollections();
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      if (cancelled) return;
+      reloadCollections();
+    }, 0);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, []);
 
   useEffect(() => {
-    if (!currentCollection) return;
-    reloadDocs(currentCollection);
+    if (!currentCollection) return undefined;
+
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      if (cancelled) return;
+      reloadDocs(currentCollection);
+    }, 0);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [currentCollection]);
 
   const selectedDoc = useMemo(() => {
@@ -664,7 +671,7 @@ export default function MongoDB() {
     return typeof val === "string" ? val : JSON.stringify(val);
   }
 
-  function buildPairsFromDoc(doc) {
+  const buildPairsFromDoc = useCallback((doc) => {
     if (!doc) return [];
 
     const keys = Object.keys(doc).sort((a, b) => a.localeCompare(b));
@@ -684,16 +691,25 @@ export default function MongoDB() {
       v: formatVal(k, doc[k]),
       locked: LOCK_FIELDS.has(k),
     }));
-  }
+  }, []);
 
   useEffect(() => {
-    if (!selectedDoc) {
-      setDetailPairs([]);
-      return;
-    }
-    if (isEditingDoc) return;
-    setDetailPairs(buildPairsFromDoc(selectedDoc));
-  }, [selectedDoc, isEditingDoc]);
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      if (cancelled) return;
+      if (!selectedDoc) {
+        setDetailPairs([]);
+        return;
+      }
+      if (isEditingDoc) return;
+      setDetailPairs(buildPairsFromDoc(selectedDoc));
+    }, 0);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [selectedDoc, isEditingDoc, buildPairsFromDoc]);
 
   const headerTitle = useMemo(() => {
     if (isRoot) return "MongoDB";
@@ -1193,6 +1209,7 @@ export default function MongoDB() {
       </div>
 
       <CollectionModal
+        key={`create-col-${openCreateCol ? "open" : "closed"}`}
         open={openCreateCol}
         onClose={() => setOpenCreateCol(false)}
         title="Tạo collection mới"
@@ -1200,6 +1217,7 @@ export default function MongoDB() {
       />
 
       <CollectionModal
+        key={`rename-col-${renameTarget?.name || "new"}-${openRenameCol ? "open" : "closed"}`}
         open={openRenameCol}
         onClose={() => {
           setOpenRenameCol(false);
@@ -1211,6 +1229,7 @@ export default function MongoDB() {
       />
 
       <DocumentModal
+        key={`create-doc-${currentCollection || "none"}-${openCreateDoc ? "open" : "closed"}`}
         open={openCreateDoc}
         onClose={() => setOpenCreateDoc(false)}
         title={`Tạo document mới (${currentCollection})`}
@@ -1220,6 +1239,7 @@ export default function MongoDB() {
       />
 
       <DocumentModal
+        key={`edit-doc-${editDocTarget?._id || "new"}-${openEditDoc ? "open" : "closed"}`}
         open={openEditDoc}
         onClose={() => {
           setOpenEditDoc(false);

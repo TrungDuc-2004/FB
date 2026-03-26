@@ -32,22 +32,52 @@ export default function Neo4j() {
   }
 
   useEffect(() => {
-    reloadLabels().catch((e) => console.error(e));
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      if (cancelled) return;
+      reloadLabels().catch((e) => console.error(e));
+    }, 0);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, []);
 
   useEffect(() => {
-    if (!currentLabel) return;
-    reloadNodes(currentLabel)
-      .then(() => setSelectedNode(null))
-      .catch((e) => console.error(e));
+    if (!currentLabel) return undefined;
+
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      if (cancelled) return;
+      reloadNodes(currentLabel)
+        .then(() => {
+          if (!cancelled) setSelectedNode(null);
+        })
+        .catch((e) => console.error(e));
+    }, 0);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [currentLabel]);
 
   useEffect(() => {
-    if (!currentNodeId) {
-      setSelectedNode(null);
-      return;
-    }
-    reloadNodeDetail(currentNodeId).catch((e) => console.error(e));
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      if (cancelled) return;
+      if (!currentNodeId) {
+        setSelectedNode(null);
+        return;
+      }
+      reloadNodeDetail(currentNodeId).catch((e) => console.error(e));
+    }, 0);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [currentNodeId]);
 
   const headerTitle = useMemo(() => {

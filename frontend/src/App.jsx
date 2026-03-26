@@ -16,7 +16,6 @@ import UsersPage from "./pages/admin/Users";
 
 import UserHome from "./pages/user/UserHome";
 import Search from "./pages/user/UserSearch";
-import Library from "./pages/user/UserLibrary";
 import Saved from "./pages/user/UserSaved";
 import History from "./pages/user/UserHistory";
 import DocumentDetail from "./pages/user/UserDocDetail";
@@ -58,9 +57,6 @@ export default function App() {
         >
           <Route index element={<UserHome />} />
           <Route path="search" element={<Search />} />
-          <Route path="library" element={<Library />} />
-          <Route path="list" element={<Navigate to="/user/library" replace />} />
-          <Route path="user-library" element={<Library />} />
           <Route path="saved" element={<Saved />} />
           <Route path="history" element={<History />} />
           <Route path="docs/:chunkID" element={<DocumentDetail />} />

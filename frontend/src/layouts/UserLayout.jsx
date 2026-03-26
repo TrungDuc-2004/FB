@@ -131,7 +131,7 @@ function QuickInfoCard({ title, value }) {
 }
 
 export default function UserLayout() {
-  const { IHome, IBook, ISearch, IStar, IUser } = DashboardIcons;
+  const { IHome, ISearch, IStar, IUser } = DashboardIcons;
   const navigate = useNavigate();
   const location = useLocation();
   const menuRef = useRef(null);
@@ -168,11 +168,10 @@ export default function UserLayout() {
       { to: "/user", label: "Trang chủ", icon: IHome, end: true },
       { to: "/user/search", label: "Tìm kiếm", icon: ISearch },
       { to: "/user/history", label: "Lịch sử", icon: <HistoryIcon /> },
-      { to: "/user/library", label: "Thư viện", icon: IBook },
       { to: "/user/saved", label: "Đã lưu", icon: IStar },
       { to: "/user/profile", label: "Hồ sơ", icon: IUser },
     ],
-    [IBook, IHome, ISearch, IStar, IUser]
+    [IHome, ISearch, IStar, IUser]
   );
 
   useEffect(() => {

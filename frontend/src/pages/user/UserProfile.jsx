@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
 import "../../styles/user/profile.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
@@ -67,7 +66,6 @@ function patchStoredProfile(next) {
 }
 
 export default function UserProfile() {
-  const navigate = useNavigate();
   const fileInputRef = useRef(null);
   const localPreviewUrlRef = useRef("");
 
@@ -362,14 +360,6 @@ export default function UserProfile() {
     }
   }
 
-  function logout() {
-    localStorage.removeItem("role");
-    localStorage.removeItem("user_id");
-    localStorage.removeItem("username");
-    localStorage.removeItem(AVATAR_STORAGE_KEY);
-    window.dispatchEvent(new Event("account-profile-updated"));
-    navigate("/login");
-  }
 
   return (
     <div className="user-profile-page">

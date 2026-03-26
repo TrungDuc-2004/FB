@@ -719,6 +719,7 @@ export default function MinIO() {
       />
 
       <FilterModal
+        key={`${openFilter}-${filters.loai}-${filters.type}`}
         open={openFilter}
         onClose={() => setOpenFilter(false)}
         initialValue={filters}

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 export default function FilterModal({
   open,
@@ -7,14 +7,10 @@ export default function FilterModal({
   onApply,
   availableTypes = [],
 }) {
-  const [loai, setLoai] = useState("all");
-  const [type, setType] = useState("all");
-
-  useEffect(() => {
-    if (!open) return;
-    setLoai(initialValue?.loai ?? "all");
-    setType(initialValue?.type ?? "all");
-  }, [open, initialValue]);
+  const [draft, setDraft] = useState(() => ({
+    loai: initialValue?.loai ?? "all",
+    type: initialValue?.type ?? "all",
+  }));
 
   if (!open) return null;
 
@@ -29,7 +25,10 @@ export default function FilterModal({
         <div className="modal-body">
           <div className="form-row">
             <label>Loại</label>
-            <select value={loai} onChange={(e) => setLoai(e.target.value)}>
+            <select
+              value={draft.loai}
+              onChange={(e) => setDraft((prev) => ({ ...prev, loai: e.target.value }))}
+            >
               <option value="all">Tất cả loại</option>
               <option value="document">Document</option>
               <option value="image">Image</option>
@@ -39,7 +38,10 @@ export default function FilterModal({
 
           <div className="form-row">
             <label>Type (đuôi file)</label>
-            <select value={type} onChange={(e) => setType(e.target.value)}>
+            <select
+              value={draft.type}
+              onChange={(e) => setDraft((prev) => ({ ...prev, type: e.target.value }))}
+            >
               <option value="all">Tất cả type</option>
               {availableTypes.map((t) => (
                 <option key={t} value={t}>
@@ -54,8 +56,7 @@ export default function FilterModal({
           <button
             className="btn"
             onClick={() => {
-              setLoai("all");
-              setType("all");
+              setDraft({ loai: "all", type: "all" });
             }}
           >
             Reset bộ lọc
@@ -64,7 +65,7 @@ export default function FilterModal({
           <button
             className="btn btn-primary"
             onClick={() => {
-              onApply({ loai, type });
+              onApply(draft);
               onClose();
             }}
           >

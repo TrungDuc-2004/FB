@@ -144,7 +144,7 @@ function deriveResolvedPath(folderName = "", meta = {}, category = "document") {
 }
 
 function stripFileExtension(filename = "") {
-  const base = String(filename || "").trim().split(/[\/]/).pop() || "";
+  const base = String(filename || "").trim().replaceAll("\\", "/").split("/").pop() || "";
   return base.replace(/\.[^/.]+$/, "").trim();
 }
 

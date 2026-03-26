@@ -812,6 +812,7 @@ export default function DashboardShell({
   );
 }
 
+// eslint-disable-next-line react-refresh/only-export-components
 export const DashboardIcons = {
   IHome,
   IMinio,

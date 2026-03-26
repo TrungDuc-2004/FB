@@ -65,12 +65,31 @@ export default function PostgreSQL() {
   }
 
   useEffect(() => {
-    reloadTables();
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      if (cancelled) return;
+      reloadTables();
+    }, 0);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, []);
 
   useEffect(() => {
-    if (!currentTable) return;
-    reloadRows(currentTable);
+    if (!currentTable) return undefined;
+
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      if (cancelled) return;
+      reloadRows(currentTable);
+    }, 0);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [currentTable]);
 
   const headerTitle = useMemo(() => {

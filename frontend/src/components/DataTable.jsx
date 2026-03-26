@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import "../styles/admin/table.css";
 
 export default function DataTable({
@@ -48,20 +48,22 @@ export default function DataTable({
   }, [pageSize, columns.length, rows.length]);
 
   // ✅ size cuối cùng
-  const size = pageSize === -1 ? 0 : (pageSize && pageSize > 0 ? pageSize : autoSize);
+  const size = pageSize === -1 ? 0 : pageSize && pageSize > 0 ? pageSize : autoSize;
   const totalPages = size > 0 ? Math.max(1, Math.ceil(total / size)) : 1;
+  const datasetKey = `${total}:${size}`;
 
-  const [page, setPage] = useState(1);
+  const [pagination, setPagination] = useState(() => ({ key: datasetKey, page: 1 }));
+  const page = pagination.key === datasetKey ? Math.min(pagination.page, totalPages) : 1;
 
-  // reset page khi folder/search đổi dữ liệu
-  useEffect(() => {
-    setPage(1);
-  }, [total, size]);
-
-  // clamp nếu size thay đổi làm totalPages giảm
-  useEffect(() => {
-    if (page > totalPages) setPage(totalPages);
-  }, [page, totalPages]);
+  function updatePage(nextPageOrUpdater) {
+    setPagination((prev) => {
+      const basePage = prev.key === datasetKey ? Math.min(prev.page, totalPages) : 1;
+      const rawNext =
+        typeof nextPageOrUpdater === "function" ? nextPageOrUpdater(basePage) : nextPageOrUpdater;
+      const safeNext = Math.min(totalPages, Math.max(1, Number(rawNext) || 1));
+      return { key: datasetKey, page: safeNext };
+    });
+  }
 
   const visibleRows = useMemo(() => {
     if (!size || size <= 0) return rows;
@@ -119,7 +121,7 @@ export default function DataTable({
               type="button"
               className="btn"
               disabled={page <= 1}
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              onClick={() => updatePage((p) => Math.max(1, p - 1))}
             >
               ← Trước
             </button>
@@ -132,7 +134,7 @@ export default function DataTable({
               type="button"
               className="btn"
               disabled={page >= totalPages}
-              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              onClick={() => updatePage((p) => Math.min(totalPages, p + 1))}
             >
               Sau →
             </button>

@@ -50,11 +50,6 @@ export default function UserHome() {
   const quickLinks = useMemo(
     () => [
       {
-        label: "Thư viện",
-        hint: "Duyệt theo lớp · môn · chủ đề · bài",
-        onClick: () => navigate("/user/library"),
-      },
-      {
         label: "Tìm kiếm",
         hint: "Gõ câu hỏi tự nhiên hoặc từ khóa",
         onClick: () => navigate("/user/search"),
@@ -63,6 +58,11 @@ export default function UserHome() {
         label: "Đã lưu",
         hint: "Xem lại những nội dung quan trọng",
         onClick: () => navigate("/user/saved"),
+      },
+      {
+        label: "Lịch sử",
+        hint: "Mở lại những tài liệu đã xem gần đây",
+        onClick: () => navigate("/user/history"),
       },
     ],
     [navigate]
@@ -146,9 +146,6 @@ export default function UserHome() {
             <button className="btn btn-primary" type="submit">
               Tìm kiếm
             </button>
-            <button className="btn" type="button" onClick={() => navigate("/user/library")}>
-              Mở thư viện
-            </button>
           </form>
 
           <div className="user-home-stat-row">
@@ -182,8 +179,8 @@ export default function UserHome() {
         <SectionHeader
           title="Tài liệu đang có"
           subtitle="Các tài liệu mới cập nhật để mở nhanh từ trang chủ."
-          actionLabel="Xem thư viện"
-          onAction={() => navigate("/user/library")}
+          actionLabel="Tìm tài liệu"
+          onAction={() => navigate("/user/search")}
         />
 
         {loading && !feed.documents.length ? (

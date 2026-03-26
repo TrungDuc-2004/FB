@@ -5,9 +5,6 @@ import "../../styles/admin/modal.css";
 import DataTable from "../../components/DataTable";
 import * as userApi from "../../services/userMongoApi";
 
-function nowStr() {
-  return new Date().toISOString().slice(0, 16).replace("T", " ");
-}
 
 function fmtTime(s) {
   // Mongo jsonable_encoder thường ra ISO: 2026-01-27T09:00:00+00:00
@@ -20,16 +17,8 @@ function fmtTime(s) {
 function UserModal({ open, onClose, title, initial, onSave }) {
   const [username, setUsername] = useState(initial?.username || "");
   const [password, setPassword] = useState(""); // edit cũng bắt nhập lại
-  const [role, setRole] = useState(initial?.role || "users");
+  const [role, setRole] = useState(initial?.role || "user");
   const [active, setActive] = useState(initial?.active ?? true);
-
-  useEffect(() => {
-    if (!open) return;
-    setUsername(initial?.username || "");
-    setPassword("");
-    setRole(initial?.role || "user");
-    setActive(initial?.active ?? true);
-  }, [open, initial]);
 
   if (!open) return null;
 
@@ -143,11 +132,20 @@ export default function Users() {
   }
 
   useEffect(() => {
-    reloadUsers().catch((e) => {
-      console.error(e);
-      setError(e.message || String(e));
-      setLoading(false);
-    });
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      reloadUsers().catch((e) => {
+        if (cancelled) return;
+        console.error(e);
+        setError(e.message || String(e));
+        setLoading(false);
+      });
+    }, 0);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, []);
 
   const rows = useMemo(() => {
@@ -331,6 +329,7 @@ export default function Users() {
       </div>
 
       <UserModal
+        key={`create-${openCreate ? "open" : "closed"}`}
         open={openCreate}
         onClose={() => setOpenCreate(false)}
         title="Thêm User"
@@ -339,6 +338,7 @@ export default function Users() {
       />
 
       <UserModal
+        key={`edit-${editTarget?.id || "new"}-${openEdit ? "open" : "closed"}`}
         open={openEdit}
         onClose={() => {
           setOpenEdit(false);

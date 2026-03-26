@@ -83,53 +83,10 @@ export function normalizeSearchResponse(payload) {
   return { total, items };
 }
 
-export function listClasses({ category = "all" } = {}) {
-  const url = new URL(`${API_BASE}/user/docs/classes`);
-  url.searchParams.set("category", category);
-  url.searchParams.set("_ts", String(Date.now()));
-  return httpJson(url.toString(), { method: "GET" });
-}
 
-export function listSubjects({ classID = "", category = "all" } = {}) {
-  const url = new URL(`${API_BASE}/user/docs/subjects`);
-  if (classID) url.searchParams.set("classID", classID);
-  url.searchParams.set("category", category);
-  url.searchParams.set("_ts", String(Date.now()));
-  return httpJson(url.toString(), { method: "GET" });
-}
 
-export function listTopics({ subjectID = "", category = "all" } = {}) {
-  const url = new URL(`${API_BASE}/user/docs/topics`);
-  if (subjectID) url.searchParams.set("subjectID", subjectID);
-  url.searchParams.set("category", category);
-  url.searchParams.set("_ts", String(Date.now()));
-  return httpJson(url.toString(), { method: "GET" });
-}
 
-export function listLessons({ topicID = "", category = "all" } = {}) {
-  const url = new URL(`${API_BASE}/user/docs/lessons`);
-  if (topicID) url.searchParams.set("topicID", topicID);
-  url.searchParams.set("category", category);
-  url.searchParams.set("_ts", String(Date.now()));
-  return httpJson(url.toString(), { method: "GET" });
-}
 
-export function listChunks({
-  lessonID = "",
-  category = "document",
-  limit = 50,
-  offset = 0,
-  sort = "name",
-} = {}) {
-  const url = new URL(`${API_BASE}/user/docs`);
-  if (lessonID) url.searchParams.set("lessonID", lessonID);
-  url.searchParams.set("category", category);
-  url.searchParams.set("limit", String(limit));
-  url.searchParams.set("offset", String(offset));
-  url.searchParams.set("sort", sort);
-  url.searchParams.set("_ts", String(Date.now()));
-  return httpJson(url.toString(), { method: "GET" });
-}
 
 export function getHomeFeed({ limit = 6 } = {}) {
   const url = new URL(`${API_BASE}/user/docs/home`);
