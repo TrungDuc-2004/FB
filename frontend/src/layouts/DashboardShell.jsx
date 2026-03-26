@@ -559,7 +559,6 @@ function AccountModal({
         <div className="account-modal-header">
           <div>
             <div className="account-modal-title">{title}</div>
-            <div className="account-modal-subtitle">Xem và cập nhật tài khoản đang đăng nhập</div>
           </div>
           <button className="account-modal-close" type="button" onClick={onClose}>
             ×

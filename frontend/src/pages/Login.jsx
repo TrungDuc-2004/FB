@@ -51,68 +51,85 @@ export default function Login() {
   }
 
   return (
-    <div className="login-page">
-      <div className="background-image"></div>
-      <div className="login-container">
-        <div className="login-card">
-          <div className="header">
-            <div className="logo">
-              <img src="/logo.png" alt="Logo trường" />
+    <div className="lp-root">
+      <div className="lp-bg" aria-hidden="true" />
+      <div className="lp-overlay" aria-hidden="true" />
+      <div className="lp-blob lp-blob--1" aria-hidden="true" />
+      <div className="lp-blob lp-blob--2" aria-hidden="true" />
+      <div className="lp-blob lp-blob--3" aria-hidden="true" />
+
+      <main className="lp-main">
+        <section className="lp-card" aria-label="Đăng nhập">
+          <header className="lp-header">
+            <img
+              className="lp-logo"
+              src="/logo-hcmue.png"
+              alt="Logo"
+              onError={(e) => {
+                e.currentTarget.src = "/logo.png";
+              }}
+            />
+            <div>
+              <h1 className="lp-title">ĐĂNG NHẬP</h1>
+              <p className="lp-subtitle">Cổng thông tin đào tạo</p>
             </div>
-            <div className="school-info">
-              <h1 className="school-name">ĐH Sư phạm TP. Hồ Chí Minh</h1>
-              <div className="school-subtitle">Khoá Luận Tốt Nghiệp</div>
-            </div>
-          </div>
+          </header>
 
-          <div className="form-container">
-            <h2 className="form-title">Đăng nhập hệ thống</h2>
-
-            <form className="login-form" onSubmit={handleSubmit}>
-              <div className="input-group">
-                <div className="input-field">
-                  <input
-                    type="text"
-                    placeholder="Tên đăng nhập"
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value)}
-                    className="input-control"
-                    disabled={isLoading}
-                    autoFocus
-                  />
-                </div>
-
-                <div className="input-field">
-                  <input
-                    type="password"
-                    placeholder="Mật khẩu"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    className="input-control"
-                    disabled={isLoading}
-                  />
-                </div>
+          <form className="lp-form" onSubmit={handleSubmit}>
+            <label className="lp-label">
+              <span className="lp-labelText">Tên đăng nhập</span>
+              <div className="lp-inputWrap">
+                <span className="lp-icon" aria-hidden="true">👤</span>
+                <input
+                  className="lp-input"
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="Nhập tên đăng nhập"
+                  autoComplete="username"
+                  disabled={isLoading}
+                  autoFocus
+                />
               </div>
+            </label>
 
-              {error && (
-                <div className="error-message">
-                  <span className="error-icon">!</span>
-                  <span>{error}</span>
-                </div>
-              )}
+            <label className="lp-label">
+              <span className="lp-labelText">Mật khẩu</span>
+              <div className="lp-inputWrap">
+                <span className="lp-icon" aria-hidden="true">🔒</span>
+                <input
+                  className="lp-input"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Nhập mật khẩu"
+                  autoComplete="current-password"
+                  disabled={isLoading}
+                />
+              </div>
+            </label>
 
-              <button type="submit" className="submit-btn" disabled={isLoading}>
-                {isLoading ? "Đang đăng nhập..." : "Đăng nhập"}
-              </button>
-            </form>
+            {error ? (
+              <div className="lp-alert err" role="alert">
+                {error}
+              </div>
+            ) : null}
 
-            <div className="auth-links auth-links-center">
-              <Link to="/register">Đăng ký tài khoản</Link>
-              <Link to="/forgot-password">Quên mật khẩu</Link>
+            <button className="lp-submit" type="submit" disabled={isLoading}>
+              <span>{isLoading ? "Đang đăng nhập..." : "Đăng nhập"}</span>
+            </button>
+
+            <div className="lp-authLinks">
+              <Link className="lp-link" to="/register">
+                Đăng ký tài khoản
+              </Link>
+              <Link className="lp-link" to="/forgot-password">
+                Quên mật khẩu
+              </Link>
             </div>
-          </div>
-        </div>
-      </div>
+          </form>
+        </section>
+      </main>
     </div>
   );
 }

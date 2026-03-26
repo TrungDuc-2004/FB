@@ -366,7 +366,7 @@ export default function UserProfile() {
       <div className="user-profile-head">
         <div>
           <h1>Tài khoản</h1>
-          <p>Xem và cập nhật tài khoản đang đăng nhập</p>
+          
         </div>
       </div>
 
@@ -419,7 +419,7 @@ export default function UserProfile() {
 
             <label className="user-profile-field">
               <span>Trạng thái</span>
-              <input value={meta.isActive ? "Active" : "Disabled"} readOnly disabled />
+              <input value={meta.isActive ? "Đang hoạt động" : "Đã vô hiệu"} readOnly disabled />
             </label>
           </div>
 
@@ -457,10 +457,10 @@ export default function UserProfile() {
               onClick={() => resetFormFromProfile(sessionProfile, { isActive: meta.isActive })}
               disabled={isSaving}
             >
-              Hoàn tác
+              Hủy
             </button>
             <button className="user-profile-primary-btn" type="submit" disabled={isLoading || isSaving}>
-              {isSaving ? "Đang lưu..." : "Lưu thay đổi"}
+              {isSaving ? "Đang lưu..." : "Xác nhận"}
             </button>
           </div>
         </form>

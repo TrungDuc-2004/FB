@@ -93,7 +93,7 @@ export default function PostgreSQL() {
   }, [currentTable]);
 
   const headerTitle = useMemo(() => {
-    if (isRoot) return "PostgreSQL";
+    if (isRoot) return "Dữ liệu có cấu trúc";
     if (isRowDetail) {
       const r = rows.find((x) => String(x._pk) === String(currentPk)) || null;
       return rowTitle(r) || String(currentPk);
@@ -103,8 +103,8 @@ export default function PostgreSQL() {
 
   const breadcrumbParts = useMemo(() => {
     if (isRoot) return [];
-    if (isRowDetail) return ["postgres", currentTable, String(currentPk)];
-    return ["postgres", currentTable];
+    if (isRowDetail) return ["Dữ liệu có cấu trúc", currentTable, String(currentPk)];
+    return ["Dữ liệu có cấu trúc", currentTable];
   }, [isRoot, isRowDetail, currentTable, currentPk]);
 
   function goBack() {
@@ -277,7 +277,7 @@ export default function PostgreSQL() {
 
             {!isRoot && (
               <button className="back-btn back-btn-right" onClick={goBack}>
-                Back →
+                Quay lại
               </button>
             )}
           </div>

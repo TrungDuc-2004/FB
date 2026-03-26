@@ -7,7 +7,7 @@ from ..models import model_postgre as pg_models
 from ..services.postgre_client import get_session_local
 from ..services.postgre_sync_from_mongo import sync_postgre_from_mongo_auto_ids
 from ..services.neo_sync import sync_neo4j_from_maps_and_pg_ids
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Tuple, Optional, Set
 from uuid import uuid4
 from fastapi.encoders import jsonable_encoder
 from bson import ObjectId
@@ -172,6 +172,45 @@ def _user_normalize_and_validate(
 
 def _clean_str(value: Any) -> str:
     return str(value or "").strip()
+
+
+IMMUTABLE_FIELD_NAMES: Set[str] = {
+    "_id",
+    "mongo_id",
+    "pg_id",
+    "created_at",
+    "created_by",
+    "updated_at",
+    "updated_by",
+    "deleted_at",
+    "deleted_by",
+    "createdAt",
+    "createdBy",
+    "updatedAt",
+    "updatedBy",
+    "deletedAt",
+    "deletedBy",
+    "is_deleted",
+}
+
+
+def _is_immutable_field(field_name: str) -> bool:
+    key = _clean_str(field_name)
+    if not key:
+        return False
+    if key in IMMUTABLE_FIELD_NAMES:
+        return True
+    return key.endswith("_id") or key.endswith("ID") or key.endswith("Id")
+
+
+def _reject_or_strip_immutable_updates(body: Dict[str, Any]) -> Dict[str, Any]:
+    blocked = sorted({k for k in list(body.keys()) if _is_immutable_field(k)})
+    if blocked:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Các trường không được phép sửa: {', '.join(blocked)}",
+        )
+    return body
 
 
 def _sync_user_mongo_to_postgre(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -414,8 +453,7 @@ def update_document(
     now = _now()
 
     body.pop("_id", None)
-    body.pop("created_at", None)
-    body.pop("created_by", None)
+    body = _reject_or_strip_immutable_updates(body)
 
     if not body:
         raise HTTPException(status_code=422, detail="Not field change to updated")
@@ -462,17 +500,39 @@ def update_document(
     }
 
 
-@router.delete("/documents/{collection_name}/{oid}", summary="Delete document (generic)")
-def delete_document(collection_name: str = Path(...), oid: str = Path(...)):
+@router.delete("/documents/{collection_name}/{oid}", summary="Ẩn document (soft delete)")
+def delete_document(
+    collection_name: str = Path(...),
+    oid: str = Path(...),
+    request: Request = None,
+):
     col = _normalize_collection_name(collection_name)
     _check_collection_exist(col)
 
-    exist, id_filter = _find_one_by_any_key(col, oid, {"_id": 1})
+    exist, id_filter = _find_one_by_any_key(col, oid, {"_id": 1, "status": 1})
     if not exist or not id_filter:
         raise HTTPException(status_code=404, detail=f"_id: '{oid}' not exist")
 
-    r = db[col].delete_one(id_filter)
-    return {"deleted": True, "deleted_count": r.deleted_count, "_id": oid}
+    actor = _get_actor(request)
+    now = _now()
+
+    update_payload = {
+        "status": "hidden",
+        "is_deleted": True,
+        "deleted_at": now,
+        "updated_at": now,
+        "updated_by": actor,
+    }
+
+    r = db[col].update_one(id_filter, {"$set": update_payload})
+    return {
+        "deleted": True,
+        "soft_deleted": True,
+        "matched": r.matched_count,
+        "modified": r.modified_count,
+        "_id": oid,
+        "status": "hidden",
+    }
 
 
 # ========================= BULK IMPORT =========================

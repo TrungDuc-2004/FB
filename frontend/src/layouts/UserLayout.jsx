@@ -316,11 +316,6 @@ export default function UserLayout() {
           />
 
           <div className="user-site-header-right">
-            <div className="user-site-quick-wrap">
-              <QuickInfoCard title="Tra cứu" value="Nhanh hơn" />
-              <QuickInfoCard title="Giao diện" value="Gọn & hiện đại" />
-            </div>
-
             <div className="user-site-user-menu" ref={menuRef}>
               <button
                 className={`user-site-user-trigger${menuOpen ? " open" : ""}`}
@@ -383,10 +378,6 @@ export default function UserLayout() {
               </NavLink>
             ))}
           </nav>
-
-          <div className="user-site-nav-note">
-            <span>Sắp xếp chức năng lên thanh trên để trang tìm kiếm thoáng hơn.</span>
-          </div>
         </div>
       </header>
 

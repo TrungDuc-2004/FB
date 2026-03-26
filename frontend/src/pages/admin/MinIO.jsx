@@ -321,7 +321,7 @@ export default function MinIO() {
       return;
     }
     if (n.includes("/")) {
-      alert("Tên folder không được chứa dấu '/'.");
+      alert("Tên thư mục không được chứa dấu '/'.");
       return;
     }
 
@@ -371,7 +371,7 @@ export default function MinIO() {
     if (!name) return;
 
     if (name.includes("/")) {
-      alert("Tên folder không được chứa dấu '/'.");
+      alert("Tên thư mục không được chứa dấu '/'.");
       return;
     }
 
@@ -536,9 +536,9 @@ export default function MinIO() {
   }
 
   const headerTitle = useMemo(() => {
-    if (isRoot) return "MinIO";
-    if (currentPath === "documents") return "Documents";
-    if (currentPath === "images") return "Images";
+    if (isRoot) return "Dữ liệu đối tượng";
+    if (currentPath === "documents") return "Tài liệu";
+    if (currentPath === "images") return "Hình ảnh";
     if (currentPath === "video") return "Video";
     return lastName(currentPath);
   }, [isRoot, currentPath]);
@@ -555,7 +555,7 @@ export default function MinIO() {
 
             {!isRoot && (
               <button className="back-btn back-btn-right" onClick={goBack}>
-                Back →
+                Quay lại
               </button>
             )}
           </div>
@@ -584,7 +584,7 @@ export default function MinIO() {
           <div className="header-actions">
             {canCreateFolderHere() && (
               <button className="btn btn-primary" onClick={() => setOpenCreateFolder(true)}>
-                + Folder
+                + Thư mục
               </button>
             )}
 
@@ -595,7 +595,7 @@ export default function MinIO() {
                 </button>
                 {canUploadAutoHere() && (
                   <button className="btn btn-primary" onClick={() => setOpenUploadAuto(true)}>
-                    Upload auto
+                    Tải lên tự động
                   </button>
                 )}
               </>
@@ -603,7 +603,7 @@ export default function MinIO() {
 
             {canFilterHere() && (
               <button className="btn" onClick={() => setOpenFilter(true)}>
-                Filter
+                Lọc
               </button>
             )}
           </div>

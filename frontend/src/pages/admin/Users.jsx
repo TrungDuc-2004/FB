@@ -29,7 +29,7 @@ function UserModal({ open, onClose, title, initial, onSave }) {
     if (!u) return;
 
     if (!pw) {
-      alert("Vui lòng nhập password!");
+      alert("Vui lòng nhập mật khẩu!");
       return;
     }
 
@@ -49,12 +49,12 @@ function UserModal({ open, onClose, title, initial, onSave }) {
         <div className="modal-body">
           <form onSubmit={submit}>
             <div className="field">
-              <label>User name</label>
+              <label>Tên tài khoản</label>
               <input value={username} onChange={(e) => setUsername(e.target.value)} autoFocus />
             </div>
 
             <div className="field">
-              <label>Password</label>
+              <label>Mật khẩu</label>
               <input
                 type="password"
                 value={password}
@@ -64,9 +64,9 @@ function UserModal({ open, onClose, title, initial, onSave }) {
             </div>
 
             <div className="field">
-              <label>Role</label>
+              <label>Vai trò</label>
               <select value={role} onChange={(e) => setRole(e.target.value)}>
-                <option value="user">User</option>
+                <option value="user">Người dùng</option>
                 <option value="admin">Admin</option>
               </select>
             </div>
@@ -192,7 +192,7 @@ export default function Users() {
       label: "ROLE",
       render: (r) => (
         <span className={`role-badge ${r.role === "admin" ? "is-admin" : "is-user"}`}>
-          {r.role === "admin" ? "Admin" : "User"}
+          {r.role === "admin" ? "Quản trị viên" : "Người dùng"}
         </span>
       ),
     },
@@ -201,7 +201,7 @@ export default function Users() {
       label: "TRẠNG THÁI",
       render: (r) => (
         <span className={`status-badge ${r.active ? "is-active" : "is-disabled"}`}>
-          {r.active ? "Active" : "Disabled"}
+          {r.active ? "Đang hoạt động" : "Đã vô hiệu"}
         </span>
       ),
     },
@@ -217,7 +217,7 @@ export default function Users() {
       await reloadUsers();
     } catch (e) {
       console.error(e);
-      alert(`Update failed: ${e.message || e}`);
+      alert(`Cập nhật thất bại: ${e.message || e}`);
     }
   }
 
@@ -241,7 +241,7 @@ export default function Users() {
       setEditTarget(null);
     } catch (e) {
       console.error(e);
-      alert(`Update failed: ${e.message || e}`);
+      alert(`Cập nhật thất bại: ${e.message || e}`);
     }
   }
 
@@ -257,7 +257,7 @@ export default function Users() {
       setOpenCreate(false);
     } catch (e) {
       console.error(e);
-      alert(`Create failed: ${e.message || e}`);
+      alert(`Tạo tài khoản thất bại: ${e.message || e}`);
     }
   }
 
@@ -266,14 +266,14 @@ export default function Users() {
       <div className="page-header">
         <div className="page-header-top">
           <div className="title-row">
-            <h2 className="page-title">Users</h2>
+            <h2 className="page-title">Tài khoản</h2>
           </div>
         </div>
 
         <div className="page-header-bottom">
           <div className="search-box">
             <input
-              placeholder="Tìm user (id / username / role)..."
+              placeholder="Tìm tài khoản (id / tên / vai trò)..."
               value={q}
               onChange={(e) => setQ(e.target.value)}
             />
@@ -281,7 +281,7 @@ export default function Users() {
 
           <div className="header-actions">
             <button className="btn btn-primary" onClick={() => setOpenCreate(true)}>
-              + Thêm User
+              + Thêm tài khoản
             </button>
           </div>
         </div>
@@ -289,10 +289,10 @@ export default function Users() {
 
       <div className="table-wrapper">
         {loading ? (
-          <div style={{ padding: 24, textAlign: "center" }}>Đang tải danh sách user...</div>
+          <div style={{ padding: 24, textAlign: "center" }}>Đang tải danh sách tài khoản...</div>
         ) : error ? (
           <div style={{ padding: 24, textAlign: "center" }}>
-            <div style={{ marginBottom: 12, color: "#b42318" }}>Load users failed: {error}</div>
+            <div style={{ marginBottom: 12, color: "#b42318" }}>Tải danh sách tài khoản thất bại: {error}</div>
             <button className="btn btn-primary" onClick={() => reloadUsers().catch((e) => { setError(e.message || String(e)); setLoading(false); })}>Thử lại</button>
           </div>
         ) : (
@@ -332,7 +332,7 @@ export default function Users() {
         key={`create-${openCreate ? "open" : "closed"}`}
         open={openCreate}
         onClose={() => setOpenCreate(false)}
-        title="Thêm User"
+        title="Thêm tài khoản"
         initial={{ username: "", role: "user", active: true }}
         onSave={saveCreateUser}
       />
@@ -344,7 +344,7 @@ export default function Users() {
           setOpenEdit(false);
           setEditTarget(null);
         }}
-        title="Sửa User"
+        title="Sửa tài khoản"
         initial={editTarget}
         onSave={saveEditUser}
       />

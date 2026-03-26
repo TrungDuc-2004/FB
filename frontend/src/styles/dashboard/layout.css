@@ -334,11 +334,6 @@
   color: var(--text-900);
 }
 
-.account-modal-subtitle {
-  font-size: 13px;
-  color: var(--text-500);
-  margin-top: 4px;
-}
 
 .account-modal-close {
   width: 38px;

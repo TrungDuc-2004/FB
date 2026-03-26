@@ -102,10 +102,7 @@ export default function UploadAutoModal({ open, onClose, currentPath = "", onUpl
     <div className="modal-overlay" onClick={() => !busy && onClose?.()}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
-          <h3 className="modal-title">Upload auto</h3>
-          <p className="modal-subtitle">
-            Tự cắt PDF theo cấu trúc học liệu rồi sync vào hệ thống
-          </p>
+          <h3 className="modal-title">Tải lên tự động</h3>
           <button
             type="button"
             className="modal-close"
@@ -120,7 +117,7 @@ export default function UploadAutoModal({ open, onClose, currentPath = "", onUpl
         <form className="modal-form" onSubmit={handleSubmit}>
           <div className="modal-body">
             <div className="field">
-              <label>Thư mục hiện tại</label>
+              <label>Đường dẫn</label>
               <input type="text" value={currentPath} readOnly />
             </div>
 
@@ -232,11 +229,6 @@ export default function UploadAutoModal({ open, onClose, currentPath = "", onUpl
               </div>
             )}
 
-            <div className="modal-note">
-              <strong>Lưu ý:</strong> Hệ thống sẽ tự suy ra ID theo cây subject → topic → lesson.
-              Upload ở subjects thì hệ thống cắt sách gốc; upload ở topics thì hệ thống cắt tiếp xuống lesson.
-              Hiện tại dừng ở lesson, chưa cắt chunk.
-            </div>
 
             {error ? (
               <div style={{ color: "#dc2626", whiteSpace: "pre-wrap", marginTop: 16 }}>
@@ -250,7 +242,7 @@ export default function UploadAutoModal({ open, onClose, currentPath = "", onUpl
               Huỷ
             </button>
             <button type="submit" className="btn btn-primary" disabled={busy || !file}>
-              {busy ? "Đang xử lý..." : "Upload auto"}
+              {busy ? "Đang xử lý..." : "Tải lên"}
             </button>
           </div>
         </form>

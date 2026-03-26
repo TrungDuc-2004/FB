@@ -152,32 +152,9 @@ body.user-shell-clean {
   gap: 14px;
 }
 
-.user-site-quick-wrap {
-  display: flex;
-  gap: 10px;
-}
 
-.user-site-quick-card {
-  min-width: 114px;
-  padding: 10px 12px;
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.72);
-  border: 1px solid rgba(15, 23, 42, 0.06);
-  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.04);
-  display: grid;
-  gap: 2px;
-}
 
-.user-site-quick-card span {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: #667085;
-}
 
-.user-site-quick-card strong {
-  font-size: 14px;
-}
 
 .user-site-user-menu {
   position: relative;
@@ -346,15 +323,6 @@ body.user-shell-clean {
   display: inline-flex;
 }
 
-.user-site-nav-note {
-  padding: 10px 14px;
-  border-radius: 999px;
-  background: rgba(var(--user-shell-accent-rgb), 0.08);
-  color: var(--user-shell-accent);
-  border: 1px solid rgba(var(--user-shell-accent-rgb), 0.14);
-  font-weight: 600;
-  font-size: 13px;
-}
 
 .user-site-content {
   max-width: 1480px;
@@ -418,10 +386,7 @@ body.user-shell-clean {
     justify-content: space-between;
   }
 
-  .user-site-quick-wrap {
-    flex-wrap: wrap;
-  }
-
+  
   .user-site-user-trigger {
     min-width: 0;
     width: 100%;
@@ -435,7 +400,6 @@ body.user-shell-clean {
   }
 
   .user-site-nav-row,
-  .user-site-quick-wrap,
   .user-site-nav {
     display: none;
   }

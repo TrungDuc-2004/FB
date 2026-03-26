@@ -81,14 +81,14 @@ export default function Neo4j() {
   }, [currentNodeId]);
 
   const headerTitle = useMemo(() => {
-    if (isRoot) return "Neo4j";
+    if (isRoot) return "Dữ liệu đồ thị";
     if (isNodeDetail) return selectedNode?.name || currentLabel;
     return currentLabel;
   }, [isRoot, isNodeDetail, selectedNode, currentLabel]);
 
   const breadcrumbParts = useMemo(() => {
     if (isRoot) return [];
-    const parts = ["neo4j", currentLabel];
+    const parts = ["Dữ liệu đồ thị", currentLabel];
     if (isNodeDetail) parts.push(selectedNode?.name || currentNodeId);
     return parts;
   }, [isRoot, currentLabel, isNodeDetail, selectedNode, currentNodeId]);
@@ -229,7 +229,7 @@ export default function Neo4j() {
             <h2 className="page-title">{headerTitle}</h2>
             {!isRoot && (
               <button className="back-btn back-btn-right" onClick={goBack}>
-                Back →
+                Quay lại
               </button>
             )}
           </div>

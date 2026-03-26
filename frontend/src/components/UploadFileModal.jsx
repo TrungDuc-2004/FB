@@ -21,8 +21,8 @@ export default function UploadFileModal({ open, onClose, folderName, onUpload })
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
-          <h3 className="modal-title">Upload file</h3>
-          <p className="modal-subtitle">Chọn một hoặc nhiều file để tải lên thư mục hiện tại</p>
+          <h3 className="modal-title">Tải file lên</h3>
+          
           <button
             className="modal-close"
             onClick={() => {
@@ -37,7 +37,7 @@ export default function UploadFileModal({ open, onClose, folderName, onUpload })
         <div className="modal-body">
           <form onSubmit={submit}>
             <div className="field">
-              <label htmlFor="upload-file">Thư mục hiện tại</label>
+              <label htmlFor="upload-folder">Đường dẫn</label>
               <input id="upload-folder" type="text" value={folderName || ""} disabled />
             </div>
 
@@ -87,7 +87,7 @@ export default function UploadFileModal({ open, onClose, folderName, onUpload })
             Huỷ
           </button>
           <button className="btn btn-primary" onClick={submit} disabled={!files.length}>
-            Upload file
+            Tải file lên
           </button>
         </div>
       </div>

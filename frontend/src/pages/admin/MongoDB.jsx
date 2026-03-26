@@ -1,5 +1,5 @@
 // pages/admin/MongoDB.jsx
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import "../../styles/admin/page.css";
 import "../../styles/admin/modal.css";
 import DataTable from "../../components/DataTable";
@@ -52,6 +52,37 @@ function formatBytes(bytes = 0) {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${(value / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+const IMMUTABLE_FIELD_NAMES = new Set([
+  "_id",
+  "mongo_id",
+  "pg_id",
+  "created_at",
+  "created_by",
+  "updated_at",
+  "updated_by",
+  "deleted_at",
+  "deleted_by",
+  "createdAt",
+  "createdBy",
+  "updatedAt",
+  "updatedBy",
+  "deletedAt",
+  "deletedBy",
+  "is_deleted",
+]);
+
+function isImmutableMongoField(fieldName) {
+  const key = String(fieldName || "").trim();
+  if (!key) return false;
+  if (IMMUTABLE_FIELD_NAMES.has(key)) return true;
+  return key.endsWith("_id") || key.endsWith("ID") || key.endsWith("Id");
+}
+
+function toInputValue(val) {
+  if (val == null) return "";
+  return typeof val === "string" ? val : JSON.stringify(val);
 }
 
 function defaultPairsForCollection(col) {
@@ -145,7 +176,11 @@ function defaultPairsForCollection(col) {
 
 /** ===== Mini modal: Create/Rename Collection ===== */
 function CollectionModal({ open, onClose, initialName = "", title, onSubmit }) {
-  const [name, setName] = useState(initialName || "");
+  const [name, setName] = useState(initialName);
+
+  useEffect(() => {
+    setName(initialName || "");
+  }, [initialName, open]);
 
   if (!open) return null;
 
@@ -193,12 +228,20 @@ function CollectionModal({ open, onClose, initialName = "", title, onSubmit }) {
 }
 
 /** ===== Modal: Create/Edit Document (fields động) ===== */
-function DocumentModal({ open, onClose, title, initialDoc, onSave, collectionName }) {
-  const [pairs, setPairs] = useState(() => {
-    if (!initialDoc) return defaultPairsForCollection(collectionName);
+function DocumentModal({ open, onClose, title, initialDoc, onSave, collectionName, isEditing = false }) {
+  const [pairs, setPairs] = useState([]);
+
+  useEffect(() => {
+    if (!open) return;
+
+    if (!initialDoc) {
+      setPairs(defaultPairsForCollection(collectionName));
+      return;
+    }
+
     const fields = initialDoc.fields || [];
-    return fields.length ? fields : defaultPairsForCollection(collectionName);
-  });
+    setPairs(fields.length ? fields : defaultPairsForCollection(collectionName));
+  }, [open, initialDoc, collectionName]);
 
   if (!open) return null;
 
@@ -221,6 +264,7 @@ function DocumentModal({ open, onClose, title, initialDoc, onSave, collectionNam
     for (const p of pairs) {
       const k = (p.k || "").trim();
       if (!k) continue;
+      if (isEditing && p.locked) continue;
       obj[k] = parseValue(p.v);
     }
 
@@ -247,6 +291,7 @@ function DocumentModal({ open, onClose, title, initialDoc, onSave, collectionNam
               {pairs.map((p, i) => {
                 const keyName = (p.k || "").trim();
                 const isBoolField = keyName === "is_deleted" || keyName === "is_active";
+                const locked = Boolean(p.locked);
 
                 return (
                   <div
@@ -262,6 +307,7 @@ function DocumentModal({ open, onClose, title, initialDoc, onSave, collectionNam
                       className="kv-input"
                       placeholder="field (vd: class_name, minio...)"
                       value={p.k}
+                      disabled={locked}
                       onChange={(e) => change(i, "k", e.target.value)}
                     />
 
@@ -269,6 +315,7 @@ function DocumentModal({ open, onClose, title, initialDoc, onSave, collectionNam
                       <select
                         className="kv-input"
                         value={String(p.v ?? "false")}
+                        disabled={locked}
                         onChange={(e) => change(i, "v", e.target.value)}
                       >
                         <option value="false">false</option>
@@ -279,6 +326,7 @@ function DocumentModal({ open, onClose, title, initialDoc, onSave, collectionNam
                         className="kv-input"
                         placeholder='value'
                         value={p.v}
+                        disabled={locked}
                         onChange={(e) => change(i, "v", e.target.value)}
                       />
                     )}
@@ -287,7 +335,8 @@ function DocumentModal({ open, onClose, title, initialDoc, onSave, collectionNam
                       type="button"
                       className="btn"
                       onClick={() => removeRow(i)}
-                      title="Xoá field"
+                      title={locked ? "Field này bị khoá" : "Xoá field"}
+                      disabled={locked}
                       style={{ height: 38 }}
                     >
                       ✕
@@ -297,10 +346,15 @@ function DocumentModal({ open, onClose, title, initialDoc, onSave, collectionNam
               })}
             </div>
 
-            <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+            <div style={{ marginTop: 12, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
               <button type="button" className="btn" onClick={addRow}>
                 + Thêm field
               </button>
+              {isEditing ? (
+                <span className="modal-note" style={{ margin: 0 }}>
+                  Các trường ID và thông tin tạo/cập nhật được khoá, không cho chỉnh sửa.
+                </span>
+              ) : null}
             </div>
           </form>
         </div>
@@ -567,7 +621,7 @@ export default function MongoDB() {
 
   const [collections, setCollections] = useState([]);
   const [docs, setDocs] = useState([]);
-  const [, setTotalDocs] = useState(0);
+  const [totalDocs, setTotalDocs] = useState(0);
 
   const [err, setErr] = useState("");
 
@@ -629,31 +683,12 @@ export default function MongoDB() {
   }
 
   useEffect(() => {
-    let cancelled = false;
-    const timer = setTimeout(() => {
-      if (cancelled) return;
-      reloadCollections();
-    }, 0);
-
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
+    reloadCollections();
   }, []);
 
   useEffect(() => {
-    if (!currentCollection) return undefined;
-
-    let cancelled = false;
-    const timer = setTimeout(() => {
-      if (cancelled) return;
-      reloadDocs(currentCollection);
-    }, 0);
-
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
+    if (!currentCollection) return;
+    reloadDocs(currentCollection);
   }, [currentCollection]);
 
   const selectedDoc = useMemo(() => {
@@ -671,45 +706,27 @@ export default function MongoDB() {
     return typeof val === "string" ? val : JSON.stringify(val);
   }
 
-  const buildPairsFromDoc = useCallback((doc) => {
+  function buildPairsFromDoc(doc) {
     if (!doc) return [];
 
     const keys = Object.keys(doc).sort((a, b) => a.localeCompare(b));
-
-    const LOCK_FIELDS = new Set([
-      "_id",
-      "created_at",
-      "created_by",
-      "updated_at",
-      "updated_by",
-      "deleted_at",
-    ]);
 
     return keys.map((k) => ({
       id: k,
       k,
       v: formatVal(k, doc[k]),
-      locked: LOCK_FIELDS.has(k),
+      locked: isImmutableMongoField(k),
     }));
-  }, []);
+  }
 
   useEffect(() => {
-    let cancelled = false;
-    const timer = setTimeout(() => {
-      if (cancelled) return;
-      if (!selectedDoc) {
-        setDetailPairs([]);
-        return;
-      }
-      if (isEditingDoc) return;
-      setDetailPairs(buildPairsFromDoc(selectedDoc));
-    }, 0);
-
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [selectedDoc, isEditingDoc, buildPairsFromDoc]);
+    if (!selectedDoc) {
+      setDetailPairs([]);
+      return;
+    }
+    if (isEditingDoc) return;
+    setDetailPairs(buildPairsFromDoc(selectedDoc));
+  }, [selectedDoc, isEditingDoc]);
 
   const headerTitle = useMemo(() => {
     if (isRoot) return "MongoDB";
@@ -961,7 +978,8 @@ export default function MongoDB() {
     const entries = Object.entries(doc || {}).filter(([k]) => k !== "_id");
     return entries.map(([k, v]) => ({
       k,
-      v: typeof v === "string" ? v : JSON.stringify(v),
+      v: toInputValue(v),
+      locked: isImmutableMongoField(k),
     }));
   }
 
@@ -994,7 +1012,7 @@ export default function MongoDB() {
   }
 
   async function deleteDoc(row) {
-    if (!confirm(`Xoá document "${docTitle(row) || row._id}"?`)) return;
+    if (!confirm(`Ẩn document "${docTitle(row) || row._id}"? Trạng thái sẽ chuyển sang hidden.`)) return;
     try {
       await mongoApi.deleteDocument(currentCollection, String(row._id));
       await reloadDocs(currentCollection);
@@ -1027,7 +1045,7 @@ export default function MongoDB() {
     const patch = {};
     for (const p of detailPairs) {
       const k = (p.k || "").trim();
-      if (!k || k === "_id") continue;
+      if (!k || k === "_id" || p.locked) continue;
       patch[k] = parseValue(p.v);
     }
 
@@ -1042,7 +1060,7 @@ export default function MongoDB() {
 
   async function deleteDocFromDetail() {
     if (!selectedDoc) return;
-    if (!confirm(`Xoá document "${docTitle(selectedDoc) || selectedDoc._id}"?`)) return;
+    if (!confirm(`Ẩn document "${docTitle(selectedDoc) || selectedDoc._id}"? Trạng thái sẽ chuyển sang hidden.`)) return;
     try {
       await mongoApi.deleteDocument(currentCollection, String(selectedDoc._id));
       setCurrentDocId("");
@@ -1147,7 +1165,7 @@ export default function MongoDB() {
                 <DataTable columns={detailViewColumns} rows={detailPairs} renderActions={null} />
                 <div className="detail-footer">
                   <button className="btn" onClick={deleteDocFromDetail}>
-                    Xoá
+                    Ẩn
                   </button>
                   <div className="spacer" />
                   <button className="btn btn-primary" onClick={() => setIsEditingDoc(true)}>
@@ -1200,7 +1218,7 @@ export default function MongoDB() {
                   Sửa
                 </button>
                 <button className="btn" onClick={() => deleteDoc(row)}>
-                  Xoá
+                  Ẩn
                 </button>
               </div>
             )}
@@ -1209,7 +1227,6 @@ export default function MongoDB() {
       </div>
 
       <CollectionModal
-        key={`create-col-${openCreateCol ? "open" : "closed"}`}
         open={openCreateCol}
         onClose={() => setOpenCreateCol(false)}
         title="Tạo collection mới"
@@ -1217,7 +1234,6 @@ export default function MongoDB() {
       />
 
       <CollectionModal
-        key={`rename-col-${renameTarget?.name || "new"}-${openRenameCol ? "open" : "closed"}`}
         open={openRenameCol}
         onClose={() => {
           setOpenRenameCol(false);
@@ -1229,7 +1245,6 @@ export default function MongoDB() {
       />
 
       <DocumentModal
-        key={`create-doc-${currentCollection || "none"}-${openCreateDoc ? "open" : "closed"}`}
         open={openCreateDoc}
         onClose={() => setOpenCreateDoc(false)}
         title={`Tạo document mới (${currentCollection})`}
@@ -1239,7 +1254,6 @@ export default function MongoDB() {
       />
 
       <DocumentModal
-        key={`edit-doc-${editDocTarget?._id || "new"}-${openEditDoc ? "open" : "closed"}`}
         open={openEditDoc}
         onClose={() => {
           setOpenEditDoc(false);
@@ -1253,6 +1267,7 @@ export default function MongoDB() {
         }
         onSave={saveEditDoc}
         collectionName={currentCollection}
+        isEditing
       />
 
       <ImportXlsxModal
