@@ -3,6 +3,7 @@ import io
 import time
 import tempfile
 import json
+import re
 import threading
 import uuid
 from pathlib import Path
@@ -206,6 +207,192 @@ def clean_path(path: str) -> str:
 def folder_marker(rel_path: str) -> str:
     p = clean_path(rel_path)
     return f"{p}/" if p else ""
+
+
+def _split_keyword_values(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        raw = value
+    else:
+        raw = [x.strip() for x in re.split(r"[,;\n\r\t|]+", str(value)) if str(x).strip()]
+    out: List[str] = []
+    seen = set()
+    for item in raw:
+        s = str(item).strip()
+        if not s:
+            continue
+        key = s.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+
+def _active_docs(cursor) -> List[dict]:
+    docs: List[dict] = []
+    for doc in cursor:
+        if str(doc.get("status") or "active").strip().lower() == "hidden":
+            continue
+        docs.append(doc)
+    return docs
+
+
+def _refresh_topic_keywords_from_lessons(*, topic_map: str, lesson_map: str = "") -> Dict[str, Any] | None:
+    mg = get_mongo_client()
+    db = mg["db"]
+    now = datetime.now(timezone.utc)
+
+    topic_doc = db["topics"].find_one({"topicID": topic_map}) if topic_map else None
+    if topic_doc is None and lesson_map:
+        lesson_doc = db["lessons"].find_one({"lessonID": lesson_map})
+        if lesson_doc:
+            topic_doc = db["topics"].find_one({"topicID": str(lesson_doc.get("topicID") or "").strip()})
+    if not topic_doc:
+        return None
+
+    topic_id = str(topic_doc.get("topicID") or "").strip()
+    lesson_docs = _active_docs(db["lessons"].find({"topicID": topic_id}).sort("lessonNumber", 1))
+    merged: List[str] = []
+    seen = set()
+    for lesson in lesson_docs:
+        for kw in _split_keyword_values(lesson.get("keywordLesson")):
+            key = kw.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(kw)
+
+    db["topics"].update_one(
+        {"_id": topic_doc["_id"]},
+        {"$set": {"keywordTopic": merged, "searchUpdatedAt": now, "updatedAt": now}},
+    )
+    return {
+        "topicID": topic_id,
+        "subjectID": str(topic_doc.get("subjectID") or "").strip(),
+        "keywordCount": len(merged),
+    }
+
+
+def _refresh_subject_keywords_from_topics(*, subject_map: str) -> Dict[str, Any] | None:
+    if not subject_map:
+        return None
+    mg = get_mongo_client()
+    db = mg["db"]
+    now = datetime.now(timezone.utc)
+
+    subject_doc = db["subjects"].find_one({"subjectID": subject_map})
+    if not subject_doc:
+        return None
+
+    topics = _active_docs(db["topics"].find({"subjectID": subject_map}).sort("topicNumber", 1))
+    merged: List[str] = []
+    seen = set()
+    for topic in topics:
+        for kw in _split_keyword_values(topic.get("keywordTopic")):
+            key = kw.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(kw)
+
+    db["subjects"].update_one(
+        {"_id": subject_doc["_id"]},
+        {"$set": {"keywordSubject": merged, "searchUpdatedAt": now, "updatedAt": now}},
+    )
+    return {"subjectID": subject_map, "keywordCount": len(merged)}
+
+
+def _refresh_standard_hierarchy_keywords(*, subject_map: str, topic_map: str = "", lesson_map: str = "") -> Dict[str, Any]:
+    result: Dict[str, Any] = {"topic": None, "subject": None}
+
+    topic_res = _refresh_topic_keywords_from_lessons(topic_map=topic_map, lesson_map=lesson_map)
+    if topic_res:
+        result["topic"] = {"topicID": topic_res["topicID"], "keywordCount": topic_res["keywordCount"]}
+        subject_map = subject_map or topic_res["subjectID"]
+
+    subject_res = _refresh_subject_keywords_from_topics(subject_map=subject_map)
+    if subject_res:
+        result["subject"] = subject_res
+
+    return result
+
+
+def _finalize_standard_upload_batch(
+    *,
+    upload_id: str,
+    actor: str,
+    dirty_topics: Set[str],
+    dirty_subjects: Set[str],
+) -> Dict[str, Any]:
+    total_steps = max(1, len(dirty_topics) + len(dirty_subjects))
+    completed = 0
+    summary: Dict[str, Any] = {"topics": [], "subjects": []}
+
+    def _percent(base: float = 96.0, span: float = 3.0) -> int:
+        return min(99, max(1, round(base + (completed / total_steps) * span)))
+
+    for topic_map in sorted(x for x in dirty_topics if str(x or "").strip()):
+        _update_upload_progress(
+            upload_id,
+            stage="finalizing_hierarchy",
+            stageLabel="Đang cập nhật keyword topic",
+            message=f"Đang gom keyword lesson -> topic cho {topic_map}",
+            percent=_percent(),
+        )
+        try:
+            topic_res = _refresh_topic_keywords_from_lessons(topic_map=topic_map)
+            if topic_res:
+                summary["topics"].append(topic_res)
+                subject_map = str(topic_res.get("subjectID") or "").strip()
+                class_map = _derive_class_map_from_subject_map(subject_map)
+                if subject_map:
+                    pg_ids = sync_postgre_from_mongo_auto_ids(
+                        class_map=class_map,
+                        subject_map=subject_map,
+                        topic_map=topic_map,
+                    )
+                    sync_neo4j_from_maps_and_pg_ids(
+                        class_map=class_map,
+                        subject_map=subject_map,
+                        topic_map=topic_map,
+                        pg_ids=pg_ids,
+                        actor=actor,
+                    )
+                    dirty_subjects.add(subject_map)
+        except Exception:
+            pass
+        completed += 1
+
+    for subject_map in sorted(x for x in dirty_subjects if str(x or "").strip()):
+        _update_upload_progress(
+            upload_id,
+            stage="finalizing_hierarchy",
+            stageLabel="Đang cập nhật keyword subject",
+            message=f"Đang gom keyword topic -> subject cho {subject_map}",
+            percent=_percent(),
+        )
+        try:
+            subject_res = _refresh_subject_keywords_from_topics(subject_map=subject_map)
+            if subject_res:
+                summary["subjects"].append(subject_res)
+                class_map = _derive_class_map_from_subject_map(subject_map)
+                pg_ids = sync_postgre_from_mongo_auto_ids(
+                    class_map=class_map,
+                    subject_map=subject_map,
+                )
+                sync_neo4j_from_maps_and_pg_ids(
+                    class_map=class_map,
+                    subject_map=subject_map,
+                    pg_ids=pg_ids,
+                    actor=actor,
+                )
+        except Exception:
+            pass
+        completed += 1
+
+    return summary
 
 
 def _api_base(request: Request) -> str:
@@ -1176,6 +1363,8 @@ def upload_files_to_path(
 
     uploaded, failed = [], []
     seen = set()
+    dirty_topics: Set[str] = set()
+    dirty_subjects: Set[str] = set()
 
     try:
         for index, f in enumerate(files, start=1):
@@ -1237,7 +1426,7 @@ def upload_files_to_path(
                     sync_res = sync_minio_object_to_mongo(
                         bucket=bucket,
                         object_key=object_key,
-                        meta={},
+                        meta={"__upload_mode": "standard"},
                         actor=actor,
                     )
                 except Exception as e:
@@ -1261,17 +1450,14 @@ def upload_files_to_path(
                     error="Đã sync MongoDB, đang chờ PostgreSQL/Neo4j",
                 )
 
-                _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="rebuilding_hierarchy", stage_label="Đang cập nhật mô tả/keyword", file_percent=0.54, message=f"Đang dựng mô tả và keyword cho {filename}")
+                _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="queueing_hierarchy", stage_label="Ghi nhận cập nhật keyword cha", file_percent=0.54, message=f"Đã ghi nhận {filename}, sẽ cập nhật topic/subject ở cuối batch")
 
-                try:
-                    rebuild_hierarchy_descriptions_and_keywords(
-                        subject_map=sync_res.subject_map,
-                        topic_map=sync_res.topic_map or "",
-                        lesson_map=sync_res.lesson_map or "",
-                        chunk_map=sync_res.chunk_map or "",
-                    )
-                except Exception:
-                    pass
+                sync_topic_map = str(sync_res.topic_map or "").strip()
+                sync_subject_map = str(sync_res.subject_map or "").strip()
+                if sync_topic_map:
+                    dirty_topics.add(sync_topic_map)
+                if sync_subject_map:
+                    dirty_subjects.add(sync_subject_map)
 
                 _mark_file_progress(upload_id, file_index=index, total_files=total_files, file_name=filename, stage="syncing_postgre", stage_label="Đang import PostgreSQL", file_percent=0.72, message=f"Đang sync {filename} vào PostgreSQL")
 
@@ -1391,6 +1577,15 @@ def upload_files_to_path(
                 except Exception:
                     pass
 
+        final_hierarchy = {"topics": [], "subjects": []}
+        if uploaded and (dirty_topics or dirty_subjects):
+            final_hierarchy = _finalize_standard_upload_batch(
+                upload_id=upload_id,
+                actor=actor,
+                dirty_topics=dirty_topics,
+                dirty_subjects=dirty_subjects,
+            )
+
         status = "completed" if not failed else ("failed" if not uploaded else "completed_with_errors")
         message = "Hoàn tất toàn bộ" if status == "completed" else ("Tất cả file đều lỗi" if status == "failed" else "Hoàn tất nhưng có file lỗi")
         _finish_upload_progress(upload_id, total_files=total_files, completed_files=len(uploaded), status=status, message=message, stage="completed", stage_label="Hoàn tất")
@@ -1404,6 +1599,7 @@ def upload_files_to_path(
             "uploaded_count": len(uploaded),
             "failed_count": len(failed),
             "upload_id": upload_id,
+            "finalHierarchy": final_hierarchy,
         }
 
     except HTTPException:
@@ -1611,7 +1807,7 @@ def insert_item(
             sync_res = sync_minio_object_to_mongo(
                 bucket=bucket,
                 object_key=object_key,
-                meta={**meta, "__local_file_path": temp_file_path},
+                meta={**meta, "__local_file_path": temp_file_path, "__upload_mode": "standard"},
                 actor=actor,
             )
         except Exception as e:
@@ -1634,13 +1830,12 @@ def insert_item(
         )
 
         hierarchy_info: Dict[str, Any] = {"updated": False, "details": None, "error": None}
-        _mark_file_progress(upload_id, file_index=1, total_files=1, file_name=filename, stage="rebuilding_hierarchy", stage_label="Đang cập nhật mô tả/keyword", file_percent=0.56, message=f"Đang dựng mô tả và keyword cho {filename}")
+        _mark_file_progress(upload_id, file_index=1, total_files=1, file_name=filename, stage="updating_hierarchy", stage_label="Đang cập nhật keyword cha", file_percent=0.56, message=f"Đang cập nhật keyword cha cho {filename}")
         try:
-            hierarchy_details = rebuild_hierarchy_descriptions_and_keywords(
+            hierarchy_details = _refresh_standard_hierarchy_keywords(
                 subject_map=sync_res.subject_map,
                 topic_map=sync_res.topic_map or "",
                 lesson_map=sync_res.lesson_map or "",
-                chunk_map=sync_res.chunk_map or "",
             )
             hierarchy_info = {"updated": True, "details": hierarchy_details, "error": None}
         except Exception as e:
@@ -1968,13 +2163,13 @@ def _sync_local_document_to_system(
     sync_res = sync_minio_object_to_mongo(
         bucket=bucket,
         object_key=object_key,
-        meta={**meta, "__local_file_path": local_file_path},
+        meta={**meta, "__local_file_path": local_file_path, "__upload_mode": "auto"},
         actor=actor,
     )
     _set_hierarchy_sync_status(sync_res, minio_ok=True, mongo_ok=True, postgre_ok=False, neo4j_ok=False, actor=actor, error="Đã sync MongoDB, đang chờ PostgreSQL/Neo4j")
 
     hierarchy_details = None
-    _mark_file_progress(upload_id, file_index=file_index, total_files=total_files, file_name=target_filename, stage="rebuilding_hierarchy", stage_label="Đang cập nhật mô tả/keyword", file_percent=0.58, message=f"Đang dựng mô tả và keyword cho {target_filename}")
+    _mark_file_progress(upload_id, file_index=file_index, total_files=total_files, file_name=target_filename, stage="rebuilding_hierarchy", stage_label="Đang cập nhật mô tả / keyword cha", file_percent=0.58, message=f"Đang cập nhật mô tả và keyword cha cho {target_filename}")
     try:
         hierarchy_details = rebuild_hierarchy_descriptions_and_keywords(
             subject_map=sync_res.subject_map,

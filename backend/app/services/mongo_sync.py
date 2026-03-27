@@ -14,8 +14,8 @@ from .keyword_embedding import embed_keyword_cached, get_keyword_embedder
 from .chunk_content_ai import (
     generate_chunk_description_and_keywords,
     generate_lesson_description_and_keywords,
-    generate_topic_description_and_keywords,
-    generate_subject_description_and_keywords,
+    generate_topic_description_only,
+    generate_subject_description_only,
 )
 
 _WORD_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
@@ -409,6 +409,7 @@ def sync_minio_object_to_mongo(
     lesson_keywords = _parse_keywords(_pick(meta, "keywordLesson", "lessonKeywords", "lesson_keywords"))
 
     local_file_path = _clean_str(meta.get("__local_file_path"))
+    upload_mode = (_clean_str(meta.get("__upload_mode")) or "standard").lower()
     topic_doc_for_level = db["topics"].find_one({"topicID": topic_map}) if topic_map else None
     subject_doc_for_level = db["subjects"].find_one({"subjectID": subject_map}) if subject_map else None
     lesson_doc_for_level = db["lessons"].find_one({"lessonID": lesson_map}) if lesson_map else None
@@ -461,23 +462,23 @@ def sync_minio_object_to_mongo(
             limit=10,
         )
     elif folder_type == "topic":
-        topic_desc, _topic_keywords_ai, _topic_ai_meta = generate_topic_description_and_keywords(
+        topic_desc, _topic_ai_meta = generate_topic_description_only(
             topic_name=topic_name or topic_map or "",
             explicit_description=topic_desc,
-            explicit_keywords=topic_keywords,
             subject_name=_clean_str((subject_doc_for_level or {}).get("subjectName") or subject_name),
             file_path=local_file_path,
-            limit=48,
         )
+        # Topic không lấy keyword trực tiếp từ AI/file ở cả upload thường lẫn upload auto.
+        # keywordTopic chỉ được gom từ keywordLesson khi có lesson.
         topic_keywords = []
     else:
-        subject_desc, _subject_keywords_ai, _subject_ai_meta = generate_subject_description_and_keywords(
+        subject_desc, _subject_ai_meta = generate_subject_description_only(
             subject_name=subject_name or subject_title or subject_map or "",
             explicit_description=subject_desc,
-            explicit_keywords=subject_keywords,
             file_path=local_file_path,
-            limit=80,
         )
+        # Subject không lấy keyword trực tiếp từ AI/file ở cả upload thường lẫn upload auto.
+        # keywordSubject chỉ được gom từ keywordTopic khi có topic.
         subject_keywords = []
 
     # ====== Collections ======
