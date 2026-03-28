@@ -19,6 +19,14 @@ try:
 except Exception:  # pragma: no cover
     docx = None
 
+try:
+    from pypdf import PdfReader  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from PyPDF2 import PdfReader  # type: ignore
+    except Exception:  # pragma: no cover
+        PdfReader = None
+
 _TEXT_BASED_SUFFIXES = {'.txt', '.md', '.json', '.docx'}
 
 _WORD_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
@@ -443,6 +451,70 @@ def _read_text_content_for_keyword_extraction(file_path: str) -> str:
     return ''
 
 
+def _read_pdf_text_for_keyword_extraction(file_path: str, *, max_chars: int = 48000) -> str:
+    path = Path(file_path)
+    if PdfReader is None or not path.exists():
+        return ''
+    try:
+        reader = PdfReader(str(path))
+    except Exception:
+        return ''
+
+    pages: List[str] = []
+    total = 0
+    for page in getattr(reader, 'pages', []) or []:
+        try:
+            page_text = (page.extract_text() or '').strip()
+        except Exception:
+            page_text = ''
+        if not page_text:
+            continue
+        pages.append(page_text)
+        total += len(page_text)
+        if total >= max_chars:
+            break
+
+    combined = '\n\n'.join(pages).strip()
+    if max_chars and len(combined) > max_chars:
+        combined = combined[:max_chars]
+    return combined
+
+
+def _wait_until_uploaded_file_ready(uploaded: Any, *, timeout_seconds: int = 90, poll_interval: float = 2.0) -> Any:
+    if genai is None or uploaded is None:
+        return uploaded
+
+    import time as _time
+
+    started = _time.time()
+    current = uploaded
+    while _time.time() - started < timeout_seconds:
+        state = getattr(getattr(current, 'state', None), 'name', '') or ''
+        state = str(state).upper()
+        if not state or state in {'ACTIVE', 'SUCCEEDED', 'READY'}:
+            return current
+        if state in {'FAILED', 'ERROR', 'CANCELLED'}:
+            raise RuntimeError(f'uploaded_file_state={state}')
+        _time.sleep(poll_interval)
+        file_name = getattr(current, 'name', '')
+        if file_name and hasattr(genai, 'get_file'):
+            try:
+                current = genai.get_file(file_name)
+            except Exception:
+                pass
+    return current
+
+
+def _read_lesson_file_text_for_keyword_extraction(file_path: str) -> str:
+    path = Path(file_path)
+    suffix = path.suffix.lower()
+    if suffix in _TEXT_BASED_SUFFIXES:
+        return _read_text_content_for_keyword_extraction(file_path)
+    if suffix == '.pdf':
+        return _read_pdf_text_for_keyword_extraction(file_path)
+    return ''
+
+
 def _parse_keyword_json_like_reference(text: str) -> List[str]:
     clean_text = (text or '').strip()
     if not clean_text:
@@ -567,7 +639,7 @@ def _lesson_keywords_only_prompt(*, lesson_name: str, topic_name: str, subject_n
         f'Nhiệm vụ: Đọc hiểu tài liệu bài học và trích xuất đúng {num_keywords} từ khóa quan trọng nhất phục vụ tìm kiếm. '
         'Chỉ lấy keyword có nghĩa tìm kiếm trực tiếp, ưu tiên cụm từ 2-6 từ. '
         'Không lấy nguyên mệnh đề mô tả, không lấy cụm kết thúc bằng "là", "thuộc", "gồm", "bao gồm". '
-        'Không lấy map id, mã bài, ký hiệu kỹ thuật hoặc token rời rạc vô nghĩa. '
+        'Không lấy map id, mã bài, ký hiệu kỹ thuật hoặc token rời rạc vô nghĩa. Keyword phải bám sát nội dung thật trong file, không tự suy diễn chỉ từ tên bài. '
         'Chỉ trả về JSON thuần, không markdown, không giải thích. '
         f'JSON bắt buộc: {{"keywords":[{{"term":"kw1"}},{{"term":"kw2"}}]}} với đúng {num_keywords} phần tử.\n'
         f'Ngữ cảnh:\n{scope_text}'
@@ -576,35 +648,62 @@ def _lesson_keywords_only_prompt(*, lesson_name: str, topic_name: str, subject_n
 
 def _generate_lesson_keywords_from_reference_style(*, file_path: str, prompt: str, limit: int) -> Tuple[List[str], Dict[str, Any]]:
     path = Path(file_path) if file_path else None
-    if path and path.exists() and path.suffix.lower() in _TEXT_BASED_SUFFIXES:
-        content_text = _read_text_content_for_keyword_extraction(str(path))
+
+    # Ưu tiên đọc trực tiếp nội dung file lesson giống tool Keyword.zip: bám sát nội dung thật,
+    # không fallback sang prompt-only vì dễ sinh keyword chung chung/sai ngữ cảnh.
+    if path and path.exists():
+        content_text = _read_lesson_file_text_for_keyword_extraction(str(path))
         if content_text:
             desc, raw_keywords, meta = _gemini_extract_via_rest(
                 prompt=f"{prompt}\n\n---\nNỘI DUNG VĂN BẢN:\n{content_text}",
                 limit=None,
                 output_tokens=720,
             )
-            parsed = _parse_keyword_json_like_reference(json.dumps({'keywords': [{'term': k} for k in raw_keywords]})) if raw_keywords else []
-            if parsed:
-                return _filter_lesson_keyword_values(parsed, description=desc, limit=limit), {**meta, 'mode': 'rest_text_embedded'}
+            if raw_keywords:
+                return _filter_lesson_keyword_values(raw_keywords, description=desc, limit=limit), {**meta, 'mode': 'rest_text_embedded'}
 
-    if file_path:
-        _desc, raw_keywords, meta = _gemini_extract_from_file(
-            file_path=file_path,
-            prompt=prompt,
-            limit=None,
-            output_tokens=720,
-        )
-        if raw_keywords:
-            return _filter_lesson_keyword_values(raw_keywords, limit=limit), meta
+    if path and path.exists():
+        meta: Dict[str, Any] = {'mode': 'lesson_file_ai', 'library': 'google-generativeai'}
+        if genai is None:
+            return [], {**meta, 'error': 'google-generativeai_not_installed'}
+        if path.suffix.lower() not in _ALLOWED_SUFFIXES:
+            return [], {**meta, 'error': f'unsupported_suffix:{path.suffix.lower()}'}
 
-    _desc, raw_keywords, meta = _gemini_extract_via_rest(
-        prompt=prompt,
-        limit=None,
-        output_tokens=720,
-    )
-    return _filter_lesson_keyword_values(raw_keywords, limit=limit), meta
+        model = _clean(os.getenv('GEMINI_MODEL')) or 'gemini-2.5-flash'
+        rotated, base_meta = _rotated_keys()
+        meta.update({'model': model, 'key_count': base_meta.get('key_count', 0)})
+        if not rotated:
+            return [], {**meta, 'error': 'no_api_key'}
 
+        mime_type, _ = mimetypes.guess_type(str(path))
+        mime_type = mime_type or 'application/octet-stream'
+        last_error = None
+
+        for attempt, (slot, key, source) in enumerate(rotated, start=1):
+            uploaded = None
+            try:
+                genai.configure(api_key=key)
+                model_obj = genai.GenerativeModel(model)
+                uploaded = genai.upload_file(str(path), mime_type=mime_type)
+                uploaded = _wait_until_uploaded_file_ready(uploaded)
+                response = model_obj.generate_content([prompt, uploaded])
+                text = getattr(response, 'text', '') or ''
+                _desc, raw_keywords = _extract_from_response_text(text, limit=None)
+                filtered = _filter_lesson_keyword_values(raw_keywords, limit=limit)
+                if filtered:
+                    return filtered, {**meta, 'attempt': attempt, 'key_slot': slot, 'key_source': source}
+                last_error = 'empty_response'
+            except Exception as exc:
+                last_error = str(exc)
+            finally:
+                try:
+                    if uploaded is not None:
+                        uploaded.delete()
+                except Exception:
+                    pass
+        return [], {**meta, 'error': last_error or 'extract_failed'}
+
+    return [], {'mode': 'lesson_keywords_no_prompt_only_fallback', 'error': 'file_not_found_or_empty'}
 
 def _lesson_keyword_retry_prompt(
     *,
@@ -628,7 +727,7 @@ def _lesson_keyword_retry_prompt(
         f'Nhiệm vụ: Từ chính tài liệu bài học này, hãy bổ sung đúng {num_keywords} keyword còn thiếu để đủ bộ keyword cho lesson. '
         'Chỉ lấy keyword có nghĩa tìm kiếm trực tiếp, ưu tiên cụm từ 2-6 từ. '
         'Không lấy nguyên mệnh đề mô tả, không lấy cụm kết thúc bằng "là", "thuộc", "gồm", "bao gồm". '
-        'Không lấy map id, mã bài, ký hiệu kỹ thuật hoặc token rời rạc vô nghĩa. '
+        'Không lấy map id, mã bài, ký hiệu kỹ thuật hoặc token rời rạc vô nghĩa. Keyword phải bám sát nội dung thật trong file, không tự suy diễn chỉ từ tên bài. '
         'Không được lặp lại keyword đã có. '
         'Chỉ trả về JSON thuần, không markdown, không giải thích. '
         f'JSON bắt buộc: {{"keywords":[{{"term":"kw1"}},{{"term":"kw2"}}]}} với đúng {num_keywords} phần tử.\n'
@@ -685,7 +784,7 @@ def _collect_lesson_keywords_strict_ai_only(
         seen_modes.append(str(primary_meta.get("mode")))
     _merge(primary_keywords)
 
-    max_retries = 3
+    max_retries = 5
     retry_count = 0
     while len(final_keywords) < limit and retry_count < max_retries:
         missing = limit - len(final_keywords)
