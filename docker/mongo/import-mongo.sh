@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BACKUP_ROOT="${BACKUP_ROOT:-$PROJECT_ROOT/Database}"
 MONGO_SRC="${MONGO_SRC:-$BACKUP_ROOT/MongoDB}"
 MONGO_SERVICE="${MONGO_SERVICE:-mongo}"
@@ -13,6 +13,7 @@ cd "$PROJECT_ROOT"
 
 if [[ ! -d "$MONGO_SRC" ]]; then
   echo "Khong tim thay thu muc MongoDB backup: $MONGO_SRC"
+  echo "Dat BACKUP_ROOT=/duong/dan/Database hoac MONGO_SRC=/duong/dan/MongoDB"
   exit 1
 fi
 

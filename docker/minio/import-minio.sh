@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BACKUP_ROOT="${BACKUP_ROOT:-$PROJECT_ROOT/Database}"
 MINIO_SRC="${MINIO_SRC:-$BACKUP_ROOT/MinIO}"
 MINIO_SERVICE="${MINIO_SERVICE:-minio}"
@@ -13,6 +13,7 @@ cd "$PROJECT_ROOT"
 
 if [[ ! -d "$MINIO_SRC" ]]; then
   echo "Khong tim thay thu muc MinIO backup: $MINIO_SRC"
+  echo "Dat BACKUP_ROOT=/duong/dan/Database hoac MINIO_SRC=/duong/dan/MinIO"
   exit 1
 fi
 

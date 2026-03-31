@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BACKUP_ROOT="${BACKUP_ROOT:-$PROJECT_ROOT/Database}"
 SQL_FILE="${SQL_FILE:-$BACKUP_ROOT/Postgre/dataa.sql}"
 PG_SERVICE="${PG_SERVICE:-postgres}"
@@ -13,6 +13,7 @@ cd "$PROJECT_ROOT"
 
 if [[ ! -f "$SQL_FILE" ]]; then
   echo "Khong tim thay file SQL: $SQL_FILE"
+  echo "Dat BACKUP_ROOT=/duong/dan/Database hoac SQL_FILE=/duong/dan/file.sql"
   exit 1
 fi
 

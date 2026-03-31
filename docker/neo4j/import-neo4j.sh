@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BACKUP_ROOT="${BACKUP_ROOT:-$PROJECT_ROOT/Database}"
 NEO4J_BACKUP_DIR="${NEO4J_BACKUP_DIR:-$BACKUP_ROOT/Neo4j}"
 NEO4J_DUMP_FILE="${NEO4J_DUMP_FILE:-$NEO4J_BACKUP_DIR/neo4j.dump}"
@@ -13,6 +13,7 @@ cd "$PROJECT_ROOT"
 
 if [[ ! -f "$NEO4J_DUMP_FILE" ]]; then
   echo "Khong tim thay file dump: $NEO4J_DUMP_FILE"
+  echo "Dat BACKUP_ROOT=/duong/dan/Database hoac NEO4J_DUMP_FILE=/duong/dan/neo4j.dump"
   exit 1
 fi
 

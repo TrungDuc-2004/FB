@@ -1,19 +1,18 @@
-# .git/
-# .venv/
-# backend/.venv/
-# frontend/node_modules/
-# frontend/dist/
-# **/__pycache__/
-# **/*.py[cod]
-# **/*.log
+.git/
+.venv/
+.vscode/
+.idea/
+.DS_Store
+*.log
+*.tmp
+*.swp
 
-# # Local env files (copy from *.example instead)
-# .env
-# .env.*
-# backend/.env
-# backend/core/config.env
+.env
+.env.*
 
-# # OS / IDE
-# .DS_Store
-# .idea/
-# .vscode/
+Database/
+backend/.venv/
+backend/__pycache__/
+backend/**/*.py[cod]
+frontend/node_modules/
+frontend/dist/
