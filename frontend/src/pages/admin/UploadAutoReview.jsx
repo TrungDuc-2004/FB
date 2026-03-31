@@ -54,6 +54,90 @@ function buildPagePreviewUrl(sessionId, itemId, kind = "current", page = 1) {
   return `${API_BASE}/admin/minio/upload-auto/session/${encodeURIComponent(sessionId)}/page-preview?item_id=${encodeURIComponent(itemId)}&kind=${encodeURIComponent(kind)}&page=${safePage}`;
 }
 
+
+function normalizeCropBands(raw, fallbackPage = 1, fallbackTop = null, fallbackBottom = null) {
+  const list = Array.isArray(raw) ? raw : [];
+  const map = new Map();
+
+  for (const entry of list) {
+    const page = Number(entry?.page);
+    const cropTop = Number(entry?.cropTop);
+    const cropBottom = Number(entry?.cropBottom);
+    if (!Number.isFinite(page) || !Number.isFinite(cropTop) || !Number.isFinite(cropBottom) || cropBottom <= cropTop) continue;
+    map.set(Math.max(1, Math.round(page)), {
+      page: Math.max(1, Math.round(page)),
+      cropTop: Math.round(cropTop),
+      cropBottom: Math.round(cropBottom),
+    });
+  }
+
+  if (!map.size) {
+    const page = Number(fallbackPage || 1);
+    const cropTop = Number(fallbackTop);
+    const cropBottom = Number(fallbackBottom);
+    if (Number.isFinite(page) && Number.isFinite(cropTop) && Number.isFinite(cropBottom) && cropBottom > cropTop) {
+      map.set(Math.max(1, Math.round(page)), {
+        page: Math.max(1, Math.round(page)),
+        cropTop: Math.round(cropTop),
+        cropBottom: Math.round(cropBottom),
+      });
+    }
+  }
+
+  return Array.from(map.values()).sort((a, b) => a.page - b.page);
+}
+
+function getCropBandForPage(item, page) {
+  const bands = normalizeCropBands(item?.cropBands, item?.cropPage, item?.cropTop, item?.cropBottom);
+  const targetPage = Math.max(1, Number(page || item?.cropPage || 1));
+  return bands.find((band) => band.page === targetPage) || null;
+}
+
+function normalizeReviewItem(item) {
+  if (!item) return item;
+  if (item.kind !== "chunk") return { ...item, approved: item.approved !== false };
+
+  const cropBands = normalizeCropBands(item.cropBands, item.cropPage, item.cropTop, item.cropBottom);
+  const selectedPage = Math.max(1, Number(item.cropPage || cropBands[0]?.page || 1));
+  const activeBand = cropBands.find((band) => band.page === selectedPage) || null;
+
+  return {
+    ...item,
+    approved: item.approved !== false,
+    cropPage: selectedPage,
+    cropTop: activeBand ? activeBand.cropTop : null,
+    cropBottom: activeBand ? activeBand.cropBottom : null,
+    cropBands,
+  };
+}
+
+function upsertCropBand(item, page, cropTop, cropBottom) {
+  const bands = normalizeCropBands(item?.cropBands, item?.cropPage, item?.cropTop, item?.cropBottom);
+  const safePage = Math.max(1, Number(page || 1));
+  const next = bands.filter((band) => band.page !== safePage);
+
+  const top = Number(cropTop);
+  const bottom = Number(cropBottom);
+  if (Number.isFinite(top) && Number.isFinite(bottom) && bottom > top) {
+    next.push({ page: safePage, cropTop: Math.round(top), cropBottom: Math.round(bottom) });
+  }
+
+  next.sort((a, b) => a.page - b.page);
+  const activeBand = next.find((band) => band.page === safePage) || null;
+
+  return {
+    cropPage: safePage,
+    cropTop: activeBand ? activeBand.cropTop : null,
+    cropBottom: activeBand ? activeBand.cropBottom : null,
+    cropBands: next,
+  };
+}
+
+function removeCropBand(item, page) {
+  return upsertCropBand(item, page, null, null);
+}
+
+
 function kindLabel(kind = "") {
   if (kind === "topic") return "Topic";
   if (kind === "lesson") return "Lesson";
@@ -93,7 +177,7 @@ function buildInitialReviewedMap(items = []) {
 function normalizeReviewPayload(payload) {
   if (!payload) return null;
   const items = Array.isArray(payload.items)
-    ? payload.items.map((item) => ({ ...item, approved: item.approved !== false }))
+    ? payload.items.map((item) => normalizeReviewItem(item))
     : [];
   return {
     sessionId: payload.session_id,
@@ -212,11 +296,12 @@ export default function UploadAutoReview() {
   const lessonOptions = grouped.lessons;
 
   function replaceItem(nextItem) {
+    const normalizedNext = normalizeReviewItem(nextItem);
     setReview((prev) => {
       if (!prev) return prev;
       return {
         ...prev,
-        items: (prev.items || []).map((item) => (item.reviewId === nextItem.reviewId ? { ...item, ...nextItem } : item)),
+        items: (prev.items || []).map((item) => (item.reviewId === normalizedNext.reviewId ? normalizeReviewItem({ ...item, ...normalizedNext }) : item)),
       };
     });
   }
@@ -277,6 +362,7 @@ export default function UploadAutoReview() {
         cropTop: autoMode ? null : target.cropTop,
         cropBottom: autoMode ? null : target.cropBottom,
         cropPage: autoMode ? 1 : target.cropPage,
+        cropBands: autoMode ? [] : normalizeCropBands(target.cropBands, target.cropPage, target.cropTop, target.cropBottom),
       };
       const res = await minioApi.updateUploadAutoReviewItem(review.sessionId, payload, {
         onProgress: (p) => setProgress(normalizeProgress(p)),
@@ -620,6 +706,7 @@ export default function UploadAutoReview() {
   );
 }
 
+
 function ChunkCropEditor({ sessionId, item, busy, onChange, onRefresh, onAutoRefresh }) {
   const frameRef = useRef(null);
   const imgRef = useRef(null);
@@ -627,7 +714,12 @@ function ChunkCropEditor({ sessionId, item, busy, onChange, onRefresh, onAutoRef
   const [renderBox, setRenderBox] = useState({ width: 0, height: 0, naturalHeight: 0 });
 
   const chunkPages = Math.max(1, Number(item.chunkPages || (Number(item.end || 1) - Number(item.start || 1) + 1) || 1));
-  const cropPage = Math.max(1, Math.min(chunkPages, Number(item.cropPage || 1)));
+  const cropBands = useMemo(
+    () => normalizeCropBands(item.cropBands, item.cropPage, item.cropTop, item.cropBottom),
+    [item.cropBands, item.cropPage, item.cropTop, item.cropBottom]
+  );
+  const cropPage = Math.max(1, Math.min(chunkPages, Number(item.cropPage || cropBands[0]?.page || 1)));
+  const currentBand = cropBands.find((band) => band.page === cropPage) || null;
   const pagePreviewUrl = buildPagePreviewUrl(sessionId, item.reviewId, "current", cropPage);
 
   const syncMeasure = useCallback(() => {
@@ -642,13 +734,36 @@ function ChunkCropEditor({ sessionId, item, busy, onChange, onRefresh, onAutoRef
     });
   }, []);
 
-  const safeTop = item.cropTop == null ? Math.round(renderBox.naturalHeight * 0.2) : Number(item.cropTop || 0);
-  const safeBottom = item.cropBottom == null
+  const safeTop = currentBand?.cropTop == null ? Math.round(renderBox.naturalHeight * 0.2) : Number(currentBand.cropTop || 0);
+  const safeBottom = currentBand?.cropBottom == null
     ? Math.round(renderBox.naturalHeight * 0.8)
-    : Number(item.cropBottom || renderBox.naturalHeight || 0);
+    : Number(currentBand.cropBottom || renderBox.naturalHeight || 0);
 
   const cropTop = Math.max(0, Math.min(safeTop, Math.max(0, safeBottom - 1)));
   const cropBottom = Math.max(cropTop + 1, Math.min(safeBottom, renderBox.naturalHeight || safeBottom || 1));
+
+  const applyBandPatch = useCallback((top, bottom, page = cropPage) => {
+    onChange(upsertCropBand(item, page, top, bottom));
+  }, [cropPage, item, onChange]);
+
+  const switchCropPage = useCallback((page) => {
+    const safePage = Math.max(1, Math.min(chunkPages, Number(page || 1)));
+    const band = getCropBandForPage(item, safePage);
+    onChange({
+      cropPage: safePage,
+      cropTop: band ? band.cropTop : null,
+      cropBottom: band ? band.cropBottom : null,
+      cropBands: normalizeCropBands(item.cropBands, item.cropPage, item.cropTop, item.cropBottom),
+    });
+  }, [chunkPages, item, onChange]);
+
+  const clearCurrentPage = useCallback(() => {
+    onChange(removeCropBand(item, cropPage));
+  }, [cropPage, item, onChange]);
+
+  const clearAllPages = useCallback(() => {
+    onChange({ cropPage: 1, cropTop: null, cropBottom: null, cropBands: [], yLine: null });
+  }, [onChange]);
 
   const syncLineFromPointer = useCallback((clientY, edge) => {
     const frame = frameRef.current;
@@ -657,11 +772,11 @@ function ChunkCropEditor({ sessionId, item, busy, onChange, onRefresh, onAutoRef
     const y = Math.max(0, Math.min(rect.height, clientY - rect.top));
     const naturalY = Math.round((y / rect.height) * renderBox.naturalHeight);
     if (edge === "top") {
-      onChange({ cropTop: Math.max(0, Math.min(naturalY, cropBottom - 1)) });
+      applyBandPatch(Math.max(0, Math.min(naturalY, cropBottom - 1)), cropBottom, cropPage);
       return;
     }
-    onChange({ cropBottom: Math.max(cropTop + 1, Math.min(naturalY, renderBox.naturalHeight)) });
-  }, [cropBottom, cropTop, onChange, renderBox.height, renderBox.naturalHeight]);
+    applyBandPatch(cropTop, Math.max(cropTop + 1, Math.min(naturalY, renderBox.naturalHeight)), cropPage);
+  }, [applyBandPatch, cropBottom, cropPage, cropTop, renderBox.height, renderBox.naturalHeight]);
 
   useEffect(() => {
     function handleMove(e) {
@@ -693,9 +808,9 @@ function ChunkCropEditor({ sessionId, item, busy, onChange, onRefresh, onAutoRef
 
   const lineTopPct = renderBox.naturalHeight ? `${(cropTop / renderBox.naturalHeight) * 100}%` : "20%";
   const lineBottomPct = renderBox.naturalHeight ? `${(cropBottom / renderBox.naturalHeight) * 100}%` : "80%";
-  const cropModeText = item.cropTop != null && item.cropBottom != null
-    ? `Trang ${cropPage} · crop từ ${item.cropTop} đến ${item.cropBottom}`
-    : "Đang crop tay bằng 2 đường trên preview của chunk";
+  const cropModeText = currentBand
+    ? `Trang ${cropPage} · crop từ ${currentBand.cropTop} đến ${currentBand.cropBottom}`
+    : `Trang ${cropPage} · chưa có crop tay`;
 
   return (
     <div className="upload-auto-editor-block">
@@ -703,7 +818,7 @@ function ChunkCropEditor({ sessionId, item, busy, onChange, onRefresh, onAutoRef
         <div>
           <div className="upload-auto-section-title">Crop chunk kiểu 2 đầu</div>
           <div className="upload-auto-section-desc">
-            Crop trực tiếp trên preview của chunk. Dùng 2 đường ngang để lấy phần giữa. Bên dưới vẫn có preview full file lesson cha để đối chiếu.
+            Crop trực tiếp trên preview của chunk. Mỗi trang có vùng crop riêng, lưu trang nào sẽ giữ lại trang đó.
           </div>
         </div>
         <div className="upload-auto-inline-note">{cropModeText}</div>
@@ -713,7 +828,7 @@ function ChunkCropEditor({ sessionId, item, busy, onChange, onRefresh, onAutoRef
         <div className="upload-auto-crop-toolbar">
           <div className="upload-auto-crop-group">
             <span className="upload-auto-crop-label">Trang chunk</span>
-            <select value={cropPage} onChange={(e) => onChange({ cropPage: Number(e.target.value) })} style={toolbarInputStyle} disabled={busy}>
+            <select value={cropPage} onChange={(e) => switchCropPage(Number(e.target.value))} style={toolbarInputStyle} disabled={busy}>
               {Array.from({ length: chunkPages }, (_, idx) => idx + 1).map((page) => (
                 <option key={page} value={page}>Trang {page}</option>
               ))}
@@ -721,28 +836,46 @@ function ChunkCropEditor({ sessionId, item, busy, onChange, onRefresh, onAutoRef
           </div>
           <div className="upload-auto-crop-group">
             <span className="upload-auto-crop-label">Trên</span>
-            <input type="number" value={item.cropTop ?? ""} onChange={(e) => onChange({ cropTop: e.target.value === "" ? null : Number(e.target.value) })} style={toolbarInputStyle} disabled={busy} />
+            <input
+              type="number"
+              value={currentBand?.cropTop ?? ""}
+              onChange={(e) => applyBandPatch(e.target.value === "" ? null : Number(e.target.value), currentBand?.cropBottom ?? cropBottom, cropPage)}
+              style={toolbarInputStyle}
+              disabled={busy}
+            />
           </div>
           <div className="upload-auto-crop-group">
             <span className="upload-auto-crop-label">Dưới</span>
-            <input type="number" value={item.cropBottom ?? ""} onChange={(e) => onChange({ cropBottom: e.target.value === "" ? null : Number(e.target.value) })} style={toolbarInputStyle} disabled={busy} />
+            <input
+              type="number"
+              value={currentBand?.cropBottom ?? ""}
+              onChange={(e) => applyBandPatch(currentBand?.cropTop ?? cropTop, e.target.value === "" ? null : Number(e.target.value), cropPage)}
+              style={toolbarInputStyle}
+              disabled={busy}
+            />
           </div>
-          <button type="button" className="btn" onClick={() => onChange({ cropTop: Math.max(0, cropTop - 10) })} disabled={busy}>Trên -10</button>
-          <button type="button" className="btn" onClick={() => onChange({ cropTop: cropTop + 10 })} disabled={busy}>Trên +10</button>
-          <button type="button" className="btn" onClick={() => onChange({ cropBottom: Math.max(cropTop + 1, cropBottom - 10) })} disabled={busy}>Dưới -10</button>
-          <button type="button" className="btn" onClick={() => onChange({ cropBottom: cropBottom + 10 })} disabled={busy}>Dưới +10</button>
-          <button type="button" className="btn" onClick={() => onChange({ cropTop: null, cropBottom: null, cropPage: 1, yLine: null })} disabled={busy}>Xóa crop tay</button>
+          <button type="button" className="btn" onClick={() => applyBandPatch(Math.max(0, cropTop - 10), cropBottom, cropPage)} disabled={busy}>Trên -10</button>
+          <button type="button" className="btn" onClick={() => applyBandPatch(cropTop + 10, cropBottom, cropPage)} disabled={busy}>Trên +10</button>
+          <button type="button" className="btn" onClick={() => applyBandPatch(cropTop, Math.max(cropTop + 1, cropBottom - 10), cropPage)} disabled={busy}>Dưới -10</button>
+          <button type="button" className="btn" onClick={() => applyBandPatch(cropTop, cropBottom + 10, cropPage)} disabled={busy}>Dưới +10</button>
+          <button type="button" className="btn" onClick={clearCurrentPage} disabled={busy}>Xóa crop trang này</button>
+          <button type="button" className="btn" onClick={clearAllPages} disabled={busy}>Xóa tất cả crop</button>
           <button type="button" className="btn" onClick={onAutoRefresh} disabled={busy}>Auto</button>
           <button type="button" className="btn btn-primary" onClick={onRefresh} disabled={busy}>Lưu crop và cập nhật preview</button>
         </div>
 
-        <div className="upload-auto-crop-page-note">Preview chunk đang chọn · kéo đường đỏ và xanh để lấy phần giữa.</div>
+        <div className="upload-auto-crop-page-note">
+          Preview chunk đang chọn · kéo đường đỏ và xanh để lấy phần giữa. Các trang đã lưu crop:{" "}
+          {cropBands.length ? cropBands.map((band) => `Trang ${band.page}`).join(", ") : "chưa có"}
+        </div>
+
         <div
           ref={frameRef}
           className="upload-auto-crop-frame"
           onMouseDown={(e) => {
+            if (busy) return;
             const frame = frameRef.current;
-            if (!frame) return;
+            if (!frame || !renderBox.naturalHeight) return;
             const rect = frame.getBoundingClientRect();
             const y = e.clientY - rect.top;
             const topPx = renderBox.height ? (cropTop / renderBox.naturalHeight) * renderBox.height : 0;
@@ -763,10 +896,28 @@ function ChunkCropEditor({ sessionId, item, busy, onChange, onRefresh, onAutoRef
           <div className="upload-auto-crop-band" style={{ top: lineTopPct, height: renderBox.naturalHeight ? `${((cropBottom - cropTop) / renderBox.naturalHeight) * 100}%` : "60%" }} />
           <div className="upload-auto-crop-line upload-auto-crop-line-top" style={{ top: lineTopPct }} />
           <div className="upload-auto-crop-line upload-auto-crop-line-bottom" style={{ top: lineBottomPct }} />
-          <button type="button" className="upload-auto-crop-handle upload-auto-crop-handle-top" style={{ top: lineTopPct }} onMouseDown={(e) => { e.stopPropagation(); setDraggingEdge("top"); }}>
+          <button
+            type="button"
+            className="upload-auto-crop-handle upload-auto-crop-handle-top"
+            style={{ top: lineTopPct }}
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setDraggingEdge("top");
+            }}
+          >
             Trên
           </button>
-          <button type="button" className="upload-auto-crop-handle upload-auto-crop-handle-bottom" style={{ top: lineBottomPct }} onMouseDown={(e) => { e.stopPropagation(); setDraggingEdge("bottom"); }}>
+          <button
+            type="button"
+            className="upload-auto-crop-handle upload-auto-crop-handle-bottom"
+            style={{ top: lineBottomPct }}
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setDraggingEdge("bottom");
+            }}
+          >
             Dưới
           </button>
         </div>

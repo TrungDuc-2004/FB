@@ -69,11 +69,77 @@ def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
     except Exception:
         return default
 
+def _normalize_crop_bands(raw: Any) -> List[Dict[str, int]]:
+    bands: List[Dict[str, int]] = []
+    if not raw:
+        return bands
+    if isinstance(raw, dict):
+        raw = list(raw.values())
+    if not isinstance(raw, list):
+        return bands
+
+    dedup: Dict[int, Dict[str, int]] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        page = _safe_int(item.get("page"), None)
+        top = _safe_int(item.get("cropTop"), None)
+        bottom = _safe_int(item.get("cropBottom"), None)
+        if page is None or top is None or bottom is None or bottom <= top:
+            continue
+        dedup[int(page)] = {"page": int(page), "cropTop": int(top), "cropBottom": int(bottom)}
+
+    for page in sorted(dedup):
+        bands.append(dedup[page])
+    return bands
+
+
+def _crop_bands_from_item(item: Dict[str, Any]) -> List[Dict[str, int]]:
+    bands = _normalize_crop_bands(item.get("cropBands"))
+    if bands:
+        return bands
+
+    page = _safe_int(item.get("cropPage"), 1) or 1
+    top = _safe_int(item.get("cropTop"), None)
+    bottom = _safe_int(item.get("cropBottom"), None)
+    if top is not None and bottom is not None and bottom > top:
+        return [{"page": int(page), "cropTop": int(top), "cropBottom": int(bottom)}]
+    return []
+
+
+def _get_crop_band_for_page(item: Dict[str, Any], page: Optional[int] = None) -> Optional[Dict[str, int]]:
+    bands = _crop_bands_from_item(item)
+    if not bands:
+        return None
+    target_page = _safe_int(page, None)
+    if target_page is None:
+        target_page = _safe_int(item.get("cropPage"), None)
+    if target_page is not None:
+        for band in bands:
+            if int(band.get("page") or 0) == int(target_page):
+                return dict(band)
+    return dict(bands[0])
+
+
+def _sync_item_crop_fields(item: Dict[str, Any]) -> Dict[str, Any]:
+    bands = _crop_bands_from_item(item)
+    item["cropBands"] = bands
+    selected_page = _safe_int(item.get("cropPage"), 1) or 1
+    band = _get_crop_band_for_page(item, selected_page)
+    if band:
+        item["cropPage"] = int(band["page"])
+        item["cropTop"] = int(band["cropTop"])
+        item["cropBottom"] = int(band["cropBottom"])
+    else:
+        item["cropPage"] = int(selected_page)
+        item["cropTop"] = None
+        item["cropBottom"] = None
+    return item
+
 
 def _has_manual_crop_band(item: Dict[str, Any]) -> bool:
-    top = _safe_int(item.get('cropTop'))
-    bottom = _safe_int(item.get('cropBottom'))
-    return top is not None and bottom is not None and bottom > top
+    return bool(_crop_bands_from_item(item))
+
 
 
 def _apply_manual_crop_band(
@@ -157,6 +223,34 @@ def _apply_manual_crop_band(
     }
     cut_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
     return payload
+
+
+def _apply_manual_crop_bands(
+    *,
+    chunk_pdf_path: str,
+    out_dir: Path,
+    crop_bands: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    for band in _normalize_crop_bands(crop_bands):
+        res = _apply_manual_crop_band(
+            chunk_pdf_path=chunk_pdf_path,
+            out_dir=out_dir,
+            crop_page=int(band.get("page") or 1),
+            crop_top=_safe_int(band.get("cropTop")),
+            crop_bottom=_safe_int(band.get("cropBottom")),
+        )
+        if res:
+            results.append(res)
+    if results:
+        try:
+            stem = Path(chunk_pdf_path).stem
+            cut_json = out_dir / f"{stem}_cutline.json"
+            cut_json.write_text(json.dumps({"mode": "manual_crop_bands", "bands": results}, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+    return results
+
 
 
 _AUTO_REVIEW_SESSIONS: Dict[str, Dict[str, Any]] = {}
@@ -2638,6 +2732,7 @@ def _build_review_items_from_split(session_id: str, split_result: Dict[str, Any]
             'cropPage': 1,
             'cropTop': None,
             'cropBottom': None,
+            'cropBands': [],
             'chunkPages': len(PdfReader(_clean(chunk.get('file_path'))).pages) if _clean(chunk.get('file_path')) and os.path.exists(_clean(chunk.get('file_path'))) else max(1, int(chunk.get('end') or chunk.get('start') or 1) - int(chunk.get('start') or 1) + 1),
             'bestMode': _clean(chunk.get('best_mode')),
             'totalPages': len(PdfReader(_clean((lesson_item or {}).get('currentPath'))).pages) if lesson_item and _clean((lesson_item or {}).get('currentPath')) and os.path.exists(_clean((lesson_item or {}).get('currentPath'))) else source_total_pages,
@@ -2647,7 +2742,10 @@ def _build_review_items_from_split(session_id: str, split_result: Dict[str, Any]
 
 
 def _public_review_item(session_id: str, item: Dict[str, Any]) -> Dict[str, Any]:
-    out = {k: v for k, v in item.items() if k not in {'filePath', 'metaPath', 'sourcePath', 'contextPath', 'currentPath', 'chunkPdfPath', 'cutlineJson', 'debugPng', 'topPng', 'midPng', 'botPng'}}
+    src = dict(item or {})
+    if _clean(src.get('kind')).lower() == 'chunk':
+        _sync_item_crop_fields(src)
+    out = {k: v for k, v in src.items() if k not in {'filePath', 'metaPath', 'sourcePath', 'contextPath', 'currentPath', 'chunkPdfPath', 'cutlineJson', 'debugPng', 'topPng', 'midPng', 'botPng'}}
     review_id = _clean(item.get('reviewId'))
     quoted = quote_plus(review_id)
     out['previewSourceUrl'] = f"/admin/minio/upload-auto/session/{session_id}/preview?item_id={quoted}&kind=source"
@@ -2681,33 +2779,55 @@ def _session_public_payload(session: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+
 def _merge_review_items(session: Dict[str, Any], incoming_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     base_map = {str(item.get('reviewId')): dict(item) for item in (session.get('review_items') or [])}
-    editable = {'start', 'end', 'heading', 'title', 'number', 'contentHead', 'topicReviewId', 'lessonReviewId', 'yLine', 'cropPage', 'cropTop', 'cropBottom'}
+    editable = {
+        'start', 'end', 'heading', 'title', 'number', 'contentHead', 'topicReviewId',
+        'lessonReviewId', 'yLine', 'cropPage', 'cropTop', 'cropBottom', 'cropBands', 'approved'
+    }
+
     for raw in incoming_items or []:
         review_id = _clean((raw or {}).get('reviewId'))
         if not review_id or review_id not in base_map:
             continue
+
         target = base_map[review_id]
         for key in editable:
             if key not in raw:
                 continue
             value = raw.get(key)
+
+            if key == 'cropBands':
+                target['cropBands'] = _normalize_crop_bands(value)
+                continue
+
             if key in {'start', 'end', 'number', 'yLine', 'cropPage', 'cropTop', 'cropBottom'}:
                 if value in (None, ''):
-                    target[key] = None if key in {'yLine', 'cropTop', 'cropBottom'} else target.get(key)
-                else:
-                    try:
-                        target[key] = int(value)
-                    except Exception:
-                        pass
-            elif key == 'contentHead':
+                    if key in {'yLine', 'cropTop', 'cropBottom'}:
+                        target[key] = None
+                    elif key == 'cropPage':
+                        target[key] = 1
+                    continue
+                try:
+                    target[key] = int(value)
+                except Exception:
+                    pass
+                continue
+
+            if key in {'contentHead', 'approved'}:
                 target[key] = bool(value)
-            else:
-                target[key] = _clean(value)
+                continue
+
+            target[key] = _clean(value)
+
+        if _clean(target.get('kind')).lower() == 'chunk':
+            _sync_item_crop_fields(target)
+
     merged = list(base_map.values())
     merged.sort(key=lambda x: ({'topic': 1, 'lesson': 2, 'chunk': 3}.get(_clean(x.get('kind')), 9), int(x.get('start') or 0), int(x.get('end') or 0), _clean(x.get('reviewId'))))
     return merged
+
 
 
 def _pick_session_preview_path(item: Dict[str, Any], kind: str) -> str:
@@ -2879,13 +2999,12 @@ def _approve_auto_review_session(
             chunk_meta.write_text(json.dumps(meta_payload, ensure_ascii=False, indent=2), encoding='utf-8')
             try:
                 debug_dir = chunk_dir / 'DebugCutlines'
-                if _has_manual_crop_band(chunk):
-                    _apply_manual_crop_band(
+                crop_bands = _crop_bands_from_item(chunk)
+                if crop_bands:
+                    _apply_manual_crop_bands(
                         chunk_pdf_path=str(chunk_pdf),
                         out_dir=debug_dir,
-                        crop_page=_safe_int(chunk.get('cropPage'), 1) or 1,
-                        crop_top=_safe_int(chunk.get('cropTop')),
-                        crop_bottom=_safe_int(chunk.get('cropBottom')),
+                        crop_bands=crop_bands,
                     )
                 else:
                     from ..services.auto_split_upload import _apply_manual_or_auto_cutline  # type: ignore
@@ -3021,13 +3140,12 @@ def _refresh_review_item_preview(session: Dict[str, Any], merged_items: List[Dic
         chunk_meta.write_text(json.dumps(meta_payload, ensure_ascii=False, indent=2), encoding='utf-8')
         debug_dir = item_dir / 'DebugCutlines'
         try:
-            if _has_manual_crop_band(target):
-                _apply_manual_crop_band(
+            crop_bands = _crop_bands_from_item(target)
+            if crop_bands:
+                _apply_manual_crop_bands(
                     chunk_pdf_path=str(chunk_pdf),
                     out_dir=debug_dir,
-                    crop_page=_safe_int(target.get('cropPage'), 1) or 1,
-                    crop_top=_safe_int(target.get('cropTop')),
-                    crop_bottom=_safe_int(target.get('cropBottom')),
+                    crop_bands=crop_bands,
                 )
                 target['yLine'] = None
             else:
@@ -3055,6 +3173,7 @@ def _refresh_review_item_preview(session: Dict[str, Any], merged_items: List[Dic
         target['botPng'] = str(debug_dir / f"{stem}_cutline_bot.png")
         target['chunkPages'] = len(PdfReader(chunk_pdf).pages) if chunk_pdf and os.path.exists(chunk_pdf) else max(1, int(target.get('end') or target.get('start') or 1) - int(target.get('start') or 1) + 1)
         target['totalPages'] = len(PdfReader(lesson_pdf).pages) if lesson_pdf and os.path.exists(lesson_pdf) else source_total_pages
+        _sync_item_crop_fields(target)
         return target
 
     raise HTTPException(status_code=400, detail='Loại mục không hỗ trợ cập nhật preview')

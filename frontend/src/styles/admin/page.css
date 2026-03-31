@@ -866,3 +866,14 @@ body.user-shell-clean .sep {
     grid-template-columns: 1fr;
   }
 }
+
+
+/* crop multi-page fix */
+.upload-auto-crop-handle {
+  pointer-events: auto !important;
+  user-select: none;
+}
+
+.upload-auto-crop-frame button {
+  pointer-events: auto;
+}

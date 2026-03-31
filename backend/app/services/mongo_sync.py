@@ -307,6 +307,122 @@ def _parse_chunk_map(chunk_map: str) -> Optional[Dict[str, str]]:
     }
 
 
+
+
+def _active_docs(docs):
+    out = []
+    for doc in docs or []:
+        if not isinstance(doc, dict):
+            continue
+        if _clean_str(doc.get("status") or "active").lower() == "hidden":
+            continue
+        out.append(doc)
+    return out
+
+
+def _refresh_lesson_keywords_from_chunks(db, *, lesson_map: str, category: str, now: datetime) -> Dict[str, Any] | None:
+    """
+    Giữ nguyên keywordLesson hiện có của lesson, chỉ đồng bộ timestamp sau khi chunk thay đổi.
+
+    keyword của chunk chỉ thuộc chunk; lesson/topic/subject sẽ được tổng hợp theo các hàm cha-con
+    bên dưới. Hàm này tồn tại để tránh NameError và để luồng sync chunk không bị vỡ.
+    """
+    lesson_map = _clean_str(lesson_map)
+    if not lesson_map:
+        return None
+
+    lesson_filter = {"lessonID": lesson_map}
+    if _clean_str(category):
+        lesson_filter["lessonCategory"] = _clean_str(category)
+
+    lesson_doc = db["lessons"].find_one(lesson_filter)
+    if not lesson_doc and "lessonCategory" in lesson_filter:
+        lesson_filter.pop("lessonCategory", None)
+        lesson_doc = db["lessons"].find_one(lesson_filter)
+    if not lesson_doc:
+        return None
+
+    keywords = _uniq_keep_order(_parse_keywords(lesson_doc.get("keywordLesson")), limit=None)
+    db["lessons"].update_one(
+        {"_id": lesson_doc["_id"]},
+        {"$set": {"keywordLesson": keywords, "searchUpdatedAt": now, "updatedAt": now}},
+    )
+    return {"lessonID": lesson_map, "keywordCount": len(keywords)}
+
+
+def _refresh_topic_keywords_from_lessons(db, *, topic_map: str, category: str, now: datetime) -> Dict[str, Any] | None:
+    topic_map = _clean_str(topic_map)
+    if not topic_map:
+        return None
+
+    topic_filter = {"topicID": topic_map}
+    if _clean_str(category):
+        topic_filter["topicCategory"] = _clean_str(category)
+
+    topic_doc = db["topics"].find_one(topic_filter)
+    if not topic_doc and "topicCategory" in topic_filter:
+        topic_filter.pop("topicCategory", None)
+        topic_doc = db["topics"].find_one(topic_filter)
+    if not topic_doc:
+        return None
+
+    lesson_filter = {"topicID": topic_map}
+    if _clean_str(category):
+        lesson_filter["lessonCategory"] = _clean_str(category)
+
+    lessons = _active_docs(list(db["lessons"].find(lesson_filter).sort("lessonNumber", 1)))
+    if not lessons and "lessonCategory" in lesson_filter:
+        lesson_filter.pop("lessonCategory", None)
+        lessons = _active_docs(list(db["lessons"].find(lesson_filter).sort("lessonNumber", 1)))
+
+    keywords: List[str] = []
+    for lesson in lessons:
+        keywords.extend(_parse_keywords(lesson.get("keywordLesson")))
+    keywords = _uniq_keep_order(keywords, limit=None)
+
+    db["topics"].update_one(
+        {"_id": topic_doc["_id"]},
+        {"$set": {"keywordTopic": keywords, "searchUpdatedAt": now, "updatedAt": now}},
+    )
+    return {"topicID": topic_map, "keywordCount": len(keywords)}
+
+
+def _refresh_subject_keywords_from_topics(db, *, subject_map: str, category: str, now: datetime) -> Dict[str, Any] | None:
+    subject_map = _clean_str(subject_map)
+    if not subject_map:
+        return None
+
+    subject_filter = {"subjectID": subject_map}
+    if _clean_str(category):
+        subject_filter["subjectCategory"] = _clean_str(category)
+
+    subject_doc = db["subjects"].find_one(subject_filter)
+    if not subject_doc and "subjectCategory" in subject_filter:
+        subject_filter.pop("subjectCategory", None)
+        subject_doc = db["subjects"].find_one(subject_filter)
+    if not subject_doc:
+        return None
+
+    topic_filter = {"subjectID": subject_map}
+    if _clean_str(category):
+        topic_filter["topicCategory"] = _clean_str(category)
+
+    topics = _active_docs(list(db["topics"].find(topic_filter).sort("topicNumber", 1)))
+    if not topics and "topicCategory" in topic_filter:
+        topic_filter.pop("topicCategory", None)
+        topics = _active_docs(list(db["topics"].find(topic_filter).sort("topicNumber", 1)))
+
+    keywords: List[str] = []
+    for topic in topics:
+        keywords.extend(_parse_keywords(topic.get("keywordTopic")))
+    keywords = _uniq_keep_order(keywords, limit=None)
+
+    db["subjects"].update_one(
+        {"_id": subject_doc["_id"]},
+        {"$set": {"keywordSubject": keywords, "searchUpdatedAt": now, "updatedAt": now}},
+    )
+    return {"subjectID": subject_map, "keywordCount": len(keywords)}
+
 @dataclass
 class SyncResult:
     folder_type: str
