@@ -953,6 +953,92 @@ def _resolve_entity_doc(entity_id: str, *, category: str, username: str, pg: Opt
     return None
 
 
+
+
+def _parse_follow_id_parts(value: str) -> Optional[dict[str, str]]:
+    s = str(value or '').strip()
+    if not s:
+        return None
+
+    patterns = [
+        (r"^(.+?)_CD(\d+)_B(\d+)_C(\d+)$", "chunk", "map"),
+        (r"^(.+?)_T(\d+)_L(\d+)_C(\d+)$", "chunk", "semantic"),
+        (r"^(.+?)_CD(\d+)_B(\d+)$", "lesson", "map"),
+        (r"^(.+?)_T(\d+)_L(\d+)$", "lesson", "semantic"),
+        (r"^(.+?)_CD(\d+)$", "topic", "map"),
+        (r"^(.+?)_T(\d+)$", "topic", "semantic"),
+    ]
+    for pattern, follow_type, style in patterns:
+        m = re.match(pattern, s, flags=re.I)
+        if not m:
+            continue
+        parts = m.groups()
+        data = {
+            "follow_type": follow_type,
+            "style": style,
+            "subject": parts[0],
+            "topic_no": parts[1] if len(parts) >= 2 else "",
+            "lesson_no": parts[2] if len(parts) >= 3 else "",
+            "chunk_no": parts[3] if len(parts) >= 4 else "",
+        }
+        return data
+    if s:
+        return {
+            "follow_type": "subject",
+            "style": "plain",
+            "subject": s,
+            "topic_no": "",
+            "lesson_no": "",
+            "chunk_no": "",
+        }
+    return None
+
+
+def _build_follow_id_from_parts(parts: dict[str, str], *, style: str) -> str:
+    subject = str(parts.get("subject") or "").strip()
+    topic_no = str(parts.get("topic_no") or "").strip()
+    lesson_no = str(parts.get("lesson_no") or "").strip()
+    chunk_no = str(parts.get("chunk_no") or "").strip()
+    follow_type = str(parts.get("follow_type") or "").strip().lower()
+    if not subject:
+        return ""
+
+    def _n(v: str) -> str:
+        return str(int(v)) if str(v or '').strip().isdigit() else str(v or '').strip()
+
+    if follow_type == "subject":
+        return subject
+    if style == "map":
+        out = [subject]
+        if topic_no:
+            out.append(f"CD{_n(topic_no)}")
+        if lesson_no:
+            out.append(f"B{_n(lesson_no)}")
+        if chunk_no:
+            out.append(f"C{_n(chunk_no)}")
+        return "_".join(out)
+    out = [subject]
+    if topic_no:
+        out.append(f"T{_n(topic_no)}")
+    if lesson_no:
+        out.append(f"L{_n(lesson_no)}")
+    if chunk_no:
+        out.append(f"C{_n(chunk_no)}")
+    return "_".join(out)
+
+
+def _media_follow_id_aliases(follow_type: str, follow_id: str) -> list[str]:
+    fid = str(follow_id or '').strip()
+    if not fid:
+        return []
+    aliases = [fid]
+    parsed = _parse_follow_id_parts(fid)
+    if parsed and str(parsed.get("follow_type") or '').lower() == str(follow_type or '').lower():
+        for style in ("map", "semantic"):
+            alt = _build_follow_id_from_parts(parsed, style=style)
+            if alt and alt not in aliases:
+                aliases.append(alt)
+    return aliases
 def _load_media_bucket_from_pg(row: Any, collection: str, *, media_type: str, follow_type: str, follow_id: str) -> Optional[dict]:
     mongo_doc = {}
     mongo_id = getattr(row, "mongo_id", None)
@@ -1023,21 +1109,24 @@ def _attach_related_media(doc: dict, *, pg: Optional[Session]) -> dict:
     images = []
     videos = []
     for ft, fid in uniq_targets:
+        candidate_ids = _media_follow_id_aliases(ft, fid) or [fid]
         try:
-            image_rows = pg.query(PgImage).filter(PgImage.follow_type == ft, PgImage.follow_id == fid).all()
+            image_rows = pg.query(PgImage).filter(PgImage.follow_type == ft, PgImage.follow_id.in_(candidate_ids)).all()
         except Exception:
             image_rows = []
         for row in image_rows:
-            item = _load_media_bucket_from_pg(row, COL_IMAGES, media_type="image", follow_type=ft, follow_id=fid)
+            row_follow_id = str(getattr(row, "follow_id", "") or fid)
+            item = _load_media_bucket_from_pg(row, COL_IMAGES, media_type="image", follow_type=ft, follow_id=row_follow_id)
             if item:
                 images.append(item)
 
         try:
-            video_rows = pg.query(PgVideo).filter(PgVideo.follow_type == ft, PgVideo.follow_id == fid).all()
+            video_rows = pg.query(PgVideo).filter(PgVideo.follow_type == ft, PgVideo.follow_id.in_(candidate_ids)).all()
         except Exception:
             video_rows = []
         for row in video_rows:
-            item = _load_media_bucket_from_pg(row, COL_VIDEOS, media_type="video", follow_type=ft, follow_id=fid)
+            row_follow_id = str(getattr(row, "follow_id", "") or fid)
+            item = _load_media_bucket_from_pg(row, COL_VIDEOS, media_type="video", follow_type=ft, follow_id=row_follow_id)
             if item:
                 videos.append(item)
 

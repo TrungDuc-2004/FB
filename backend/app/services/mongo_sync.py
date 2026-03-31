@@ -13,7 +13,7 @@ from .mongo_client import get_mongo_client
 from .keyword_embedding import embed_keyword_cached, get_keyword_embedder
 from .chunk_content_ai import (
     generate_chunk_description_and_keywords,
-    generate_lesson_description_and_keywords,
+    generate_lesson_description_only,
     generate_topic_description_only,
     generate_subject_description_only,
 )
@@ -159,6 +159,35 @@ def _prepare_chunk_keywords(explicit_keywords: List[str], chunk_name: str, chunk
         return kws[:limit]
     auto = _auto_chunk_keywords(chunk_name, chunk_desc, limit=limit)
     return _uniq_keep_order([*kws, *auto], limit=limit)
+
+
+def _require_manual_document_fields(*, folder_type: str, subject_name: str, subject_desc: str, topic_name: str, topic_desc: str, lesson_name: str, lesson_desc: str, lesson_keywords: List[str], chunk_name: str, chunk_desc: str, chunk_keywords: List[str]) -> None:
+    if folder_type == "subject":
+        if not _clean_str(subject_name):
+            raise ValueError("subjectName là bắt buộc cho upload thường")
+        if not _clean_str(subject_desc):
+            raise ValueError("subjectDescription là bắt buộc cho upload thường")
+        return
+    if folder_type == "topic":
+        if not _clean_str(topic_name):
+            raise ValueError("topicName là bắt buộc cho upload thường")
+        if not _clean_str(topic_desc):
+            raise ValueError("topicDescription là bắt buộc cho upload thường")
+        return
+    if folder_type == "lesson":
+        if not _clean_str(lesson_name):
+            raise ValueError("lessonName là bắt buộc cho upload thường")
+        if not _clean_str(lesson_desc):
+            raise ValueError("lessonDescription là bắt buộc cho upload thường")
+        return
+    if folder_type == "chunk":
+        if not _clean_str(chunk_name):
+            raise ValueError("chunkName là bắt buộc cho upload thường")
+        if not _clean_str(chunk_desc):
+            raise ValueError("chunkDescription là bắt buộc cho upload thường")
+        if not chunk_keywords:
+            raise ValueError("keywords là bắt buộc cho upload thường")
+        return
 
 
 def _minio_public_base() -> str:
@@ -410,6 +439,7 @@ def sync_minio_object_to_mongo(
 
     local_file_path = _clean_str(meta.get("__local_file_path"))
     upload_mode = (_clean_str(meta.get("__upload_mode")) or "standard").lower()
+    manual_document_mode = (category == "document" and upload_mode == "manual")
     topic_doc_for_level = db["topics"].find_one({"topicID": topic_map}) if topic_map else None
     subject_doc_for_level = db["subjects"].find_one({"subjectID": subject_map}) if subject_map else None
     lesson_doc_for_level = db["lessons"].find_one({"lessonID": lesson_map}) if lesson_map else None
@@ -440,7 +470,25 @@ def sync_minio_object_to_mongo(
         fallback=(filename.rsplit(".", 1)[0] if filename else (chunk_map or "")),
     )
 
-    if folder_type == "chunk":
+    if manual_document_mode:
+        keywords = _uniq_keep_order(keywords, limit=5)
+        lesson_keywords = []
+        topic_keywords = []
+        subject_keywords = []
+        _require_manual_document_fields(
+            folder_type=folder_type,
+            subject_name=subject_name,
+            subject_desc=subject_desc,
+            topic_name=topic_name,
+            topic_desc=topic_desc,
+            lesson_name=lesson_name,
+            lesson_desc=lesson_desc,
+            lesson_keywords=lesson_keywords,
+            chunk_name=chunk_name,
+            chunk_desc=chunk_desc,
+            chunk_keywords=keywords,
+        )
+    elif folder_type == "chunk":
         chunk_desc, keywords, _chunk_ai_meta = generate_chunk_description_and_keywords(
             chunk_name=chunk_name,
             explicit_description=chunk_desc,
@@ -452,15 +500,16 @@ def sync_minio_object_to_mongo(
             limit=5,
         )
     elif folder_type == "lesson":
-        lesson_desc, lesson_keywords, _lesson_ai_meta = generate_lesson_description_and_keywords(
+        lesson_desc, _lesson_ai_meta = generate_lesson_description_only(
             lesson_name=lesson_name or lesson_map or "",
             explicit_description=lesson_desc,
-            explicit_keywords=lesson_keywords,
             topic_name=_clean_str((topic_doc_for_level or {}).get("topicName") or topic_name),
             subject_name=_clean_str((subject_doc_for_level or {}).get("subjectName") or subject_name),
             file_path=local_file_path,
-            limit=10,
         )
+        # Lesson không lấy keyword trực tiếp từ AI/file hay form import.
+        # keywordLesson chỉ được gom từ keyword của các chunk thuộc lesson.
+        lesson_keywords = []
     elif folder_type == "topic":
         topic_desc, _topic_ai_meta = generate_topic_description_only(
             topic_name=topic_name or topic_map or "",
@@ -593,7 +642,9 @@ def sync_minio_object_to_mongo(
             }
             if lesson_desc:
                 set_fields["lessonDescription"] = lesson_desc
-            if lesson_keywords:
+            if folder_type == "lesson":
+                set_fields["keywordLesson"] = []
+            elif lesson_keywords:
                 set_fields["keywordLesson"] = lesson_keywords
             if folder_type == "lesson":
                 set_fields["lessonUrl"] = file_url
@@ -699,6 +750,12 @@ def sync_minio_object_to_mongo(
                     },
                     upsert=True,
                 )
+
+        _refresh_lesson_keywords_from_chunks(db, lesson_map=lesson_map, category=category, now=now)
+        if topic_map:
+            _refresh_topic_keywords_from_lessons(db, topic_map=topic_map, category=category, now=now)
+        if subject_map:
+            _refresh_subject_keywords_from_topics(db, subject_map=subject_map, category=category, now=now)
 
     return SyncResult(
         folder_type=folder_type,

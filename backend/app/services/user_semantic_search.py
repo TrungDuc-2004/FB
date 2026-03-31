@@ -200,7 +200,7 @@ def _cosine(a: List[float], b: List[float]) -> float:
     return float(dot / den) if den > 0 else 0.0
 
 
-# --------------------------- parsing ---------------------------
+# kiểm tra và tách lớp / chủ đề / bài / chunk ra khỏi câu hỏi, lấy class bao nhiêu ,......
 
 def _parse_query_context(query: str) -> dict:
     raw = _norm_spaces(query)

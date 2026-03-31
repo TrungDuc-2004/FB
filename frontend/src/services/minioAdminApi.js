@@ -124,7 +124,7 @@ function uploadWithProgress(url, formData, onProgress) {
           const progress = await getUploadProgress(uploadId);
           if (progress) {
             emit(progress);
-            if (["completed", "completed_with_errors", "failed"].includes(progress.status)) {
+            if (["completed", "completed_with_errors", "failed", "awaiting_review"].includes(progress.status)) {
               stopPolling();
               if (xhrFinished) {
                 if (xhrSucceeded) {
@@ -198,6 +198,73 @@ function uploadWithProgress(url, formData, onProgress) {
     });
     schedulePoll(250);
     xhr.send(formData);
+  });
+}
+
+function postJsonWithProgress(url, body, onProgress) {
+  return new Promise((resolve, reject) => {
+    const uploadId = body?.upload_id || makeUploadId();
+    const payload = { ...(body || {}), upload_id: uploadId };
+    let stopped = false;
+    let pollTimer = null;
+    let settled = false;
+
+    const emit = (progress = {}) => {
+      if (typeof onProgress !== "function") return;
+      onProgress(normalizeProgress({ uploadId, ...progress }));
+    };
+
+    const stopPolling = () => {
+      stopped = true;
+      if (pollTimer) {
+        clearTimeout(pollTimer);
+        pollTimer = null;
+      }
+    };
+
+    const schedulePoll = (delay = 250) => {
+      if (stopped || settled) return;
+      pollTimer = window.setTimeout(async () => {
+        try {
+          const progress = await getUploadProgress(uploadId);
+          if (progress) {
+            emit(progress);
+            if (["completed", "completed_with_errors", "failed", "awaiting_review"].includes(progress.status)) {
+              stopPolling();
+            }
+          }
+        } catch (error) {
+          void error;
+        }
+        if (!stopped) schedulePoll(250);
+      }, delay);
+    };
+
+    emit({ stage: "posting_json", stageLabel: "Đang gửi xác nhận", message: "Đang gửi xác nhận", percent: 5, status: "processing" });
+    schedulePoll(200);
+
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-user": getActor() },
+      body: JSON.stringify(payload),
+    })
+      .then(async (res) => {
+        const raw = await res.text();
+        if (!res.ok) throw new Error(parseErrorPayload(raw));
+        return raw ? JSON.parse(raw) : null;
+      })
+      .then((data) => {
+        if (settled) return;
+        settled = true;
+        stopPolling();
+        resolve(data);
+      })
+      .catch((error) => {
+        if (settled) return;
+        settled = true;
+        stopPolling();
+        reject(error);
+      });
   });
 }
 
@@ -291,4 +358,37 @@ export async function uploadAuto(path, file, { bookVariant = "", onProgress } = 
   if (bookVariant) fd.append("book_variant", bookVariant);
   fd.append("file", file);
   return uploadWithProgress(`${API_BASE}/admin/minio/upload-auto/`, fd, onProgress);
+}
+
+export async function getUploadAutoSession(sessionId) {
+  return httpJson(`${API_BASE}/admin/minio/upload-auto/session/${encodeURIComponent(sessionId)}`, { method: "GET", headers: { "x-user": getActor() } });
+}
+
+export async function approveUploadAuto(sessionId, items, { onProgress } = {}) {
+  return postJsonWithProgress(`${API_BASE}/admin/minio/upload-auto/approve`, {
+    session_id: sessionId,
+    items: Array.isArray(items) ? items : [],
+    upload_id: makeUploadId(),
+  }, onProgress);
+}
+
+
+export async function prepareUploadAutoReview(path, file, options = {}) {
+  return uploadAuto(path, file, options);
+}
+
+export async function approveUploadAutoReview(sessionId, payload = {}, { onProgress } = {}) {
+  return approveUploadAuto(sessionId, payload.items || [], { onProgress });
+}
+
+export async function refreshUploadAutoItem(sessionId, item, { onProgress } = {}) {
+  return postJsonWithProgress(`${API_BASE}/admin/minio/upload-auto/session/${encodeURIComponent(sessionId)}/refresh-item`, {
+    review_id: item?.reviewId || item?.review_id || '',
+    item: item || {},
+    upload_id: makeUploadId(),
+  }, onProgress);
+}
+
+export async function updateUploadAutoReviewItem(sessionId, item, { onProgress } = {}) {
+  return refreshUploadAutoItem(sessionId, item, { onProgress });
 }

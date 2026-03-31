@@ -474,12 +474,33 @@ def rebuild_hierarchy_descriptions_and_keywords(
             lesson_doc = db["lessons"].find_one({"lessonID": _clean(chunk_doc.get("lessonID"))})
 
     if lesson_doc:
-        description = _clean(lesson_doc.get("lessonDescription"))
-        keywords = _split_keywords(lesson_doc.get("keywordLesson"), limit=_keyword_limit("lesson"))
-        meta = {
-            "mode": "preserve_lesson_fields",
-            "note": "keywordLesson không rebuild từ chunk; keyword chunk chỉ thuộc chunk.",
-        }
+        lesson_chunks = _active_docs(
+            db["chunks"].find({"lessonID": _clean(lesson_doc.get("lessonID"))}).sort("chunkNumber", 1)
+        )
+        existing_lesson_keywords = _split_keywords(lesson_doc.get("keywordLesson"), limit=_keyword_limit("lesson"))
+        context = _build_context_lines(
+            "Lesson",
+            _clean(lesson_doc.get("lessonName")),
+            lesson_chunks,
+            child_name_key="chunkName",
+            child_desc_key="chunkDescription",
+            child_kw_key="keywords",
+            existing_description=_clean(lesson_doc.get("lessonDescription")),
+            existing_keywords=existing_lesson_keywords,
+        )
+
+        keywords = _uniq_keep_order(
+            [kw for chunk in lesson_chunks for kw in _split_keywords(chunk.get("keywords"), limit=None)],
+            limit=None,
+        )
+
+        description, _ignored_keywords, meta = _call_desc_keywords_api(
+            level="lesson",
+            name=_clean(lesson_doc.get("lessonName")),
+            context_text=context,
+            fallback_keywords=keywords,
+            existing_description=_clean(lesson_doc.get("lessonDescription")),
+        )
 
         _update_doc(
             "lessons",

@@ -158,9 +158,12 @@ function defaultMeta(folderType, category) {
     chunk_map: "",
     subjectName: "",
     subjectTitle: "",
+    subjectDescription: "",
     topicName: "",
+    topicDescription: "",
     lessonName: "",
     lessonType: "",
+    lessonDescription: "",
     chunkName: "",
     chunkType: "",
     keywords: "",
@@ -310,9 +313,53 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
       alert("Vui lòng nhập tên file (có đuôi) hoặc chọn file");
       return false;
     }
-    if (folderType === "chunk" && !String(meta.lesson_map || "").trim()) {
-      alert("chunk_map không đúng format. VD: TH10_CD1_B1_C1");
-      return false;
+    if (folderType === "subject") {
+      if (!String(meta.subjectName || "").trim()) {
+        alert("Vui lòng nhập subjectName");
+        return false;
+      }
+      if (!String(meta.subjectDescription || "").trim()) {
+        alert("Vui lòng nhập subjectDescription");
+        return false;
+      }
+    }
+    if (folderType === "topic") {
+      if (!String(meta.topicName || "").trim()) {
+        alert("Vui lòng nhập topicName");
+        return false;
+      }
+      if (!String(meta.topicDescription || "").trim()) {
+        alert("Vui lòng nhập topicDescription");
+        return false;
+      }
+    }
+    if (folderType === "lesson") {
+      if (!String(meta.lessonName || "").trim()) {
+        alert("Vui lòng nhập lessonName");
+        return false;
+      }
+      if (!String(meta.lessonDescription || "").trim()) {
+        alert("Vui lòng nhập lessonDescription");
+        return false;
+      }
+    }
+    if (folderType === "chunk") {
+      if (!String(meta.chunkName || "").trim()) {
+        alert("Vui lòng nhập chunkName");
+        return false;
+      }
+      if (!String(meta.chunkDescription || "").trim()) {
+        alert("Vui lòng nhập chunkDescription");
+        return false;
+      }
+      if (!String(meta.keywords || "").trim()) {
+        alert("Vui lòng nhập keywords cho chunk");
+        return false;
+      }
+      if (!String(meta.lesson_map || "").trim()) {
+        alert("chunk_map không đúng format. VD: TH10_CD1_B1_C1");
+        return false;
+      }
     }
     return true;
   }
@@ -353,20 +400,20 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
   };
 
   const infoFieldsByType = {
-    subject: ["subjectName", "subjectTitle"],
-    topic: ["topicName"],
-    lesson: ["lessonName", "lessonType"],
-    chunk: ["chunkName", "chunkType", "keywords", "chunkDescription"],
+    subject: ["subjectName", "subjectDescription"],
+    topic: ["topicName", "topicDescription"],
+    lesson: ["lessonName", "lessonDescription"],
+    chunk: ["chunkName", "keywords", "chunkDescription"],
   };
 
   const mapKey = mapFieldByType[folderType] || "subject_map";
   const infoFields = infoFieldsByType[folderType] || [];
 
   const titleMap = {
-    subject: isMedia ? `Upload ${category === "image" ? "Image" : "Video"} (Subject)` : "Insert (Subject)",
-    topic: isMedia ? `Upload ${category === "image" ? "Image" : "Video"} (Topic)` : "Insert (Topic)",
-    lesson: isMedia ? `Upload ${category === "image" ? "Image" : "Video"} (Lesson)` : "Insert (Lesson)",
-    chunk: isMedia ? `Upload ${category === "image" ? "Image" : "Video"} (Chunk)` : "Insert (Chunk)",
+    subject: isMedia ? `Upload ${category === "image" ? "Image" : "Video"} (Subject)` : "Upload thủ công (Subject)",
+    topic: isMedia ? `Upload ${category === "image" ? "Image" : "Video"} (Topic)` : "Upload thủ công (Topic)",
+    lesson: isMedia ? `Upload ${category === "image" ? "Image" : "Video"} (Lesson)` : "Upload thủ công (Lesson)",
+    chunk: isMedia ? `Upload ${category === "image" ? "Image" : "Video"} (Chunk)` : "Upload thủ công (Chunk)",
   };
 
   const mapHintByType = {
@@ -391,8 +438,25 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
         { k: "lesson_map", v: meta.lesson_map },
       ].filter((x) => x.v);
 
+  const fieldLabels = {
+    subject_map: "ID subject",
+    topic_map: "ID topic",
+    lesson_map: "ID lesson",
+    chunk_map: "ID chunk",
+    subjectName: "Tên subject",
+    topicName: "Tên topic",
+    lessonName: "Tên lesson",
+    chunkName: "Tên chunk",
+    subjectDescription: "Mô tả subject",
+    topicDescription: "Mô tả topic",
+    lessonDescription: "Mô tả lesson",
+    chunkDescription: "Mô tả chunk",
+    keywords: "Keyword chunk",
+    name: "Tên file",
+  };
+
   function renderInput(key) {
-    if (key === "keywords" || key === "chunkDescription" || key === "imgDescription" || key === "videoDescription") {
+    if (["keywords", "chunkDescription", "imgDescription", "videoDescription", "subjectDescription", "topicDescription", "lessonDescription"].includes(key)) {
       return (
         <textarea
           id={key}
@@ -400,12 +464,18 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
           onChange={(e) => change(key, e.target.value)}
           placeholder={
             key === "keywords"
-              ? "Để trống để hệ thống tự lấy 5 keyword phù hợp"
+              ? "Nhập keyword chunk, cách nhau bởi dấu phẩy"
               : key === "imgDescription"
-                ? "Để trống để hệ thống tự lấy mô tả từ ảnh"
-                : key === "videoDescription"
-                  ? "Để trống để hệ thống tự lấy mô tả từ video"
-                  : "Để trống để hệ thống tự sinh mô tả chunk"
+                  ? "Để trống để hệ thống tự lấy mô tả từ ảnh"
+                  : key === "videoDescription"
+                    ? "Để trống để hệ thống tự lấy mô tả từ video"
+                    : key === "subjectDescription"
+                      ? "Nhập mô tả subject"
+                      : key === "topicDescription"
+                        ? "Nhập mô tả topic"
+                        : key === "lessonDescription"
+                          ? "Nhập mô tả lesson"
+                          : "Nhập mô tả chunk"
           }
           rows={4}
         />
@@ -436,12 +506,12 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
             {isMedia
               ? `Nhập mapID đúng cấp ${folderType}. Ví dụ: ${mapHintByType[folderType]}`
               : folderType === "subject"
-                ? "Chỉ cần nhập subject_map (VD TH10). Class sẽ suy ra (L10)."
+                ? "Nhập tay đầy đủ id, tên và mô tả. Không dùng AI cho upload thường."
                 : folderType === "topic"
-                  ? "Chỉ cần nhập topic_map (VD TH10_CD1)."
+                  ? "Nhập tay ID topic, tên và mô tả. Keyword của topic sẽ tự gom từ các lesson cùng topic."
                   : folderType === "lesson"
-                    ? "Chỉ cần nhập lesson_map (VD TH10_CD1_B1)."
-                    : "Chỉ cần nhập chunk_map (VD TH10_CD1_B1_C1). Lesson sẽ suy ra (TH10_CD1_B1)."}
+                    ? "Nhập tay ID lesson, tên và mô tả. Keyword của lesson sẽ tự gom từ các chunk thuộc lesson rồi đẩy lên topic và subject."
+                    : "Nhập tay ID chunk, tên, mô tả và keywords cho chunk. Không dùng AI cho upload thường."}
           </p>
           <button className="modal-close" onClick={onClose} disabled={submitting}>×</button>
         </div>
@@ -554,20 +624,20 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
                 <div className="form-grid">
                   {infoFields.filter((k) => k !== "chunkDescription").map((k) => (
                     <div className="field" key={k}>
-                      <label htmlFor={k}>{k}</label>
+                      <label htmlFor={k}>{fieldLabels[k] || k}</label>
                       {renderInput(k)}
                     </div>
                   ))}
                 </div>
                 {infoFields.includes("chunkDescription") && (
                   <div className="field" style={{ marginTop: 16 }}>
-                    <label htmlFor="chunkDescription">chunkDescription</label>
-                    <div style={{ marginTop: 4, marginBottom: 6, fontSize: 12, color: "#64748b" }}>Để trống thì backend sẽ tự sinh mô tả và keyword từ nội dung file.</div>
+                    <label htmlFor="chunkDescription">{fieldLabels.chunkDescription}</label>
+                    <div style={{ marginTop: 4, marginBottom: 6, fontSize: 12, color: "#64748b" }}>Nhập mô tả chunk thủ công. Backend sẽ không tự sinh mô tả/keyword cho upload thường.</div>
                     {renderInput("chunkDescription")}
                   </div>
                 )}
                 <div className="field" style={{ marginTop: 8 }}>
-                  <label htmlFor="name">Tên file (nếu không chọn file)</label>
+                  <label htmlFor="name">{fieldLabels.name} (nếu không chọn file)</label>
                   <input
                     id="name"
                     value={meta.name}
@@ -592,13 +662,13 @@ export default function InsertMetadataModal({ open, onClose, folderName, onInser
               <strong>Lưu ý:</strong>{" "}
               {isMedia
                 ? "MongoDB sẽ là nguồn gốc metadata. Postgre chỉ lưu quan hệ media và Neo4j sẽ tự sync node group theo follow_type."
-                : <>URL lưu vào Mongo sẽ dùng <code>MINIO_PUBLIC_BASE_URL</code> + <code>/&lt;bucket&gt;/&lt;object_key&gt;</code>.</>}
+                : <>Upload thường dùng dữ liệu nhập tay. Khi bạn upload lesson với <code>lesson_map</code> như <code>TH11-UD_CD1_B1</code>, backend sẽ tự suy ra topic <code>TH11-UD_CD1</code>. Keyword của lesson sẽ được gom từ các chunk thuộc lesson rồi đẩy tiếp lên topic và subject.</>}
             </div>
           </div>
 
           <div className="modal-footer">
             <button className="btn" type="button" onClick={onClose} disabled={submitting}>Huỷ</button>
-            <button className="btn btn-primary" type="submit" disabled={submitting}>{submitting ? "Đang xử lý..." : "Insert"}</button>
+            <button className="btn btn-primary" type="submit" disabled={submitting}>{submitting ? "Đang xử lý..." : "Upload"}</button>
           </div>
         </form>
       </div>

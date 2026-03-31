@@ -399,6 +399,8 @@ function ImportXlsxModal({ open, onClose, onImported }) {
     { key: "topics", label: "Topics" },
     { key: "lessons", label: "Lessons" },
     { key: "chunks", label: "Chunks" },
+    { key: "images", label: "Images" },
+    { key: "videos", label: "Videos" },
   ];
 
   function openFilePicker() {
@@ -407,7 +409,7 @@ function ImportXlsxModal({ open, onClose, onImported }) {
 
   async function runImport() {
     if (!file) {
-      setError("Bạn chưa chọn file XLSX");
+      setError("Bạn chưa chọn file Excel");
       return;
     }
     setLoading(true);
@@ -431,7 +433,7 @@ function ImportXlsxModal({ open, onClose, onImported }) {
       <div className="modal import-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header import-modal-header">
           <div>
-            <h3 className="modal-title">Import metadata (XLSX)</h3>
+            <h3 className="modal-title">Import metadata (Excel)</h3>
             <p className="modal-subtitle">
               Upsert dữ liệu vào MongoDB và có thể đồng bộ sang PostgreSQL + Neo4j ngay trong một lần import.
             </p>
@@ -447,8 +449,9 @@ function ImportXlsxModal({ open, onClose, onImported }) {
             <div>
               <div className="import-hero-title">Nạp dữ liệu metadata từ file Excel</div>
               <p className="import-hero-text">
-                File sẽ được upsert vào MongoDB theo các cấp classes / subjects / topics / lessons / chunks.
-                Bạn có thể bật thêm sync để đẩy dữ liệu liên quan sang PostgreSQL và Neo4j.
+                File sẽ được upsert vào MongoDB theo các cấp classes / subjects / topics / lessons / chunks
+                và có thể kèm sheet image / video để import media. Bạn có thể bật thêm sync để đẩy
+                dữ liệu liên quan sang PostgreSQL và Neo4j.
               </p>
             </div>
           </div>

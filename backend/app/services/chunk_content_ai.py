@@ -1065,28 +1065,17 @@ def generate_chunk_description_and_keywords(
     return final_description, final_keywords, meta
 
 
-def generate_lesson_description_and_keywords(
+def generate_lesson_description_only(
     *,
     lesson_name: str,
     explicit_description: str = '',
-    explicit_keywords: Sequence[str] | None = None,
     topic_name: str = '',
     subject_name: str = '',
     file_path: str = '',
-    limit: int = 10,
-) -> Tuple[str, List[str], Dict[str, Any]]:
-    limit = 10
+) -> Tuple[str, Dict[str, Any]]:
     description = _clean(explicit_description)
-    manual_keywords = _filter_lesson_keyword_values(
-        _normalize_keywords(list(explicit_keywords or []), limit=limit),
-        lesson_name=lesson_name,
-        topic_name=topic_name,
-        subject_name=subject_name,
-        description=description,
-        limit=None,
-    )
-
     desc_meta: Dict[str, Any] = {'mode': 'manual_description'}
+
     if not description:
         ai_description, _ignored_keywords, desc_meta = _generate_from_file_or_rest(
             prompt=_lesson_description_only_prompt(
@@ -1101,31 +1090,64 @@ def generate_lesson_description_and_keywords(
         description = ai_description
 
     final_description = description or _fallback_description(lesson_name, lesson_name, topic_name, subject_name)
+    return final_description, {
+        'mode': 'lesson_description_only',
+        'description_meta': desc_meta,
+    }
 
-    final_keywords, keyword_meta = _collect_lesson_keywords_strict_ai_only(
+
+def generate_lesson_description_and_keywords(
+    *,
+    lesson_name: str,
+    explicit_description: str = '',
+    explicit_keywords: Sequence[str] | None = None,
+    topic_name: str = '',
+    subject_name: str = '',
+    file_path: str = '',
+    limit: int | None = 10,
+) -> Tuple[str, List[str], Dict[str, Any]]:
+    description, desc_meta = generate_lesson_description_only(
+        lesson_name=lesson_name,
+        explicit_description=explicit_description,
+        topic_name=topic_name,
+        subject_name=subject_name,
         file_path=file_path,
+    )
+
+    effective_limit = None if limit is None or int(limit or 0) <= 0 else int(limit)
+    manual_keywords = _filter_lesson_keyword_values(
+        _normalize_keywords(list(explicit_keywords or []), limit=effective_limit),
         lesson_name=lesson_name,
         topic_name=topic_name,
         subject_name=subject_name,
-        limit=limit,
-        manual_keywords=manual_keywords,
+        description=description,
+        limit=None,
     )
-    final_keywords = _filter_lesson_keyword_values(
-        final_keywords,
-        lesson_name=lesson_name,
-        topic_name=topic_name,
-        subject_name=subject_name,
-        description='',
-        limit=limit,
-    )
+
+    final_keywords: List[str] = []
+    keyword_meta: Dict[str, Any] = {'mode': 'lesson_keywords_from_input_only'}
+    if manual_keywords:
+        final_keywords = _filter_lesson_keyword_values(
+            manual_keywords,
+            lesson_name=lesson_name,
+            topic_name=topic_name,
+            subject_name=subject_name,
+            description='',
+            limit=effective_limit,
+        )
+        keyword_meta = {
+            'mode': 'lesson_keywords_from_input_only',
+            'count': len(final_keywords),
+            'limit': effective_limit,
+        }
 
     meta: Dict[str, Any] = {
-        'mode': 'lesson_description_plus_reference_keywords_strict',
+        'mode': 'lesson_description_plus_optional_keywords',
         'description_meta': desc_meta,
         'keyword_meta': keyword_meta,
-        'keyword_limit_locked': 10,
+        'keyword_limit': effective_limit,
     }
-    return final_description, final_keywords, meta
+    return description, final_keywords, meta
 
 def _description_only_prompt(*, level: str, name: str, parent_name: str = "") -> str:
     level_vi = {"topic": "chủ đề", "subject": "môn học/cuốn sách"}.get(level, level)

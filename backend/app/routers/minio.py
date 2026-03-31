@@ -2,11 +2,17 @@ import os
 import io
 import time
 import tempfile
+import shutil
 import json
 import re
 import threading
 import uuid
 from pathlib import Path
+
+try:
+    from pypdf import PdfReader, PdfWriter
+except Exception:  # pragma: no cover
+    from PyPDF2 import PdfReader, PdfWriter  # type: ignore
 
 from urllib.parse import quote, quote_plus
 from typing import List, Optional, Tuple, Set, Dict, Any
@@ -15,7 +21,7 @@ from sqlalchemy import text
 from datetime import timedelta, datetime, timezone
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 
 from minio.error import S3Error
 from pydantic import BaseModel, Field
@@ -34,7 +40,7 @@ from ..services.media_sync import sync_minio_media_to_mongo
 from ..services.postgre_media_sync import sync_postgre_media_from_mongo
 from ..services.neo_media_sync import sync_media_to_neo4j
 from ..services.media_content_ai import generate_media_description
-from ..services.auto_split_upload import extract_and_split_structure, cleanup_split_result
+from ..services.auto_split_upload import extract_and_split_structure, cleanup_split_result, _extract_heading_number
 router = APIRouter(
     prefix="/admin/minio",
     tags=["Minio"]
@@ -49,6 +55,254 @@ _UPLOAD_PROGRESS_TTL_SECONDS = 60 * 60 * 6
 
 def _progress_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _clean(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _has_manual_crop_band(item: Dict[str, Any]) -> bool:
+    top = _safe_int(item.get('cropTop'))
+    bottom = _safe_int(item.get('cropBottom'))
+    return top is not None and bottom is not None and bottom > top
+
+
+def _apply_manual_crop_band(
+    *,
+    chunk_pdf_path: str,
+    out_dir: Path,
+    crop_page: int = 1,
+    crop_top: Optional[int] = None,
+    crop_bottom: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    try:
+        import fitz  # type: ignore
+        import cv2  # type: ignore
+        from ..services import sgk_chunk_postprocess as mod  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(f'Không thể dùng manual crop band: {exc}') from exc
+
+    pdf_path = Path(chunk_pdf_path)
+    if not pdf_path.exists():
+        raise FileNotFoundError(f'PDF not found: {pdf_path}')
+
+    doc = fitz.open(str(pdf_path))
+    page_count = doc.page_count
+    if page_count <= 0:
+        doc.close()
+        raise RuntimeError('PDF chunk không có trang nào để crop')
+
+    page_idx = max(0, min(int(crop_page or 1) - 1, page_count - 1))
+    page = doc[page_idx]
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = pdf_path.stem
+    page_png = out_dir / f"{stem}_page_{page_idx + 1}.png"
+    debug_png = out_dir / f"{stem}_cutline.png"
+    top_png = out_dir / f"{stem}_cutline_top.png"
+    mid_png = out_dir / f"{stem}_cutline_middle.png"
+    bot_png = out_dir / f"{stem}_cutline_bot.png"
+    cut_json = out_dir / f"{stem}_cutline.json"
+
+    pix.save(str(page_png))
+    doc.close()
+
+    img = mod.imread_unicode(page_png)
+    if img is None:
+        raise RuntimeError('Không render được trang PDF để crop')
+
+    h, w = img.shape[:2]
+    top = max(0, min(_safe_int(crop_top, 0) or 0, h - 1))
+    bottom = max(top + 1, min(_safe_int(crop_bottom, h) or h, h))
+
+    top_img = img[:top].copy() if top > 0 else None
+    mid_img = img[top:bottom].copy()
+    bot_img = img[bottom:].copy() if bottom < h else None
+
+    if top_img is not None and top_img.size:
+        mod.imwrite_unicode(top_png, top_img)
+    if mid_img is not None and mid_img.size:
+        mod.imwrite_unicode(mid_png, mid_img)
+    if bot_img is not None and bot_img.size:
+        mod.imwrite_unicode(bot_png, bot_img)
+
+    dbg = img.copy()
+    cv2.line(dbg, (0, top), (w, top), (0, 0, 255), 2)
+    cv2.line(dbg, (0, bottom), (w, bottom), (255, 0, 0), 2)
+    mod.imwrite_unicode(debug_png, dbg)
+
+    mod.replace_page_with_png_inplace(pdf_path, mid_png, page_idx, make_backup=False)
+
+    payload = {
+        'mode': 'manual_crop_band',
+        'page': int(page_idx + 1),
+        'crop_top': int(top),
+        'crop_bottom': int(bottom),
+        'page_height': int(h),
+        'page_width': int(w),
+        'top_png': str(top_png) if top_png.exists() else '',
+        'middle_png': str(mid_png) if mid_png.exists() else '',
+        'bot_png': str(bot_png) if bot_png.exists() else '',
+        'debug_png': str(debug_png) if debug_png.exists() else '',
+    }
+    cut_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    return payload
+
+
+_AUTO_REVIEW_SESSIONS: Dict[str, Dict[str, Any]] = {}
+_AUTO_REVIEW_LOCK = threading.Lock()
+_AUTO_REVIEW_TTL_SECONDS = 60 * 60 * 12
+_AUTO_REVIEW_DIR = Path(tempfile.gettempdir()) / 'minio_upload_auto_sessions'
+
+
+def _ensure_auto_review_dir() -> None:
+    _AUTO_REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _auto_review_session_file(session_id: str) -> Path:
+    safe_id = re.sub(r'[^a-zA-Z0-9_-]+', '', _clean(session_id)) or 'session'
+    return _AUTO_REVIEW_DIR / f"{safe_id}.json"
+
+
+def _auto_review_session_dir(session_id: str) -> Path:
+    safe_id = re.sub(r'[^a-zA-Z0-9_-]+', '', _clean(session_id)) or 'session'
+    return _AUTO_REVIEW_DIR / safe_id
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _load_auto_review_session_from_disk(session_id: str) -> Dict[str, Any] | None:
+    _ensure_auto_review_dir()
+    path = _auto_review_session_file(session_id)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        return None
+    return None
+
+
+def _write_auto_review_session_to_disk(payload: Dict[str, Any]) -> None:
+    _ensure_auto_review_dir()
+    session_id = _clean(payload.get('session_id'))
+    if not session_id:
+        return
+    path = _auto_review_session_file(session_id)
+    path.write_text(json.dumps(_json_safe(payload), ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def _delete_auto_review_session_from_disk(session_id: str) -> None:
+    try:
+        path = _auto_review_session_file(session_id)
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+    try:
+        session_dir = _auto_review_session_dir(session_id)
+        if session_dir.exists():
+            shutil.rmtree(session_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _cleanup_auto_review_sessions() -> None:
+    _ensure_auto_review_dir()
+    now_ts = time.time()
+    stale_ids = []
+    with _AUTO_REVIEW_LOCK:
+        for session_id, payload in list(_AUTO_REVIEW_SESSIONS.items()):
+            updated_at = payload.get("updated_ts") or payload.get("created_ts") or now_ts
+            if now_ts - float(updated_at) > _AUTO_REVIEW_TTL_SECONDS:
+                stale_ids.append(session_id)
+        for session_id in stale_ids:
+            _AUTO_REVIEW_SESSIONS.pop(session_id, None)
+            _delete_auto_review_session_from_disk(session_id)
+
+    for session_file in _AUTO_REVIEW_DIR.glob('*.json'):
+        try:
+            payload = json.loads(session_file.read_text(encoding='utf-8'))
+            updated_at = (payload or {}).get('updated_ts') or (payload or {}).get('created_ts') or now_ts
+            if now_ts - float(updated_at) > _AUTO_REVIEW_TTL_SECONDS:
+                sid = _clean((payload or {}).get('session_id')) or session_file.stem
+                _delete_auto_review_session_from_disk(sid)
+        except Exception:
+            try:
+                if now_ts - session_file.stat().st_mtime > _AUTO_REVIEW_TTL_SECONDS:
+                    session_file.unlink()
+            except Exception:
+                pass
+
+
+def _touch_auto_review_session(session_id: str) -> None:
+    with _AUTO_REVIEW_LOCK:
+        payload = _AUTO_REVIEW_SESSIONS.get(session_id)
+        if payload is not None:
+            payload["updated_ts"] = time.time()
+            payload["updatedAt"] = _progress_now_iso()
+            try:
+                _write_auto_review_session_to_disk(payload)
+            except Exception:
+                pass
+
+
+def _save_auto_review_session(payload: Dict[str, Any]) -> None:
+    _cleanup_auto_review_sessions()
+    session_id = _clean(payload.get("session_id")) or uuid.uuid4().hex
+    now_ts = time.time()
+    payload["session_id"] = session_id
+    payload.setdefault("createdAt", _progress_now_iso())
+    payload.setdefault("updatedAt", payload["createdAt"])
+    payload["created_ts"] = payload.get("created_ts") or now_ts
+    payload["updated_ts"] = now_ts
+    with _AUTO_REVIEW_LOCK:
+        _AUTO_REVIEW_SESSIONS[session_id] = payload
+    _write_auto_review_session_to_disk(payload)
+
+
+def _pop_auto_review_session(session_id: str) -> Dict[str, Any] | None:
+    sid = _clean(session_id)
+    with _AUTO_REVIEW_LOCK:
+        payload = _AUTO_REVIEW_SESSIONS.pop(sid, None)
+    if payload is None:
+        payload = _load_auto_review_session_from_disk(sid)
+    _delete_auto_review_session_from_disk(sid)
+    return payload
+
+
+def _get_auto_review_session(session_id: str) -> Dict[str, Any] | None:
+    _cleanup_auto_review_sessions()
+    sid = _clean(session_id)
+    with _AUTO_REVIEW_LOCK:
+        payload = _AUTO_REVIEW_SESSIONS.get(sid)
+    if payload is not None:
+        return payload
+    payload = _load_auto_review_session_from_disk(sid)
+    if payload is not None:
+        with _AUTO_REVIEW_LOCK:
+            _AUTO_REVIEW_SESSIONS[sid] = payload
+    return payload
 
 
 def _cleanup_upload_progress() -> None:
@@ -1006,6 +1260,18 @@ class RenameObjectBody(BaseModel):
     new_name: str = Field(..., min_length=1)
 
 
+class UploadAutoApproveBody(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    upload_id: str = Field(default="")
+    items: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class UploadAutoRefreshItemBody(BaseModel):
+    review_id: str = Field(..., min_length=1)
+    item: Dict[str, Any] = Field(default_factory=dict)
+    upload_id: str = Field(default="")
+
+
 # =================== GET =================== #
 
 @router.get("/uploads/progress/{upload_id}", summary="Lấy tiến trình upload/import hiện tại")
@@ -1807,7 +2073,7 @@ def insert_item(
             sync_res = sync_minio_object_to_mongo(
                 bucket=bucket,
                 object_key=object_key,
-                meta={**meta, "__local_file_path": temp_file_path, "__upload_mode": "standard"},
+                meta={**meta, "__local_file_path": temp_file_path, "__upload_mode": "manual"},
                 actor=actor,
             )
         except Exception as e:
@@ -2143,6 +2409,7 @@ def _sync_local_document_to_system(
     local_file_path: str,
     target_filename: str,
     meta: Dict[str, Any],
+    skip_hierarchy_rebuild: bool = False,
 ) -> Dict[str, Any]:
     client, default_bucket, _public_base = _runtime()
     bucket, rel = _split_virtual(virtual_folder_path, default_bucket, client, allow_empty_key=True)
@@ -2169,16 +2436,19 @@ def _sync_local_document_to_system(
     _set_hierarchy_sync_status(sync_res, minio_ok=True, mongo_ok=True, postgre_ok=False, neo4j_ok=False, actor=actor, error="Đã sync MongoDB, đang chờ PostgreSQL/Neo4j")
 
     hierarchy_details = None
-    _mark_file_progress(upload_id, file_index=file_index, total_files=total_files, file_name=target_filename, stage="rebuilding_hierarchy", stage_label="Đang cập nhật mô tả / keyword cha", file_percent=0.58, message=f"Đang cập nhật mô tả và keyword cha cho {target_filename}")
-    try:
-        hierarchy_details = rebuild_hierarchy_descriptions_and_keywords(
-            subject_map=sync_res.subject_map,
-            topic_map=sync_res.topic_map or "",
-            lesson_map=sync_res.lesson_map or "",
-            chunk_map=sync_res.chunk_map or "",
-        )
-    except Exception:
-        hierarchy_details = None
+    if not skip_hierarchy_rebuild:
+        _mark_file_progress(upload_id, file_index=file_index, total_files=total_files, file_name=target_filename, stage="rebuilding_hierarchy", stage_label="Đang cập nhật mô tả / keyword cha", file_percent=0.58, message=f"Đang cập nhật mô tả và keyword cha cho {target_filename}")
+        try:
+            hierarchy_details = rebuild_hierarchy_descriptions_and_keywords(
+                subject_map=sync_res.subject_map,
+                topic_map=sync_res.topic_map or "",
+                lesson_map=sync_res.lesson_map or "",
+                chunk_map=sync_res.chunk_map or "",
+            )
+        except Exception:
+            hierarchy_details = None
+    else:
+        hierarchy_details = {"skipped": True, "reason": "approve_final_rebuild"}
 
     _mark_file_progress(upload_id, file_index=file_index, total_files=total_files, file_name=target_filename, stage="syncing_postgre", stage_label="Đang import PostgreSQL", file_percent=0.76, message=f"Đang sync {target_filename} vào PostgreSQL")
     pg_ids = sync_postgre_from_mongo_auto_ids(
@@ -2240,7 +2510,570 @@ def _analysis_progress_to_upload(upload_id: str, path: str, *, analysis_weight: 
     return _cb
 
 
-@router.post("/upload-auto/", summary="Upload PDF và tự cắt tới lesson rồi sync vào hệ thống")
+
+
+def _guess_media_type(file_path: str) -> str:
+    suffix = Path(file_path or "").suffix.lower()
+    if suffix == ".pdf":
+        return "application/pdf"
+    if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+        return f"image/{suffix[1:] if suffix != '.jpg' else 'jpeg'}"
+    return "application/octet-stream"
+
+
+def _split_single_pdf(src_pdf: str, start: int, end: int, out_path: str) -> str:
+    reader = PdfReader(src_pdf)
+    total_pages = len(reader.pages)
+    s = max(1, min(int(start), total_pages))
+    e = max(s, min(int(end), total_pages))
+    writer = PdfWriter()
+    for idx in range(s - 1, e):
+        writer.add_page(reader.pages[idx])
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, 'wb') as fh:
+        writer.write(fh)
+    return str(out)
+
+
+def _build_review_items_from_split(session_id: str, split_result: Dict[str, Any], source_pdf: str) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    source_total_pages = len(PdfReader(source_pdf).pages) if source_pdf and os.path.exists(source_pdf) else 1
+    topic_items = list(split_result.get('topics') or ([] if split_result.get('mode') != 'topic' else [split_result.get('topic') or {}]))
+    topic_map: Dict[Tuple[int, str], str] = {}
+
+    for idx, topic in enumerate(topic_items, start=1):
+        if not isinstance(topic, dict) or not topic:
+            continue
+        review_id = f"topic_{idx:04d}"
+        topic_number = topic.get('number') if isinstance(topic.get('number'), int) else _extract_heading_number(str(topic.get('heading') or ''))
+        item = {
+            'reviewId': review_id,
+            'kind': 'topic',
+            'name': _clean(topic.get('name')) or f'topic_{idx:02d}',
+            'start': int(topic.get('start') or 1),
+            'end': int(topic.get('end') or topic.get('start') or 1),
+            'heading': _clean(topic.get('heading')),
+            'title': _clean(topic.get('title')),
+            'number': topic_number,
+            'contentHead': False,
+            'confidence': 'high',
+            'confidenceScore': 0.95,
+            'confidenceReason': '',
+            'filePath': _clean(topic.get('file_path')),
+            'metaPath': _clean(topic.get('meta_path')),
+            'sourcePath': source_pdf,
+            'contextPath': source_pdf,
+            'currentPath': _clean(topic.get('file_path')) or source_pdf,
+            'totalPages': source_total_pages,
+        }
+        items.append(item)
+        topic_map[(item['start'], item['end'])] = review_id
+
+    lessons = list(split_result.get('lessons') or [])
+    lesson_review_map: Dict[str, str] = {}
+    for idx, lesson in enumerate(lessons, start=1):
+        review_id = f"lesson_{idx:04d}"
+        topic_review_id = ''
+        for t in items:
+            if t['kind'] == 'topic' and int(t['start']) <= int(lesson.get('start') or 0) <= int(t['end']):
+                topic_review_id = t['reviewId']
+                break
+        item = {
+            'reviewId': review_id,
+            'kind': 'lesson',
+            'name': _clean(lesson.get('name')) or f'lesson_{idx:02d}',
+            'start': int(lesson.get('start') or 1),
+            'end': int(lesson.get('end') or lesson.get('start') or 1),
+            'heading': _clean(lesson.get('heading')),
+            'title': _clean(lesson.get('title')),
+            'number': lesson.get('number') if isinstance(lesson.get('number'), int) else _extract_heading_number(str(lesson.get('heading') or '')),
+            'contentHead': False,
+            'topicReviewId': topic_review_id,
+            'topicNumber': lesson.get('topic_number') if isinstance(lesson.get('topic_number'), int) else None,
+            'confidence': 'high',
+            'confidenceScore': 0.95,
+            'confidenceReason': '',
+            'filePath': _clean(lesson.get('file_path')),
+            'metaPath': _clean(lesson.get('meta_path')),
+            'sourcePath': source_pdf,
+            'contextPath': _clean(lesson.get('file_path')) if split_result.get('mode') == 'lesson' else (next((t['filePath'] for t in items if t['reviewId'] == topic_review_id and _clean(t.get('filePath'))), source_pdf)),
+            'currentPath': _clean(lesson.get('file_path')),
+            'totalPages': source_total_pages,
+        }
+        items.append(item)
+        lesson_review_map[item['name']] = review_id
+
+    chunks = list(split_result.get('chunks') or [])
+    for idx, chunk in enumerate(chunks, start=1):
+        lesson_name = _clean(chunk.get('lesson_name'))
+        lesson_review_id = lesson_review_map.get(lesson_name, '')
+        lesson_item = next((x for x in items if x.get('reviewId') == lesson_review_id), None)
+        item = {
+            'reviewId': f"chunk_{idx:05d}",
+            'kind': 'chunk',
+            'name': _clean(chunk.get('name')) or f'chunk_{idx:02d}',
+            'start': int(chunk.get('start') or 1),
+            'end': int(chunk.get('end') or chunk.get('start') or 1),
+            'heading': _clean(chunk.get('heading')),
+            'title': _clean(chunk.get('title')),
+            'number': chunk.get('number') if isinstance(chunk.get('number'), int) else _extract_heading_number(str(chunk.get('heading') or '')),
+            'contentHead': bool(chunk.get('content_head')),
+            'lessonReviewId': lesson_review_id,
+            'topicReviewId': lesson_item.get('topicReviewId') if lesson_item else '',
+            'confidence': 'low' if _clean(chunk.get('confidence')).lower() == 'low' else 'high',
+            'confidenceScore': float(chunk.get('confidence_score') or (0.35 if _clean(chunk.get('confidence')).lower() == 'low' else 0.92)),
+            'confidenceReason': _clean(chunk.get('confidence_reason')),
+            'filePath': _clean(chunk.get('file_path')),
+            'metaPath': _clean(chunk.get('meta_path')),
+            'sourcePath': lesson_item.get('currentPath') if lesson_item else source_pdf,
+            'contextPath': lesson_item.get('currentPath') if lesson_item else source_pdf,
+            'currentPath': _clean(chunk.get('file_path')),
+            'chunkPdfPath': _clean(chunk.get('file_path')),
+            'cutlineJson': _clean(chunk.get('cutline_json')),
+            'debugPng': _clean(chunk.get('debug_png')),
+            'topPng': _clean(chunk.get('top_png')),
+            'botPng': _clean(chunk.get('bot_png')),
+            'yLine': chunk.get('y_line') if isinstance(chunk.get('y_line'), int) else None,
+            'cropPage': 1,
+            'cropTop': None,
+            'cropBottom': None,
+            'chunkPages': len(PdfReader(_clean(chunk.get('file_path'))).pages) if _clean(chunk.get('file_path')) and os.path.exists(_clean(chunk.get('file_path'))) else max(1, int(chunk.get('end') or chunk.get('start') or 1) - int(chunk.get('start') or 1) + 1),
+            'bestMode': _clean(chunk.get('best_mode')),
+            'totalPages': len(PdfReader(_clean((lesson_item or {}).get('currentPath'))).pages) if lesson_item and _clean((lesson_item or {}).get('currentPath')) and os.path.exists(_clean((lesson_item or {}).get('currentPath'))) else source_total_pages,
+        }
+        items.append(item)
+    return items
+
+
+def _public_review_item(session_id: str, item: Dict[str, Any]) -> Dict[str, Any]:
+    out = {k: v for k, v in item.items() if k not in {'filePath', 'metaPath', 'sourcePath', 'contextPath', 'currentPath', 'chunkPdfPath', 'cutlineJson', 'debugPng', 'topPng', 'midPng', 'botPng'}}
+    review_id = _clean(item.get('reviewId'))
+    quoted = quote_plus(review_id)
+    out['previewSourceUrl'] = f"/admin/minio/upload-auto/session/{session_id}/preview?item_id={quoted}&kind=source"
+    out['previewContextUrl'] = f"/admin/minio/upload-auto/session/{session_id}/preview?item_id={quoted}&kind=context"
+    out['previewCurrentUrl'] = f"/admin/minio/upload-auto/session/{session_id}/preview?item_id={quoted}&kind=current"
+    out['previewDebugUrl'] = f"/admin/minio/upload-auto/session/{session_id}/preview?item_id={quoted}&kind=debug"
+    out['previewTopUrl'] = f"/admin/minio/upload-auto/session/{session_id}/preview?item_id={quoted}&kind=top"
+    out['previewMiddleUrl'] = f"/admin/minio/upload-auto/session/{session_id}/preview?item_id={quoted}&kind=middle"
+    out['previewBottomUrl'] = f"/admin/minio/upload-auto/session/{session_id}/preview?item_id={quoted}&kind=bottom"
+    return out
+
+
+def _session_public_payload(session: Dict[str, Any]) -> Dict[str, Any]:
+    session_id = _clean(session.get('session_id'))
+    review_items = session.get('review_items') or []
+    public_items = [_public_review_item(session_id, item) for item in review_items]
+    return {
+        'status': 'awaiting_review',
+        'session_id': session_id,
+        'mode': session.get('mode'),
+        'subject_map': session.get('subject_map'),
+        'class_map': session.get('class_map'),
+        'counts': {
+            'topics': len([x for x in public_items if x.get('kind') == 'topic']),
+            'lessons': len([x for x in public_items if x.get('kind') == 'lesson']),
+            'chunks': len([x for x in public_items if x.get('kind') == 'chunk']),
+            'highConfidence': len([x for x in public_items if x.get('confidence') == 'high']),
+            'lowConfidence': len([x for x in public_items if x.get('confidence') == 'low']),
+        },
+        'items': public_items,
+    }
+
+
+def _merge_review_items(session: Dict[str, Any], incoming_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    base_map = {str(item.get('reviewId')): dict(item) for item in (session.get('review_items') or [])}
+    editable = {'start', 'end', 'heading', 'title', 'number', 'contentHead', 'topicReviewId', 'lessonReviewId', 'yLine', 'cropPage', 'cropTop', 'cropBottom'}
+    for raw in incoming_items or []:
+        review_id = _clean((raw or {}).get('reviewId'))
+        if not review_id or review_id not in base_map:
+            continue
+        target = base_map[review_id]
+        for key in editable:
+            if key not in raw:
+                continue
+            value = raw.get(key)
+            if key in {'start', 'end', 'number', 'yLine', 'cropPage', 'cropTop', 'cropBottom'}:
+                if value in (None, ''):
+                    target[key] = None if key in {'yLine', 'cropTop', 'cropBottom'} else target.get(key)
+                else:
+                    try:
+                        target[key] = int(value)
+                    except Exception:
+                        pass
+            elif key == 'contentHead':
+                target[key] = bool(value)
+            else:
+                target[key] = _clean(value)
+    merged = list(base_map.values())
+    merged.sort(key=lambda x: ({'topic': 1, 'lesson': 2, 'chunk': 3}.get(_clean(x.get('kind')), 9), int(x.get('start') or 0), int(x.get('end') or 0), _clean(x.get('reviewId'))))
+    return merged
+
+
+def _pick_session_preview_path(item: Dict[str, Any], kind: str) -> str:
+    kind = _clean(kind).lower() or 'current'
+    if kind == 'source':
+        return _clean(item.get('sourcePath')) or _clean(item.get('contextPath')) or _clean(item.get('filePath'))
+    if kind == 'context':
+        return _clean(item.get('contextPath')) or _clean(item.get('sourcePath')) or _clean(item.get('filePath'))
+    if kind == 'debug':
+        return _clean(item.get('debugPng')) or _clean(item.get('currentPath')) or _clean(item.get('filePath'))
+    if kind == 'top':
+        return _clean(item.get('topPng'))
+    if kind == 'middle':
+        return _clean(item.get('midPng'))
+    if kind == 'bottom':
+        return _clean(item.get('botPng'))
+    return _clean(item.get('currentPath')) or _clean(item.get('filePath')) or _clean(item.get('debugPng'))
+
+
+def _group_items_by_kind(items: List[Dict[str, Any]], kind: str) -> List[Dict[str, Any]]:
+    return [dict(x) for x in items if _clean(x.get('kind')) == kind]
+
+
+def _approve_auto_review_session(
+    *,
+    request: Request,
+    actor: str,
+    upload_id: str,
+    session: Dict[str, Any],
+    reviewed_items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    source_pdf = _clean(session.get('source_pdf'))
+    if not source_pdf or not os.path.exists(source_pdf):
+        raise HTTPException(status_code=410, detail='Phiên duyệt đã hết hạn hoặc mất file nguồn')
+
+    mode = _clean(session.get('mode')).lower()
+    root_path = _clean(session.get('root_path'))
+    subject_map = _clean(session.get('subject_map'))
+    class_map = _clean(session.get('class_map'))
+    original_name = _clean(session.get('original_filename')) or Path(source_pdf).name
+    subject_stem = Path(original_name).stem
+
+    topic_items = sorted(_group_items_by_kind(reviewed_items, 'topic'), key=lambda x: (int(x.get('start') or 0), int(x.get('end') or 0)))
+    lesson_items = sorted(_group_items_by_kind(reviewed_items, 'lesson'), key=lambda x: (int(x.get('start') or 0), int(x.get('end') or 0)))
+    chunk_items = sorted(_group_items_by_kind(reviewed_items, 'chunk'), key=lambda x: (_clean(x.get('lessonReviewId')), int(x.get('start') or 0), int(x.get('end') or 0)))
+
+    approved_dir = tempfile.mkdtemp(prefix='auto_review_approve_')
+    tasks: List[Dict[str, Any]] = []
+    dirty_lessons: Set[str] = set()
+    dirty_topics: Set[str] = set()
+    dirty_subjects: Set[str] = {subject_map} if subject_map else set()
+
+    if mode == 'subject':
+        tasks.append({
+            'folder': f"{root_path}/subjects",
+            'file_path': source_pdf,
+            'filename': f"{_slug_filename(subject_map, subject_map)}.pdf",
+            'meta': {
+                'folderType': 'subject',
+                'classMap': class_map,
+                'subjectMap': subject_map,
+                'subjectName': subject_stem,
+                'subjectTitle': subject_stem,
+                'name': subject_stem,
+            },
+        })
+
+    topic_file_map: Dict[str, str] = {}
+    topic_number_map: Dict[str, int] = {}
+    if topic_items:
+        topic_dir = Path(approved_dir) / 'topics'
+        topic_dir.mkdir(parents=True, exist_ok=True)
+        for idx, topic in enumerate(topic_items, start=1):
+            number = int(topic.get('number') or idx)
+            topic_number_map[_clean(topic.get('reviewId'))] = number
+            topic_map = f"{subject_map}_CD{number}"
+            topic_file = topic_dir / f"{_clean(topic.get('name')) or topic_map}.pdf"
+            if mode == 'topic' and idx == 1 and int(topic.get('start') or 1) == 1 and int(topic.get('end') or 0) >= len(PdfReader(source_pdf).pages):
+                shutil.copyfile(source_pdf, topic_file)
+            else:
+                _split_single_pdf(source_pdf, int(topic.get('start') or 1), int(topic.get('end') or topic.get('start') or 1), str(topic_file))
+            topic_file_map[_clean(topic.get('reviewId'))] = str(topic_file)
+            dirty_topics.add(topic_map)
+            tasks.append({
+                'folder': f"{root_path}/topics",
+                'file_path': str(topic_file),
+                'filename': f"{_slug_filename(topic_map, topic_map)}.pdf",
+                'meta': {
+                    'folderType': 'topic', 'classMap': class_map, 'subjectMap': subject_map, 'topicMap': topic_map,
+                    'topicName': _clean(topic.get('title')) or _clean(topic.get('heading')) or topic_map,
+                    'name': _clean(topic.get('title')) or topic_map,
+                },
+            })
+
+    lesson_file_map: Dict[str, str] = {}
+    lesson_map_by_review: Dict[str, str] = {}
+    lesson_dir = Path(approved_dir) / 'lessons'
+    lesson_dir.mkdir(parents=True, exist_ok=True)
+    for idx, lesson in enumerate(lesson_items, start=1):
+        topic_review_id = _clean(lesson.get('topicReviewId'))
+        topic_number = topic_number_map.get(topic_review_id) or (int(lesson.get('topicNumber') or 0) if str(lesson.get('topicNumber') or '').isdigit() else 1)
+        lesson_number = None
+        if isinstance(lesson.get('number'), int):
+            lesson_number = int(lesson.get('number'))
+        elif str(lesson.get('number') or '').isdigit():
+            lesson_number = int(str(lesson.get('number')).strip())
+        else:
+            lesson_number = (
+                _extract_heading_number(str(lesson.get('heading') or ''))
+                or _extract_heading_number(str(lesson.get('title') or ''))
+                or _extract_heading_number(str(lesson.get('name') or ''))
+            )
+        if not isinstance(lesson_number, int) or lesson_number <= 0:
+            siblings = [x for x in lesson_items if _clean(x.get('topicReviewId')) == topic_review_id] or lesson_items
+            ordered = sorted(siblings, key=lambda x: (int(x.get('start') or 0), int(x.get('end') or 0), _clean(x.get('reviewId'))))
+            lesson_number = ordered.index(lesson) + 1 if lesson in ordered else idx
+        topic_map = f"{subject_map}_CD{topic_number}"
+        lesson_map = f"{topic_map}_B{lesson_number}"
+        lesson_map_by_review[_clean(lesson.get('reviewId'))] = lesson_map
+        lesson_file = lesson_dir / f"{_clean(lesson.get('name')) or lesson_map}.pdf"
+        if mode == 'lesson' and idx == 1 and int(lesson.get('start') or 1) == 1 and int(lesson.get('end') or 0) >= len(PdfReader(source_pdf).pages):
+            shutil.copyfile(source_pdf, lesson_file)
+        else:
+            _split_single_pdf(source_pdf, int(lesson.get('start') or 1), int(lesson.get('end') or lesson.get('start') or 1), str(lesson_file))
+        lesson_file_map[_clean(lesson.get('reviewId'))] = str(lesson_file)
+        dirty_lessons.add(lesson_map)
+        dirty_topics.add(topic_map)
+        tasks.append({
+            'folder': f"{root_path}/lessons",
+            'file_path': str(lesson_file),
+            'filename': f"{_slug_filename(lesson_map, lesson_map)}.pdf",
+            'meta': {
+                'folderType': 'lesson', 'classMap': class_map, 'subjectMap': subject_map, 'topicMap': topic_map,
+                'lessonMap': lesson_map,
+                'topicName': topic_map,
+                'lessonName': _clean(lesson.get('title')) or _clean(lesson.get('heading')) or lesson_map,
+                'name': _clean(lesson.get('title')) or lesson_map,
+            },
+        })
+
+    chunk_root = Path(approved_dir) / 'chunks'
+    for lesson_review_id, lesson_pdf in lesson_file_map.items():
+        lesson_chunks = [x for x in chunk_items if _clean(x.get('lessonReviewId')) == lesson_review_id]
+        if not lesson_chunks:
+            continue
+        lesson_meta_item = next((x for x in lesson_items if _clean(x.get('reviewId')) == lesson_review_id), None)
+        lesson_name = _clean((lesson_meta_item or {}).get('name')) or Path(lesson_pdf).stem
+        lesson_chunk_dir = chunk_root / lesson_name
+        ordered_chunks = sorted(lesson_chunks, key=lambda x: (int(x.get('start') or 0), int(x.get('end') or 0), _clean(x.get('reviewId'))))
+        for cidx, chunk in enumerate(ordered_chunks, start=1):
+            chunk_name = f"chunk_{cidx:02d}"
+            chunk_dir = lesson_chunk_dir / chunk_name
+            chunk_pdf = chunk_dir / f"{lesson_name}_{chunk_name}.pdf"
+            _split_single_pdf(lesson_pdf, int(chunk.get('start') or 1), int(chunk.get('end') or chunk.get('start') or 1), str(chunk_pdf))
+            chunk_meta = chunk_pdf.with_suffix('.json')
+            meta_payload = {
+                'source_lesson_pdf': str(Path(lesson_pdf).resolve()),
+                'lesson_stem': lesson_name,
+                'chunk': chunk_name,
+                'chunk_pdf': str(chunk_pdf),
+                'heading': _clean(chunk.get('heading')),
+                'title': _clean(chunk.get('title')),
+                'start': int(chunk.get('start') or 1),
+                'end': int(chunk.get('end') or chunk.get('start') or 1),
+                'content_head': bool(chunk.get('contentHead')),
+                'total_pages': len(PdfReader(lesson_pdf).pages),
+            }
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+            chunk_meta.write_text(json.dumps(meta_payload, ensure_ascii=False, indent=2), encoding='utf-8')
+            try:
+                debug_dir = chunk_dir / 'DebugCutlines'
+                if _has_manual_crop_band(chunk):
+                    _apply_manual_crop_band(
+                        chunk_pdf_path=str(chunk_pdf),
+                        out_dir=debug_dir,
+                        crop_page=_safe_int(chunk.get('cropPage'), 1) or 1,
+                        crop_top=_safe_int(chunk.get('cropTop')),
+                        crop_bottom=_safe_int(chunk.get('cropBottom')),
+                    )
+                else:
+                    from ..services.auto_split_upload import _apply_manual_or_auto_cutline  # type: ignore
+                    _apply_manual_or_auto_cutline(
+                        chunk_pdf_path=str(chunk_pdf),
+                        chunk_meta_path=str(chunk_meta),
+                        out_dir=debug_dir,
+                        y_line_override=(int(chunk.get('yLine')) if str(chunk.get('yLine') or '').isdigit() else None),
+                    )
+            except Exception:
+                pass
+            lesson_map = lesson_map_by_review.get(lesson_review_id, '')
+            tasks.append({
+                'folder': f"{root_path}/chunks",
+                'file_path': str(chunk_pdf),
+                'filename': f"{_slug_filename(lesson_map + '_C' + str(cidx), lesson_map + '_C' + str(cidx))}.pdf",
+                'meta': {
+                    'folderType': 'chunk', 'classMap': class_map, 'subjectMap': subject_map,
+                    'topicMap': lesson_map.rsplit('_B', 1)[0] if '_B' in lesson_map else '',
+                    'lessonMap': lesson_map,
+                    'chunkMap': f"{lesson_map}_C{cidx}",
+                    'lessonName': _clean((lesson_meta_item or {}).get('title')) or lesson_map,
+                    'chunkName': _clean(chunk.get('title')) or _clean(chunk.get('heading')) or f"{lesson_map}_C{cidx}",
+                    'name': _clean(chunk.get('title')) or f"{lesson_map}_C{cidx}",
+                },
+            })
+
+    tasks = [task for task in tasks if _clean(task.get('file_path')) and os.path.exists(_clean(task.get('file_path')))]
+    if not tasks:
+        raise HTTPException(status_code=400, detail='Không có file nào để sync sau khi duyệt')
+
+    _init_upload_progress(upload_id, path=root_path, total_files=len(tasks))
+    _update_upload_progress(upload_id, stage='approving', stageLabel='Đang sinh mô tả và sync', message='Đang sync các file đã duyệt', percent=5, totalFiles=len(tasks))
+
+    synced = []
+    for idx, task in enumerate(tasks, start=1):
+        synced.append(_sync_local_document_to_system(
+            request=request, actor=actor, upload_id=upload_id, file_index=idx, total_files=len(tasks),
+            virtual_folder_path=task['folder'], local_file_path=task['file_path'], target_filename=task['filename'], meta=task['meta'],
+            skip_hierarchy_rebuild=True,
+        ))
+
+    final_rebuild = {'lessons': [], 'topics': [], 'subjects': []}
+    _update_upload_progress(upload_id, stage='rebuilding_hierarchy', stageLabel='Đang tổng hợp keyword từ chunk lên lesson/topic/subject', message='Đang rebuild mô tả và keyword từ chunk lên lesson/topic/subject', percent=92)
+    for lesson_map in sorted(dirty_lessons):
+        try:
+            final_rebuild['lessons'].append(rebuild_hierarchy_descriptions_and_keywords(subject_map=subject_map, lesson_map=lesson_map))
+        except Exception:
+            pass
+    for topic_map in sorted(dirty_topics):
+        try:
+            final_rebuild['topics'].append(rebuild_hierarchy_descriptions_and_keywords(subject_map=subject_map, topic_map=topic_map))
+        except Exception:
+            pass
+    if subject_map:
+        try:
+            final_rebuild['subjects'].append(rebuild_hierarchy_descriptions_and_keywords(subject_map=subject_map))
+        except Exception:
+            pass
+
+    _finish_upload_progress(upload_id, total_files=len(tasks), completed_files=len(tasks), status='completed', message='Hoàn tất', stage='completed', stage_label='Hoàn tất')
+    return {
+        'status': 'ok',
+        'upload_id': upload_id,
+        'mode': mode,
+        'subject_map': subject_map,
+        'counts': {
+            'synced': len(synced),
+            'topics': len(topic_items),
+            'lessons': len(lesson_items),
+            'chunks': len(chunk_items),
+        },
+        'final_rebuild': final_rebuild,
+    }
+
+
+
+
+def _refresh_review_item_preview(session: Dict[str, Any], merged_items: List[Dict[str, Any]], review_id: str) -> Dict[str, Any]:
+    source_pdf = _clean(session.get('source_pdf'))
+    if not source_pdf or not os.path.exists(source_pdf):
+        raise HTTPException(status_code=410, detail='Phiên duyệt đã hết hạn hoặc mất file nguồn')
+    target = next((x for x in merged_items if _clean(x.get('reviewId')) == _clean(review_id)), None)
+    if not target:
+        raise HTTPException(status_code=404, detail='Không tìm thấy mục cần cập nhật preview')
+
+    refresh_dir = Path((session.get('split_result') or {}).get('temp_dir') or tempfile.mkdtemp(prefix='auto_review_refresh_')) / '_review_refresh'
+    refresh_dir.mkdir(parents=True, exist_ok=True)
+    kind = _clean(target.get('kind')).lower()
+
+    def _safe_name(value: str, fallback: str) -> str:
+        value = _slug_filename(_clean(value), fallback)
+        return value or fallback
+
+    source_total_pages = len(PdfReader(source_pdf).pages) if source_pdf and os.path.exists(source_pdf) else 1
+
+    if kind in {'topic', 'lesson'}:
+        item_dir = refresh_dir / kind / _safe_name(target.get('reviewId'), kind)
+        item_dir.mkdir(parents=True, exist_ok=True)
+        out_pdf = item_dir / f"{_safe_name(target.get('name') or target.get('title') or target.get('reviewId'), kind)}.pdf"
+        _split_single_pdf(source_pdf, int(target.get('start') or 1), int(target.get('end') or target.get('start') or 1), str(out_pdf))
+        target['filePath'] = str(out_pdf)
+        target['currentPath'] = str(out_pdf)
+        target['sourcePath'] = source_pdf
+        target['contextPath'] = source_pdf
+        target['metaPath'] = ''
+        target['totalPages'] = source_total_pages
+        return target
+
+    if kind == 'chunk':
+        lesson_review_id = _clean(target.get('lessonReviewId'))
+        lesson_item = next((x for x in merged_items if _clean(x.get('reviewId')) == lesson_review_id), None)
+        lesson_pdf = _clean((lesson_item or {}).get('currentPath')) or _clean((lesson_item or {}).get('filePath')) or source_pdf
+        if not lesson_pdf or not os.path.exists(lesson_pdf):
+            raise HTTPException(status_code=400, detail='Không tìm thấy file lesson cha để cắt chunk')
+        item_dir = refresh_dir / 'chunks' / _safe_name(lesson_review_id or 'lesson', 'lesson') / _safe_name(target.get('reviewId'), 'chunk')
+        item_dir.mkdir(parents=True, exist_ok=True)
+        chunk_pdf = item_dir / f"{_safe_name(target.get('name') or target.get('title') or target.get('reviewId'), 'chunk')}.pdf"
+        _split_single_pdf(lesson_pdf, int(target.get('start') or 1), int(target.get('end') or target.get('start') or 1), str(chunk_pdf))
+        chunk_meta = chunk_pdf.with_suffix('.json')
+        meta_payload = {
+            'source_lesson_pdf': str(Path(lesson_pdf).resolve()),
+            'lesson_stem': Path(lesson_pdf).stem,
+            'chunk': _clean(target.get('name')) or Path(chunk_pdf).stem,
+            'chunk_pdf': str(chunk_pdf),
+            'heading': _clean(target.get('heading')),
+            'title': _clean(target.get('title')),
+            'start': int(target.get('start') or 1),
+            'end': int(target.get('end') or target.get('start') or 1),
+            'content_head': bool(target.get('contentHead')),
+            'total_pages': len(PdfReader(lesson_pdf).pages),
+        }
+        chunk_meta.write_text(json.dumps(meta_payload, ensure_ascii=False, indent=2), encoding='utf-8')
+        debug_dir = item_dir / 'DebugCutlines'
+        try:
+            if _has_manual_crop_band(target):
+                _apply_manual_crop_band(
+                    chunk_pdf_path=str(chunk_pdf),
+                    out_dir=debug_dir,
+                    crop_page=_safe_int(target.get('cropPage'), 1) or 1,
+                    crop_top=_safe_int(target.get('cropTop')),
+                    crop_bottom=_safe_int(target.get('cropBottom')),
+                )
+                target['yLine'] = None
+            else:
+                from ..services.auto_split_upload import _apply_manual_or_auto_cutline  # type: ignore
+                _apply_manual_or_auto_cutline(
+                    chunk_pdf_path=str(chunk_pdf),
+                    chunk_meta_path=str(chunk_meta),
+                    out_dir=debug_dir,
+                    y_line_override=(int(target.get('yLine')) if str(target.get('yLine') or '').isdigit() else None),
+                )
+            
+        except Exception:
+            pass
+        stem = chunk_pdf.stem
+        target['filePath'] = str(chunk_pdf)
+        target['chunkPdfPath'] = str(chunk_pdf)
+        target['currentPath'] = str(chunk_pdf)
+        target['sourcePath'] = lesson_pdf
+        target['contextPath'] = lesson_pdf
+        target['metaPath'] = str(chunk_meta)
+        target['cutlineJson'] = str(debug_dir / f"{stem}_cutline.json")
+        target['debugPng'] = str(debug_dir / f"{stem}_cutline.png")
+        target['topPng'] = str(debug_dir / f"{stem}_cutline_top.png")
+        target['midPng'] = str(debug_dir / f"{stem}_cutline_middle.png")
+        target['botPng'] = str(debug_dir / f"{stem}_cutline_bot.png")
+        target['chunkPages'] = len(PdfReader(chunk_pdf).pages) if chunk_pdf and os.path.exists(chunk_pdf) else max(1, int(target.get('end') or target.get('start') or 1) - int(target.get('start') or 1) + 1)
+        target['totalPages'] = len(PdfReader(lesson_pdf).pages) if lesson_pdf and os.path.exists(lesson_pdf) else source_total_pages
+        return target
+
+    raise HTTPException(status_code=400, detail='Loại mục không hỗ trợ cập nhật preview')
+
+
+@router.post("/upload-auto/session/{session_id}/refresh-item", summary="Cập nhật preview cho một mục trong phiên duyệt upload auto")
+def refresh_upload_auto_item(session_id: str, body: UploadAutoRefreshItemBody):
+    session = _get_auto_review_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail='Không tìm thấy phiên duyệt')
+    merged_items = _merge_review_items(session, [dict(body.item or {}, reviewId=body.review_id)])
+    updated = _refresh_review_item_preview(session, merged_items, body.review_id)
+    session['review_items'] = merged_items
+    _save_auto_review_session(session)
+    _touch_auto_review_session(session_id)
+    return {'status': 'ok', 'item': _public_review_item(session_id, updated)}
+
+
+@router.post("/upload-auto/", summary="Upload PDF, tự cắt tới chunk và tạo phiên duyệt trước khi sync")
 def upload_auto_pdf(
     request: Request,
     current_path: str = Form(..., description="Ví dụ: documents/class-12/subjects hoặc documents/class-12/topics"),
@@ -2255,8 +3088,8 @@ def upload_auto_pdf(
     if len(parts) < 3 or parts[0].lower() != "documents":
         raise HTTPException(status_code=400, detail="Upload auto chỉ dùng cho documents/class-x/subjects hoặc documents/class-x/topics")
     mode = _normalize_folder_type(parts[-1])
-    if mode not in {"subject", "topic"}:
-        raise HTTPException(status_code=400, detail="Upload auto chỉ hỗ trợ ở thư mục subjects hoặc topics")
+    if mode not in {"subject", "topic", "lesson"}:
+        raise HTTPException(status_code=400, detail="Upload auto chỉ hỗ trợ ở thư mục subjects, topics hoặc lessons")
     if not file or not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Chỉ hỗ trợ upload file PDF")
 
@@ -2271,8 +3104,10 @@ def upload_auto_pdf(
     temp_src = None
     split_result = None
     try:
-        fd, temp_src = tempfile.mkstemp(suffix=".pdf")
-        os.close(fd)
+        session_id = uuid.uuid4().hex
+        session_dir = _auto_review_session_dir(session_id)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        temp_src = str(session_dir / 'source.pdf')
         with open(temp_src, "wb") as out:
             out.write(file.file.read())
 
@@ -2280,150 +3115,31 @@ def upload_auto_pdf(
         try:
             split_result = extract_and_split_structure(temp_src, mode=mode, progress_cb=analysis_cb)
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Không tách được bài học từ file upload. Chi tiết: {exc}")
+            raise HTTPException(status_code=400, detail=f"Không tách được cấu trúc file upload. Chi tiết: {exc}")
 
-        subject_stem = Path(file.filename).stem
-        tasks = []
-        dirty_topics = set()
-        dirty_subjects = {subject_map}
-
-        if mode == "subject":
-            tasks.append({
-                "folder": f"{root_path}/subjects",
-                "file_path": temp_src,
-                "filename": f"{_slug_filename(subject_map, subject_map)}.pdf",
-                "meta": {
-                    "folderType": "subject",
-                    "classMap": class_map,
-                    "subjectMap": subject_map,
-                    "subjectName": subject_stem,
-                    "subjectTitle": subject_stem,
-                    "name": subject_stem,
-                },
-            })
-            for topic in split_result.get("topics") or []:
-                topic_number = topic.get("number") or _next_topic_number(subject_map)
-                topic_map = f"{subject_map}_CD{int(topic_number)}"
-                dirty_topics.add(topic_map)
-                tasks.append({
-                    "folder": f"{root_path}/topics",
-                    "file_path": topic.get("file_path") or "",
-                    "filename": f"{_slug_filename(topic_map, topic_map)}.pdf",
-                    "meta": {
-                        "folderType": "topic",
-                        "classMap": class_map,
-                        "subjectMap": subject_map,
-                        "topicMap": topic_map,
-                        "topicName": topic.get("title") or topic.get("heading") or topic_map,
-                        "name": topic.get("title") or topic_map,
-                    },
-                })
-            for lesson in split_result.get("lessons") or []:
-                topic_number = lesson.get("topic_number")
-                if not topic_number:
-                    continue
-                topic_map = f"{subject_map}_CD{int(topic_number)}"
-                lesson_number = lesson.get("number") or _next_lesson_number_for_topic(topic_map)
-                lesson_map = f"{topic_map}_B{int(lesson_number)}"
-                dirty_topics.add(topic_map)
-                tasks.append({
-                    "folder": f"{root_path}/lessons",
-                    "file_path": lesson.get("file_path") or "",
-                    "filename": f"{_slug_filename(lesson_map, lesson_map)}.pdf",
-                    "meta": {
-                        "folderType": "lesson",
-                        "classMap": class_map,
-                        "subjectMap": subject_map,
-                        "topicMap": topic_map,
-                        "lessonMap": lesson_map,
-                        "topicName": lesson.get("topic_title") or topic_map,
-                        "lessonName": lesson.get("title") or lesson.get("heading") or lesson_map,
-                        "name": lesson.get("title") or lesson_map,
-                    },
-                })
-        else:
-            topic_info = split_result.get("topic") or {}
-            topic_number = topic_info.get("number") or _next_topic_number(subject_map)
-            topic_map = f"{subject_map}_CD{int(topic_number)}"
-            dirty_topics.add(topic_map)
-            tasks.append({
-                "folder": f"{root_path}/topics",
-                "file_path": temp_src,
-                "filename": f"{_slug_filename(topic_map, topic_map)}.pdf",
-                "meta": {
-                    "folderType": "topic",
-                    "classMap": class_map,
-                    "subjectMap": subject_map,
-                    "topicMap": topic_map,
-                    "topicName": topic_info.get("title") or subject_stem,
-                    "name": topic_info.get("title") or subject_stem,
-                },
-            })
-            for lesson in split_result.get("lessons") or []:
-                lesson_number = lesson.get("number") or _next_lesson_number_for_topic(topic_map)
-                lesson_map = f"{topic_map}_B{int(lesson_number)}"
-                tasks.append({
-                    "folder": f"{root_path}/lessons",
-                    "file_path": lesson.get("file_path") or "",
-                    "filename": f"{_slug_filename(lesson_map, lesson_map)}.pdf",
-                    "meta": {
-                        "folderType": "lesson",
-                        "classMap": class_map,
-                        "subjectMap": subject_map,
-                        "topicMap": topic_map,
-                        "lessonMap": lesson_map,
-                        "topicName": topic_info.get("title") or topic_map,
-                        "lessonName": lesson.get("title") or lesson.get("heading") or lesson_map,
-                        "name": lesson.get("title") or lesson_map,
-                    },
-                })
-
-        tasks = [task for task in tasks if str(task.get("file_path") or "").strip()]
-        if not tasks:
-            raise HTTPException(status_code=400, detail="Không có file nào được tách để sync")
-
-        _update_upload_progress(upload_id, totalFiles=len(tasks), stage="syncing", stageLabel="Đang đồng bộ dữ liệu", message="Đang upload và sync các file đã cắt", percent=1)
-
-        synced = []
-        for idx, task in enumerate(tasks, start=1):
-            synced.append(
-                _sync_local_document_to_system(
-                    request=request,
-                    actor=actor,
-                    upload_id=upload_id,
-                    file_index=idx,
-                    total_files=len(tasks),
-                    virtual_folder_path=task["folder"],
-                    local_file_path=task["file_path"],
-                    target_filename=task["filename"],
-                    meta=task["meta"],
-                )
-            )
-
-        final_rebuild = {"topics": [], "subjects": []}
-        for topic_map in sorted(dirty_topics):
-            try:
-                final_rebuild["topics"].append(rebuild_hierarchy_descriptions_and_keywords(subject_map=subject_map, topic_map=topic_map))
-            except Exception:
-                pass
-        try:
-            final_rebuild["subjects"].append(rebuild_hierarchy_descriptions_and_keywords(subject_map=subject_map))
-        except Exception:
-            pass
-
-        _finish_upload_progress(upload_id, total_files=len(tasks), completed_files=len(tasks), status="completed", message="Hoàn tất", stage="completed", stage_label="Hoàn tất")
-        return {
-            "status": "ok",
-            "upload_id": upload_id,
-            "mode": mode,
-            "subject_map": subject_map,
-            "counts": {
-                "synced": len(synced),
-                "topics": len(split_result.get("topics") or ([] if mode == "topic" else [])),
-                "lessons": len(split_result.get("lessons") or []),
-            },
-            "final_rebuild": final_rebuild,
+        review_items = _build_review_items_from_split(session_id, split_result, temp_src)
+        session_payload = {
+            'session_id': session_id,
+            'upload_id': upload_id,
+            'actor': actor,
+            'current_path': path,
+            'root_path': root_path,
+            'mode': mode,
+            'class_number': class_number,
+            'class_map': class_map,
+            'subject_map': subject_map,
+            'book_variant': book_variant,
+            'original_filename': file.filename,
+            'source_pdf': temp_src,
+            'session_dir': str(session_dir),
+            'split_result': split_result,
+            'review_items': review_items,
         }
+        _save_auto_review_session(session_payload)
+        temp_src = None
+        split_result = None
+        _update_upload_progress(upload_id, stage='awaiting_review', stageLabel='Đang chờ duyệt', message='Đã cắt xong. Hãy kiểm tra màu xanh/đỏ rồi xác nhận.', percent=100, status='awaiting_review')
+        return _session_public_payload(session_payload)
     except HTTPException:
         raise
     except Exception as exc:
@@ -2431,8 +3147,146 @@ def upload_auto_pdf(
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
         try:
-            if temp_src and os.path.exists(temp_src):
+            if temp_src and split_result is None and os.path.exists(temp_src):
                 os.remove(temp_src)
         except Exception:
             pass
-        cleanup_split_result(split_result)
+        if split_result is not None:
+            cleanup_split_result(split_result)
+
+
+@router.get("/upload-auto/session/{session_id}", summary="Lấy dữ liệu review của một phiên upload auto")
+def get_upload_auto_session(session_id: str):
+    session = _get_auto_review_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail='Không tìm thấy phiên duyệt')
+    _touch_auto_review_session(session_id)
+    return _session_public_payload(session)
+
+
+def _resolve_session_preview_file(session: Dict[str, Any], item: Dict[str, Any], kind: str) -> str:
+    file_path = _pick_session_preview_path(item, kind)
+    if file_path and os.path.exists(file_path):
+        return file_path
+
+    item_kind = _clean(item.get('kind')).lower()
+    review_id = _clean(item.get('reviewId'))
+
+    if item_kind in {'topic', 'lesson', 'chunk'}:
+        try:
+            refreshed = _refresh_review_item_preview(session, session.get('review_items') or [], review_id)
+            file_path = _pick_session_preview_path(refreshed, kind)
+            if file_path and os.path.exists(file_path):
+                try:
+                    _save_auto_review_session(session)
+                except Exception:
+                    pass
+                return file_path
+        except Exception:
+            pass
+
+    if kind in {'context', 'source'}:
+        source_pdf = _clean(session.get('source_pdf'))
+        if source_pdf and os.path.exists(source_pdf):
+            if kind == 'context':
+                item['contextPath'] = source_pdf
+            else:
+                item['sourcePath'] = source_pdf
+            try:
+                _save_auto_review_session(session)
+            except Exception:
+                pass
+            return source_pdf
+
+    if kind == 'current':
+        for fallback_kind in ('context', 'source'):
+            fallback_path = _pick_session_preview_path(item, fallback_kind)
+            if fallback_path and os.path.exists(fallback_path):
+                return fallback_path
+        source_pdf = _clean(session.get('source_pdf'))
+        if source_pdf and os.path.exists(source_pdf):
+            return source_pdf
+
+    return ''
+
+
+@router.get("/upload-auto/session/{session_id}/preview", summary="Preview file tạm trong phiên duyệt upload auto")
+def get_upload_auto_preview(session_id: str, item_id: str = Query(...), kind: str = Query('current')):
+    session = _get_auto_review_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail='Không tìm thấy phiên duyệt')
+    item = next((x for x in (session.get('review_items') or []) if _clean(x.get('reviewId')) == _clean(item_id)), None)
+    if not item:
+        raise HTTPException(status_code=404, detail='Không tìm thấy mục preview')
+    file_path = _resolve_session_preview_file(session, item, kind)
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail='Không tìm thấy file preview')
+    _touch_auto_review_session(session_id)
+    return FileResponse(
+        path=file_path,
+        media_type=_guess_media_type(file_path),
+        headers={"Content-Disposition": f'inline; filename="{os.path.basename(file_path)}"'},
+    )
+
+
+@router.get("/upload-auto/session/{session_id}/page-preview", summary="Render một trang PDF trong phiên duyệt upload auto thành PNG")
+def get_upload_auto_page_preview(
+    session_id: str,
+    item_id: str = Query(...),
+    kind: str = Query('current'),
+    page: int = Query(1, ge=1),
+):
+    session = _get_auto_review_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail='Không tìm thấy phiên duyệt')
+    item = next((x for x in (session.get('review_items') or []) if _clean(x.get('reviewId')) == _clean(item_id)), None)
+    if not item:
+        raise HTTPException(status_code=404, detail='Không tìm thấy mục preview')
+    file_path = _resolve_session_preview_file(session, item, kind)
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail='Không tìm thấy file preview')
+    if not str(file_path).lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail='Chỉ render được file PDF')
+    try:
+        import fitz  # type: ignore
+        doc = fitz.open(str(file_path))
+        page_idx = max(0, min(int(page) - 1, doc.page_count - 1))
+        pix = doc[page_idx].get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        png_bytes = pix.tobytes('png')
+        doc.close()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Không render được trang PDF: {exc}')
+    _touch_auto_review_session(session_id)
+    return StreamingResponse(io.BytesIO(png_bytes), media_type='image/png')
+
+
+@router.post("/upload-auto/approve", summary="Xác nhận phiên review upload auto rồi mới sync toàn hệ thống")
+def approve_upload_auto(request: Request, body: UploadAutoApproveBody):
+    session = _get_auto_review_session(body.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail='Không tìm thấy phiên duyệt hoặc phiên đã hết hạn')
+    reviewed_items = _merge_review_items(session, body.items or [])
+    actor = _get_actor(request)
+    upload_id = _clean(body.upload_id) or _clean(session.get('upload_id')) or uuid.uuid4().hex
+    try:
+        result = _approve_auto_review_session(
+            request=request,
+            actor=actor,
+            upload_id=upload_id,
+            session=session,
+            reviewed_items=reviewed_items,
+        )
+        return result
+    finally:
+        popped = _pop_auto_review_session(body.session_id)
+        if popped:
+            try:
+                cleanup_split_result(popped.get('split_result'))
+            except Exception:
+                pass
+            try:
+                src = _clean(popped.get('source_pdf'))
+                if src and os.path.exists(src):
+                    os.remove(src)
+            except Exception:
+                pass

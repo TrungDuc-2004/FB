@@ -10,9 +10,9 @@ Mục tiêu:
 
 Mongo schema follow app/services/mongo_sync.py:
 - classes:  {classID, className}
-- subjects: {subjectID, classID, subjectName, subjectTitle, subjectUrl, subjectCategory, status, createdBy, createdAt, updatedAt}
-- topics:   {topicID, subjectID, topicName, topicUrl, topicCategory, status, createdBy, createdAt, updatedAt}
-- lessons:  {lessonID, topicID, lessonName, lessonType, lessonUrl, lessonCategory, status, createdBy, createdAt, updatedAt}
+- subjects: {subjectID, classID, subjectName, subjectTitle, subjectDescription, keywordSubject, subjectUrl, subjectCategory, status, createdBy, createdAt, updatedAt}
+- topics:   {topicID, subjectID, topicName, topicDescription, keywordTopic, topicUrl, topicCategory, status, createdBy, createdAt, updatedAt}
+- lessons:  {lessonID, topicID, lessonName, lessonType, lessonDescription, keywordLesson, lessonUrl, lessonCategory, status, createdBy, createdAt, updatedAt}
 - chunks:   {chunkID, lessonID, chunkName, chunkType, chunkUrl, keywords, chunkDescription, chunkCategory, status, createdBy, createdAt, updatedAt}
 
 QUAN TRỌNG: chunk chỉ lưu lessonID = lesson_map (string map id), KHÔNG lưu subject/topic/class.
@@ -31,6 +31,8 @@ from .mongo_client import get_mongo_client
 from .keyword_embedding import embed_keyword_cached, get_keyword_embedder
 from .postgre_sync_from_mongo import PgIds, sync_postgre_from_mongo_auto_ids
 from .neo_sync import NeoSyncResult, sync_neo4j_from_maps_and_pg_ids
+from .postgre_media_sync import sync_postgre_media_from_mongo
+from .neo_media_sync import sync_media_to_neo4j
 
 
 def _now() -> datetime:
@@ -69,6 +71,121 @@ def _parse_keywords(v: Any) -> List[str]:
         return []
     parts = re.split(r"[;,\n\r\t]+", s)
     return [p.strip() for p in parts if p and p.strip()]
+
+
+def _uniq_keep_order_ci(values: List[Any]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in values or []:
+        s = _clean(item)
+        if not s:
+            continue
+        key = s.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+
+def _active_docs(cursor) -> List[Dict[str, Any]]:
+    docs: List[Dict[str, Any]] = []
+    for doc in cursor:
+        if str(doc.get("status") or "active").strip().lower() == "hidden":
+            continue
+        docs.append(doc)
+    return docs
+
+
+def _refresh_topic_keywords_from_lessons(*, topic_map: str, lesson_map: str = "", category: str = "document") -> Dict[str, Any] | None:
+    mg = get_mongo_client()
+    db = mg["db"]
+    now = _now()
+    category = _normalize_category(category)
+
+    topic_q: Dict[str, Any] = {"topicID": _clean(topic_map)}
+    if category:
+        topic_q["topicCategory"] = category
+    topic_doc = db["topics"].find_one(topic_q) if _clean(topic_map) else None
+
+    if topic_doc is None and _clean(lesson_map):
+        lesson_q: Dict[str, Any] = {"lessonID": _clean(lesson_map)}
+        if category:
+            lesson_q["lessonCategory"] = category
+        lesson_doc = db["lessons"].find_one(lesson_q)
+        if lesson_doc:
+            topic_lookup: Dict[str, Any] = {"topicID": _clean(lesson_doc.get("topicID"))}
+            if category:
+                topic_lookup["topicCategory"] = category
+            topic_doc = db["topics"].find_one(topic_lookup)
+
+    if not topic_doc:
+        return None
+
+    topic_id = str(topic_doc.get("topicID") or "").strip()
+    lesson_q = {"topicID": topic_id}
+    if category:
+        lesson_q["lessonCategory"] = category
+    lesson_docs = _active_docs(db["lessons"].find(lesson_q).sort("lessonID", 1))
+
+    merged: List[str] = []
+    seen: set[str] = set()
+    for lesson in lesson_docs:
+        for kw in _parse_keywords(lesson.get("keywordLesson")):
+            key = kw.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(kw)
+
+    db["topics"].update_one(
+        {"_id": topic_doc["_id"]},
+        {"$set": {"keywordTopic": merged, "searchUpdatedAt": now, "updatedAt": now}},
+    )
+    return {
+        "topicID": topic_id,
+        "subjectID": str(topic_doc.get("subjectID") or "").strip(),
+        "keywordCount": len(merged),
+        "category": category,
+    }
+
+
+def _refresh_subject_keywords_from_topics(*, subject_map: str, category: str = "document") -> Dict[str, Any] | None:
+    if not _clean(subject_map):
+        return None
+
+    mg = get_mongo_client()
+    db = mg["db"]
+    now = _now()
+    category = _normalize_category(category)
+
+    subject_q: Dict[str, Any] = {"subjectID": _clean(subject_map)}
+    if category:
+        subject_q["subjectCategory"] = category
+    subject_doc = db["subjects"].find_one(subject_q)
+    if not subject_doc:
+        return None
+
+    topic_q = {"subjectID": _clean(subject_map)}
+    if category:
+        topic_q["topicCategory"] = category
+    topics = _active_docs(db["topics"].find(topic_q).sort("topicID", 1))
+
+    merged: List[str] = []
+    seen: set[str] = set()
+    for topic in topics:
+        for kw in _parse_keywords(topic.get("keywordTopic")):
+            key = kw.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(kw)
+
+    db["subjects"].update_one(
+        {"_id": subject_doc["_id"]},
+        {"$set": {"keywordSubject": merged, "searchUpdatedAt": now, "updatedAt": now}},
+    )
+    return {"subjectID": _clean(subject_map), "keywordCount": len(merged), "category": category}
 
 
 def _extract_last_number(s: str) -> str:
@@ -138,6 +255,162 @@ def _parse_chunk_map(chunk_map: str) -> Optional[Dict[str, str]]:
     }
 
 
+def _media_fields(media_type: str) -> Tuple[str, str, str, str, str]:
+    if media_type == "image":
+        return "images", "imgID", "imgName", "imgDescription", "imgUrl"
+    if media_type == "video":
+        return "videos", "videoID", "videoName", "videoDescription", "videoUrl"
+    raise ValueError("media_type must be image or video")
+
+
+def _parse_media_map(map_id: str) -> Optional[Dict[str, str]]:
+    s = _clean(map_id)
+    if s.upper().startswith("IMG_"):
+        media_type = "image"
+        follow_map = s[4:]
+    elif s.upper().startswith("VD_"):
+        media_type = "video"
+        follow_map = s[3:]
+    else:
+        return None
+
+    parsed = _parse_chunk_map(follow_map)
+    if parsed:
+        return {**parsed, "map_id": s, "follow_map": follow_map, "follow_type": "chunk", "media_type": media_type}
+
+    parsed_lesson = _parse_lesson_map(follow_map)
+    if parsed_lesson:
+        return {**parsed_lesson, "map_id": s, "follow_map": follow_map, "follow_type": "lesson", "media_type": media_type, "chunk_map": ""}
+
+    parsed_topic = _parse_topic_map(follow_map)
+    if parsed_topic:
+        return {**parsed_topic, "map_id": s, "follow_map": follow_map, "follow_type": "topic", "media_type": media_type, "lesson_map": "", "chunk_map": ""}
+
+    if follow_map:
+        return {
+            "map_id": s,
+            "follow_map": follow_map,
+            "follow_type": "subject",
+            "media_type": media_type,
+            "subject_map": follow_map,
+            "class_map": _derive_class_map_from_subject_map(follow_map),
+            "topic_map": "",
+            "lesson_map": "",
+            "chunk_map": "",
+        }
+    return None
+
+
+def _follow_id_from_media_map(map_id: str) -> Tuple[str, str]:
+    parsed = _parse_media_map(map_id)
+    if not parsed:
+        raise ValueError(f"media map invalid: {map_id}")
+    subject_map = parsed.get("subject_map") or ""
+    follow_type = parsed.get("follow_type") or "subject"
+    parts = [subject_map]
+    topic_map = parsed.get("topic_map") or ""
+    lesson_map = parsed.get("lesson_map") or ""
+    chunk_map = parsed.get("chunk_map") or ""
+    if follow_type in ("topic", "lesson", "chunk") and topic_map:
+        topic_no = _extract_last_number(topic_map)
+        if topic_no:
+            parts.append(f"T{int(topic_no)}")
+    if follow_type in ("lesson", "chunk") and lesson_map:
+        lesson_no = _extract_last_number(lesson_map)
+        if lesson_no:
+            parts.append(f"L{int(lesson_no)}")
+    if follow_type == "chunk" and chunk_map:
+        chunk_no = _extract_last_number(chunk_map)
+        if chunk_no:
+            parts.append(f"C{int(chunk_no)}")
+    return "_".join(parts), follow_type
+
+
+def upsert_media_to_mongo(*, media_type: str, actor: str, item: Dict[str, Any], stats: Optional[Dict[str, Dict[str, int]]] = None) -> Dict[str, Any]:
+    media_type = _normalize_category(media_type)
+    if media_type not in ("image", "video"):
+        raise ValueError("media_type must be image or video")
+
+    parsed = _parse_media_map(_best(item, "mapID", "map_id"))
+    if not parsed or parsed.get("media_type") != media_type:
+        raise ValueError(f"mapID invalid for {media_type}")
+
+    mg = get_mongo_client()
+    db = mg["db"]
+    now = _now()
+    collection, id_field, name_field, desc_field, url_field = _media_fields(media_type)
+
+    def _bump(col_key: str, action: str):
+        if not stats:
+            return
+        if col_key not in stats:
+            stats[col_key] = {"inserted": 0, "updated": 0}
+        stats[col_key][action] = int(stats[col_key].get(action, 0)) + 1
+
+    media_id = _best(item, id_field, "mediaID", "media_id")
+    media_name = _best(item, name_field, "name")
+    media_desc = _best(item, desc_field, "description")
+    media_url = _best(item, url_field, "url")
+    object_key = _best(item, "objectKey", "object_key")
+    map_id = _best(item, "mapID", "map_id")
+    status = _best(item, "status") or "active"
+
+    existing = None
+    if media_id:
+        existing = db[collection].find_one({id_field: media_id})
+    if existing is None and object_key:
+        existing = db[collection].find_one({"objectKey": object_key})
+
+    if existing:
+        media_name = media_name or _clean(existing.get(name_field)) or media_id or map_id
+        set_fields = {
+            id_field: media_id or _clean(existing.get(id_field)),
+            name_field: media_name,
+            desc_field: media_desc or _clean(existing.get(desc_field)),
+            url_field: media_url or _clean(existing.get(url_field)),
+            "objectKey": object_key or _clean(existing.get("objectKey")),
+            "mapID": map_id or _clean(existing.get("mapID")),
+            "status": status or _clean(existing.get("status")) or "active",
+            "updatedAt": now,
+        }
+        db[collection].update_one({"_id": existing["_id"]}, {"$set": set_fields})
+        _bump(collection, "updated")
+        mongo_id = str(existing["_id"])
+        effective_id = set_fields[id_field]
+    else:
+        if not media_id:
+            raise ValueError(f"{id_field} is required")
+        doc = {
+            id_field: media_id,
+            name_field: media_name or media_id or map_id,
+            desc_field: media_desc,
+            url_field: media_url,
+            "objectKey": object_key,
+            "mapID": map_id,
+            "status": status,
+            "createdBy": actor or "system",
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        mongo_id = str(db[collection].insert_one(doc).inserted_id)
+        effective_id = media_id
+        _bump(collection, "inserted")
+
+    return {
+        "collection": collection,
+        "mongo_id": mongo_id,
+        "media_id": effective_id,
+        "map_id": map_id,
+        "media_type": media_type,
+        "follow_type": parsed.get("follow_type") or "subject",
+        "class_map": parsed.get("class_map") or "",
+        "subject_map": parsed.get("subject_map") or "",
+        "topic_map": parsed.get("topic_map") or "",
+        "lesson_map": parsed.get("lesson_map") or "",
+        "chunk_map": parsed.get("chunk_map") or "",
+    }
+
+
 def _normalize_category(v: Any) -> str:
     s = _clean(v).lower()
     if s in ("image", "images"):
@@ -193,11 +466,17 @@ def upsert_chain_to_mongo_by_maps(
     class_name: str = "",
     subject_name: str = "",
     subject_title: str = "",
+    subject_description: str = "",
+    subject_keywords: Optional[List[str]] = None,
     subject_url: str = "",
     topic_name: str = "",
+    topic_description: str = "",
+    topic_keywords: Optional[List[str]] = None,
     topic_url: str = "",
     lesson_name: str = "",
     lesson_type: str = "",
+    lesson_description: str = "",
+    lesson_keywords: Optional[List[str]] = None,
     lesson_url: str = "",
     chunk_name: str = "",
     chunk_type: str = "",
@@ -224,6 +503,10 @@ def upsert_chain_to_mongo_by_maps(
     topic_map = _clean(topic_map)
     lesson_map = _clean(lesson_map)
     chunk_map = _clean(chunk_map)
+
+    subject_kw = _uniq_keep_order_ci(subject_keywords or [])
+    topic_kw = _uniq_keep_order_ci(topic_keywords or [])
+    lesson_kw = _uniq_keep_order_ci(lesson_keywords or [])
 
     if not class_map:
         raise ValueError("class_map is required")
@@ -287,6 +570,10 @@ def upsert_chain_to_mongo_by_maps(
                 "subjectTitle": subject_title or subject_doc.get("subjectTitle") or "",
                 "updatedAt": now,
             }
+            if subject_description:
+                set_fields["subjectDescription"] = subject_description
+            if subject_kw:
+                set_fields["keywordSubject"] = subject_kw
             if subject_url:
                 set_fields["subjectUrl"] = subject_url
             db[COL_SUBJECTS].update_one({"_id": subject_id}, {"$set": set_fields})
@@ -298,6 +585,8 @@ def upsert_chain_to_mongo_by_maps(
                     "classID": class_map,
                     "subjectName": subject_name or subject_map,
                     "subjectTitle": subject_title,
+                    "subjectDescription": subject_description,
+                    "keywordSubject": subject_kw,
                     "subjectUrl": subject_url,
                     "status": status or "active",
                     "createdBy": actor,
@@ -322,6 +611,10 @@ def upsert_chain_to_mongo_by_maps(
                 "topicName": topic_name or topic_doc.get("topicName") or topic_map,
                 "updatedAt": now,
             }
+            if topic_description:
+                set_fields["topicDescription"] = topic_description
+            if topic_kw:
+                set_fields["keywordTopic"] = topic_kw
             if topic_url:
                 set_fields["topicUrl"] = topic_url
             db[COL_TOPICS].update_one({"_id": topic_id}, {"$set": set_fields})
@@ -332,6 +625,8 @@ def upsert_chain_to_mongo_by_maps(
                     **topic_filter,
                     "subjectID": subject_map,
                     "topicName": topic_name or topic_map,
+                    "topicDescription": topic_description,
+                    "keywordTopic": topic_kw,
                     "topicUrl": topic_url,
                     "status": status or "active",
                     "createdBy": actor,
@@ -356,6 +651,10 @@ def upsert_chain_to_mongo_by_maps(
                 "lessonType": lesson_type or lesson_doc.get("lessonType") or "",
                 "updatedAt": now,
             }
+            if lesson_description:
+                set_fields["lessonDescription"] = lesson_description
+            if lesson_kw:
+                set_fields["keywordLesson"] = lesson_kw
             if lesson_url:
                 set_fields["lessonUrl"] = lesson_url
             db[COL_LESSONS].update_one({"_id": lesson_id}, {"$set": set_fields})
@@ -367,6 +666,8 @@ def upsert_chain_to_mongo_by_maps(
                     "topicID": topic_map,
                     "lessonName": lesson_name or lesson_map,
                     "lessonType": lesson_type,
+                    "lessonDescription": lesson_description,
+                    "keywordLesson": lesson_kw,
                     "lessonUrl": lesson_url,
                     "status": status or "active",
                     "createdBy": actor,
@@ -491,6 +792,8 @@ def parse_excel_to_payload(excel_bytes: bytes) -> Dict[str, List[Dict[str, Any]]
     raw: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
     for nm in ("class", "subject", "topic", "lesson", "chunk", "keyword"):
         raw[nm] = _sheet_rows(sheets[nm]) if nm in sheets else []
+    raw["image"] = _sheet_rows(sheets["image"]) if "image" in sheets else (_sheet_rows(sheets["images"]) if "images" in sheets else [])
+    raw["video"] = _sheet_rows(sheets["video"]) if "video" in sheets else (_sheet_rows(sheets["videos"]) if "videos" in sheets else [])
 
     # ===== Pass 1: build mapping import_key -> mapID (để support file cũ) =====
     class_key_to_id: Dict[str, str] = {}
@@ -573,7 +876,7 @@ def parse_excel_to_payload(excel_bytes: bytes) -> Dict[str, List[Dict[str, Any]]
         if ck and kw:
             keywords_by_chunk.setdefault(ck, []).append(_clean(kw))
 
-    payload: Dict[str, List[Dict[str, Any]]] = {"classes": [], "subjects": [], "topics": [], "lessons": [], "chunks": []}
+    payload: Dict[str, List[Dict[str, Any]]] = {"classes": [], "subjects": [], "topics": [], "lessons": [], "chunks": [], "images": [], "videos": []}
 
     for rowno, r in raw["class"]:
         class_id = _guess_class_id(r)
@@ -594,6 +897,8 @@ def parse_excel_to_payload(excel_bytes: bytes) -> Dict[str, List[Dict[str, Any]]
                 "subjectID": subject_id,
                 "subjectName": _best(r, "subjectName", "subject_name") or subject_id,
                 "subjectTitle": _best(r, "subjectTitle", "subject_type", "subject_title"),
+                "subjectDescription": _best(r, "subjectDescription", "subject_description", "description"),
+                "keywordSubject": _parse_keywords(_best(r, "keywordSubject", "subjectKeywords", "subject_keywords")),
                 "subjectCategory": _normalize_category(_best(r, "category", "subjectCategory", "subject_category")),
                 "subjectUrl": _best(r, "subjectUrl", "subject_url", "url"),
             }
@@ -632,6 +937,8 @@ def parse_excel_to_payload(excel_bytes: bytes) -> Dict[str, List[Dict[str, Any]]
                 "subjectID": subject_id,
                 "topicID": topic_id,
                 "topicName": _best(r, "topicName", "topic_name") or topic_id,
+                "topicDescription": _best(r, "topicDescription", "topic_description", "description"),
+                "keywordTopic": _parse_keywords(_best(r, "keywordTopic", "topicKeywords", "topic_keywords")),
                 "topicCategory": _normalize_category(_best(r, "category", "topicCategory", "topic_category")),
                 "topicUrl": _best(r, "topicUrl", "topic_url", "url"),
             }
@@ -668,6 +975,8 @@ def parse_excel_to_payload(excel_bytes: bytes) -> Dict[str, List[Dict[str, Any]]
                 "lessonID": d["lesson_map"],
                 "lessonName": _best(r, "lessonName", "lesson_name") or d["lesson_map"],
                 "lessonType": _best(r, "lessonType", "lesson_type"),
+                "lessonDescription": _best(r, "lessonDescription", "lesson_description", "description"),
+                "keywordLesson": _parse_keywords(_best(r, "keywordLesson", "lessonKeywords", "lesson_keywords")),
                 "lessonCategory": _normalize_category(_best(r, "category", "lessonCategory", "lesson_category")),
                 "lessonUrl": _best(r, "lessonUrl", "lesson_url", "url"),
             }
@@ -717,6 +1026,52 @@ def parse_excel_to_payload(excel_bytes: bytes) -> Dict[str, List[Dict[str, Any]]
             }
         )
 
+    for rowno, r in raw["image"]:
+        map_id = _best(r, "mapID", "map_id")
+        parsed = _parse_media_map(map_id)
+        if not parsed or parsed.get("media_type") != "image":
+            continue
+        payload["images"].append(
+            {
+                "_row": rowno,
+                "imgID": _best(r, "imgID", "img_id"),
+                "imgName": _best(r, "imgName", "img_name", "name"),
+                "imgDescription": _best(r, "imgDescription", "img_description", "description"),
+                "imgUrl": _best(r, "imgUrl", "img_url", "url"),
+                "objectKey": _best(r, "objectKey", "object_key"),
+                "mapID": map_id,
+                "category": "image",
+                "classID": parsed.get("class_map") or "",
+                "subjectID": parsed.get("subject_map") or "",
+                "topicID": parsed.get("topic_map") or "",
+                "lessonID": parsed.get("lesson_map") or "",
+                "chunkID": parsed.get("chunk_map") or "",
+            }
+        )
+
+    for rowno, r in raw["video"]:
+        map_id = _best(r, "mapID", "map_id")
+        parsed = _parse_media_map(map_id)
+        if not parsed or parsed.get("media_type") != "video":
+            continue
+        payload["videos"].append(
+            {
+                "_row": rowno,
+                "videoID": _best(r, "videoID", "video_id"),
+                "videoName": _best(r, "videoName", "video_name", "name"),
+                "videoDescription": _best(r, "videoDescription", "video_description", "description"),
+                "videoUrl": _best(r, "videoUrl", "video_url", "url"),
+                "objectKey": _best(r, "objectKey", "object_key"),
+                "mapID": map_id,
+                "category": "video",
+                "classID": parsed.get("class_map") or "",
+                "subjectID": parsed.get("subject_map") or "",
+                "topicID": parsed.get("topic_map") or "",
+                "lessonID": parsed.get("lesson_map") or "",
+                "chunkID": parsed.get("chunk_map") or "",
+            }
+        )
+
     return payload
 
 
@@ -731,8 +1086,36 @@ def bulk_import_payload(
     """Import payload into Mongo, then sync PG + Neo."""
 
     actor = _clean(actor) or "system"
-    inserted_or_updated = {"classes": 0, "subjects": 0, "topics": 0, "lessons": 0, "chunks": 0}
+    inserted_or_updated = {"classes": 0, "subjects": 0, "topics": 0, "lessons": 0, "chunks": 0, "images": 0, "videos": 0}
     results: List[ImportRowResult] = []
+    dirty_topics: set[Tuple[str, str]] = set()
+    dirty_subjects: set[Tuple[str, str]] = set()
+
+    def _sync_media_row(*, media_type: str, mongo_id: str, media_id: str, map_id: str) -> Tuple[Any, Any, Optional[str]]:
+        pg_res = None
+        neo_res = None
+        warning = None
+        follow_id = ""
+        follow_type = ""
+        if sync_postgre:
+            pg_res = sync_postgre_media_from_mongo(media_type=media_type, mongo_id=mongo_id)
+            follow_id = getattr(pg_res, "follow_id", "") or ""
+            follow_type = getattr(pg_res, "follow_type", "") or ""
+            media_id = getattr(pg_res, "media_id", media_id) or media_id
+        else:
+            follow_id, follow_type = _follow_id_from_media_map(map_id)
+        if sync_neo4j:
+            try:
+                neo_res = sync_media_to_neo4j(
+                    media_type=media_type,
+                    media_id=media_id,
+                    mongo_id=mongo_id,
+                    follow_id=follow_id,
+                    follow_type=follow_type,
+                )
+            except Exception as exc:
+                warning = f"Neo4j sync failed: {exc}"
+        return pg_res, neo_res, warning
 
     def _import_level(level: str, items: List[Dict[str, Any]]):
         nonlocal inserted_or_updated, results
@@ -747,6 +1130,36 @@ def bulk_import_payload(
                     or it.get("category")
                     or "document"
                 )
+
+                if level in ("image", "video"):
+                    media_res = upsert_media_to_mongo(media_type=level, actor=actor, item=it, stats=mongo_stats)
+                    inserted_or_updated[f"{level}s"] += 1
+                    pg_media = None
+                    neo_media = None
+                    warning = None
+                    if sync_postgre or sync_neo4j:
+                        try:
+                            pg_media, neo_media, warning = _sync_media_row(
+                                media_type=level,
+                                mongo_id=media_res["mongo_id"],
+                                media_id=media_res["media_id"],
+                                map_id=media_res["map_id"],
+                            )
+                        except Exception as exc:
+                            warning = f"Sync failed: {exc}"
+                    results.append(
+                        ImportRowResult(
+                            ok=True,
+                            level=level,
+                            map_id=media_res["map_id"],
+                            mongo_id=media_res["mongo_id"],
+                            postgre=pg_media,
+                            neo4j=neo_media,
+                            warning=warning,
+                            row=rowno,
+                        )
+                    )
+                    continue
 
                 class_map = _best(it, "classID", "class_map", "classMap")
                 subject_map = _best(it, "subjectID", "subject_map", "subjectMap")
@@ -788,11 +1201,17 @@ def bulk_import_payload(
                     class_name=_best(it, "className", "class_name"),
                     subject_name=_best(it, "subjectName", "subject_name"),
                     subject_title=_best(it, "subjectTitle", "subject_title"),
+                    subject_description=_best(it, "subjectDescription", "subject_description"),
+                    subject_keywords=it.get("keywordSubject") if isinstance(it.get("keywordSubject"), list) else _parse_keywords(it.get("keywordSubject")),
                     subject_url=_best(it, "subjectUrl", "subject_url"),
                     topic_name=_best(it, "topicName", "topic_name"),
+                    topic_description=_best(it, "topicDescription", "topic_description"),
+                    topic_keywords=it.get("keywordTopic") if isinstance(it.get("keywordTopic"), list) else _parse_keywords(it.get("keywordTopic")),
                     topic_url=_best(it, "topicUrl", "topic_url"),
                     lesson_name=_best(it, "lessonName", "lesson_name"),
                     lesson_type=_best(it, "lessonType", "lesson_type"),
+                    lesson_description=_best(it, "lessonDescription", "lesson_description"),
+                    lesson_keywords=it.get("keywordLesson") if isinstance(it.get("keywordLesson"), list) else _parse_keywords(it.get("keywordLesson")),
                     lesson_url=_best(it, "lessonUrl", "lesson_url"),
                     chunk_name=_best(it, "chunkName", "chunk_name"),
                     chunk_type=_best(it, "chunkType", "chunk_type"),
@@ -815,6 +1234,12 @@ def bulk_import_payload(
                         row=rowno,
                     )
                 )
+
+                if level == "lesson" and lesson_map:
+                    d = _parse_lesson_map(lesson_map)
+                    if d:
+                        dirty_topics.add((d["topic_map"], category))
+                        dirty_subjects.add((d["subject_map"], category))
             except Exception as e:
                 map_id = (
                     _best(it, "chunkID", "chunk_map")
@@ -832,6 +1257,24 @@ def bulk_import_payload(
     _import_level("topic", payload.get("topics") or [])
     _import_level("lesson", payload.get("lessons") or [])
     _import_level("chunk", payload.get("chunks") or [])
+    _import_level("image", payload.get("images") or [])
+    _import_level("video", payload.get("videos") or [])
+
+    # Lesson keyword import theo Excel phải được đẩy lên topic -> subject như luồng upload tay.
+    refresh_warnings: List[str] = []
+    for topic_map, category in sorted(dirty_topics):
+        try:
+            topic_res = _refresh_topic_keywords_from_lessons(topic_map=topic_map, category=category)
+            if topic_res and topic_res.get("subjectID"):
+                dirty_subjects.add((str(topic_res["subjectID"]), category))
+        except Exception as exc:
+            refresh_warnings.append(f"topic:{topic_map}:{exc}")
+
+    for subject_map, category in sorted(dirty_subjects):
+        try:
+            _refresh_subject_keywords_from_topics(subject_map=subject_map, category=category)
+        except Exception as exc:
+            refresh_warnings.append(f"subject:{subject_map}:{exc}")
 
     # ===== Build unique sync tasks (prefer deepest) =====
     chunks: set[str] = set()
@@ -872,6 +1315,14 @@ def bulk_import_payload(
         key = (r.level, r.map_id)
         if key not in first_idx:
             first_idx[key] = idx
+
+    if refresh_warnings:
+        for idx, r in enumerate(results):
+            if r.ok:
+                existing = r.warning or ""
+                joined = "; ".join(refresh_warnings)
+                results[idx].warning = f"{existing}; {joined}".strip("; ").strip()
+                break
 
     def _attach(level: str, map_id: str, pg_ids: Optional[PgIds], neo_res: Optional[NeoSyncResult], warning: Optional[str]):
         idx = first_idx.get((level, map_id))
@@ -1078,6 +1529,12 @@ def import_metadata_xlsx_bytes(
     for it in payload.get("chunks", []):
         if not _clean(it.get("chunkCategory")):
             it["chunkCategory"] = fallback
+    for it in payload.get("images", []):
+        if not _clean(it.get("category")):
+            it["category"] = "image"
+    for it in payload.get("videos", []):
+        if not _clean(it.get("category")):
+            it["category"] = "video"
 
     mongo_stats: Dict[str, Dict[str, int]] = {
         "classes": {"inserted": 0, "updated": 0},
@@ -1085,6 +1542,8 @@ def import_metadata_xlsx_bytes(
         "topics": {"inserted": 0, "updated": 0},
         "lessons": {"inserted": 0, "updated": 0},
         "chunks": {"inserted": 0, "updated": 0},
+        "images": {"inserted": 0, "updated": 0},
+        "videos": {"inserted": 0, "updated": 0},
     }
 
     res = bulk_import_payload(

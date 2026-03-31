@@ -13,6 +13,7 @@ import MongoPage from "./pages/admin/MongoDB";
 import PostgresPage from "./pages/admin/PostgreSQL";
 import Neo4jPage from "./pages/admin/Neo4j";
 import UsersPage from "./pages/admin/Users";
+import UploadAutoReview from "./pages/admin/UploadAutoReview";
 
 import UserHome from "./pages/user/UserHome";
 import Search from "./pages/user/UserSearch";
@@ -45,6 +46,7 @@ export default function App() {
           <Route path="postgres" element={<PostgresPage />} />
           <Route path="neo4j" element={<Neo4jPage />} />
           <Route path="users" element={<UsersPage />} />
+          <Route path="minio/upload-auto" element={<UploadAutoReview />} />
         </Route>
 
         <Route

@@ -1,11 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import * as minioApi from "../../services/minioAdminApi";
 import "../../styles/admin/page.css";
 import DataTable from "../../components/DataTable";
 import CreateFolderModal from "../../components/CreateFolderModal";
-import UploadFileModal from "../../components/UploadFileModal";
 import InsertMetadataModal from "../../components/InsertMetadataModal";
-import UploadAutoModal from "../../components/UploadAutoModal";
 import FilterModal from "../../components/FilterModal";
 
 function getExt(name = "") {
@@ -69,13 +68,12 @@ function normalizeFolderType(x = "") {
 
 
 export default function MinIO() {
+  const navigate = useNavigate();
   const [currentPath, setCurrentPath] = useState(""); // "" = root
   const [q, setQ] = useState("");
 
   const [openCreateFolder, setOpenCreateFolder] = useState(false);
-  const [openUpload, setOpenUpload] = useState(false);
   const [openInsert, setOpenInsert] = useState(false);
-  const [openUploadAuto, setOpenUploadAuto] = useState(false);
   const [openFilter, setOpenFilter] = useState(false);
 
   // filters: loai + type
@@ -429,28 +427,7 @@ export default function MinIO() {
   function canUploadAutoHere() {
     if (!isStorage) return false;
     const tail = normalizeFolderType(parts[parts.length - 1] || "");
-    return section === "documents" && (tail === "subject" || tail === "topic");
-  }
-
-  async function uploadFile(file, { onProgress } = {}) {
-    if (!canUploadHere()) return;
-
-    try {
-      const res = await minioApi.uploadFiles(currentPath, [file], onProgress);
-      if (res?.failed_count > 0) {
-        const msg = (res.failed || [])
-          .map((item) => `${item?.filename || item?.object_key || "file"}: ${item?.error || "Upload chưa sync đủ 4 hệ"}`)
-          .join("\n");
-        throw new Error(msg || "Upload chưa sync đủ MinIO / MongoDB / PostgreSQL / Neo4j");
-      }
-
-      setOpenUpload(false);
-
-      const data = await minioApi.minioList(currentPath);
-      setRemote({ folders: data.folders || [], files: data.files || [] });
-    } catch (e) {
-      alert(String(e?.message || e));
-    }
+    return section === "documents" && (tail === "subject" || tail === "topic" || tail === "lesson");
   }
 
   async function insertItem({ meta, file }, { onProgress } = {}) {
@@ -482,13 +459,25 @@ export default function MinIO() {
   }
 
   async function uploadAuto(file, { bookVariant = "", onProgress } = {}) {
-    if (!canUploadAutoHere()) return;
+    if (!canUploadAutoHere()) return null;
 
     try {
-      await minioApi.uploadAuto(currentPath, file, { bookVariant, onProgress });
-      setOpenUploadAuto(false);
+      const res = await minioApi.uploadAuto(currentPath, file, { bookVariant, onProgress });
+      return res;
+    } catch (e) {
+      alert(String(e?.message || e));
+      throw e;
+    }
+  }
+
+  async function approveUploadAuto(sessionId, items, { onProgress } = {}) {
+    try {
+      const res = await minioApi.approveUploadAuto(sessionId, items, { onProgress });
+
       const data = await minioApi.minioList(currentPath);
       setRemote({ folders: data.folders || [], files: data.files || [] });
+
+      return res;
     } catch (e) {
       alert(String(e?.message || e));
       throw e;
@@ -594,7 +583,7 @@ export default function MinIO() {
                   Upload
                 </button>
                 {canUploadAutoHere() && (
-                  <button className="btn btn-primary" onClick={() => setOpenUploadAuto(true)}>
+                  <button className="btn btn-primary" onClick={() => navigate(`/admin/minio/upload-auto?path=${encodeURIComponent(currentPath)}`)}>
                     Tải lên tự động
                   </button>
                 )}
@@ -697,25 +686,11 @@ export default function MinIO() {
         onCreate={createFolder}
       />
 
-      <UploadFileModal
-        open={openUpload}
-        onClose={() => setOpenUpload(false)}
-        folderName={currentPath}
-        onUpload={uploadFile}
-      />
-
       <InsertMetadataModal
         open={openInsert}
         onClose={() => setOpenInsert(false)}
         folderName={currentPath}
         onInsert={insertItem}
-      />
-
-      <UploadAutoModal
-        open={openUploadAuto}
-        onClose={() => setOpenUploadAuto(false)}
-        currentPath={currentPath}
-        onUploadAuto={uploadAuto}
       />
 
       <FilterModal
