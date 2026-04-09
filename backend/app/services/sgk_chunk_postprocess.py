@@ -14,7 +14,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from paddleocr import PaddleOCR
+try:
+    from paddleocr import PaddleOCR  # type: ignore
+except Exception:
+    PaddleOCR = None  # type: ignore
+
+try:
+    import pytesseract  # type: ignore
+except Exception:
+    pytesseract = None  # type: ignore
 
 
 # ============================
@@ -318,12 +326,79 @@ def _call_with_supported_kwargs(func, *args, **kwargs):
     return func(*args, **filtered)
 
 
-def run_ocr_any(ocr: PaddleOCR, img_bgr: np.ndarray):
+class _TesseractOCR:
+    def __init__(self, lang: str = "vie+eng"):
+        self.lang = lang
+
+
+def _tesseract_lang_candidates() -> List[str]:
+    if pytesseract is None:
+        return []
+    try:
+        available = set(pytesseract.get_languages(config=""))
+    except Exception:
+        available = set()
+    preferred = ["vie+eng", "vie", "eng"]
+    out: List[str] = []
+    for cand in preferred:
+        parts = cand.split("+")
+        if not available or all(part in available for part in parts):
+            out.append(cand)
+    return out or ["eng"]
+
+
+def _run_tesseract_ocr(img_bgr: np.ndarray, lang: str) -> List[Dict[str, Any]]:
+    if pytesseract is None:
+        raise RuntimeError("pytesseract_not_installed")
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    data = pytesseract.image_to_data(
+        rgb,
+        lang=lang,
+        config="--psm 6",
+        output_type=pytesseract.Output.DICT,
+    )
+    out: List[Dict[str, Any]] = []
+    texts = data.get("text", [])
+    for i in range(len(texts)):
+        txt = str(texts[i] or "").strip()
+        if not txt:
+            continue
+        conf_raw = str((data.get("conf") or ["-1"])[i]).strip()
+        try:
+            score = float(conf_raw) / 100.0
+        except Exception:
+            score = 0.0
+        x = int((data.get("left") or [0])[i])
+        y = int((data.get("top") or [0])[i])
+        w = int((data.get("width") or [0])[i])
+        h = int((data.get("height") or [0])[i])
+        if w <= 0 or h <= 0:
+            continue
+        out.append({
+            "x0": float(x),
+            "y0": float(y),
+            "x1": float(x + w),
+            "y1": float(y + h),
+            "text": txt,
+            "score": score,
+        })
+    return out
+
+
+def run_ocr_any(ocr: Any, img_bgr: np.ndarray):
     """
-    Tương thích nhiều đời PaddleOCR:
-    - 2.x: ocr.ocr(img, cls=False)
-    - 3.x: predict(img, ...), nhưng signature có thể đổi giữa các bản.
+    Tương thích nhiều đời PaddleOCR.
+    Nếu không có PaddleOCR thì fallback sang Tesseract để tránh toàn bộ bước crop bị bỏ qua.
     """
+    if isinstance(ocr, _TesseractOCR):
+        last_t_err = None
+        for lang in _tesseract_lang_candidates():
+            try:
+                return _run_tesseract_ocr(img_bgr, lang)
+            except Exception as e:
+                last_t_err = e
+        raise RuntimeError(f"tesseract_ocr_failed: {last_t_err}")
+
     last_err = None
 
     ocr_method = getattr(ocr, "ocr", None)
@@ -915,8 +990,11 @@ def process_one_chunk(
     img = render_pdf_page0_to_bgr(chunk_pdf_path, dpi=DPI)
 
     res = run_ocr_any(ocr, img)
+    # fallback Tesseract trả trực tiếp list dict bbox/text/score
+    if isinstance(res, list) and res and isinstance(res[0], dict) and {"x0", "y0", "x1", "y1", "text"}.issubset(set(res[0].keys())):
+        dets_raw = list(res)
     # nếu res là kiểu predict cũ thì dùng iter_dets_predict, còn ocr.ocr thì dùng iter_dets_paddleocr
-    if isinstance(res, list) and res and isinstance(res[0], list) and res and (len(res[0]) == 0 or isinstance(res[0][0], (list, tuple))):
+    elif isinstance(res, list) and res and isinstance(res[0], list) and (len(res[0]) == 0 or isinstance(res[0][0], (list, tuple))):
         dets_raw = iter_dets_paddleocr(res)
     else:
         dets_raw = iter_dets_predict(res)
@@ -1213,19 +1291,25 @@ def process_one_chunk(
 # ============================
 # Main
 # ============================
-def build_ocr() -> PaddleOCR:
-    common = dict(
-        lang=LANG,
-        use_textline_orientation=False,
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-    )
-    if DET_NO_RESIZE:
-        try:
-            return PaddleOCR(**{**common, "text_det_limit_type": "max", "text_det_limit_side_len": 4096})
-        except Exception:
-            return PaddleOCR(**{**common, "det_limit_type": "max", "det_limit_side_len": 4096})
-    return PaddleOCR(**common)
+def build_ocr() -> Any:
+    if PaddleOCR is not None:
+        common = dict(
+            lang=LANG,
+            use_textline_orientation=False,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+        )
+        if DET_NO_RESIZE:
+            try:
+                return PaddleOCR(**{**common, "text_det_limit_type": "max", "text_det_limit_side_len": 4096})
+            except Exception:
+                return PaddleOCR(**{**common, "det_limit_type": "max", "det_limit_side_len": 4096})
+        return PaddleOCR(**common)
+
+    if pytesseract is not None:
+        return _TesseractOCR()
+
+    raise RuntimeError("Không có OCR khả dụng. Cần paddleocr hoặc pytesseract+tesseract")
 
 def run_postprocess_for_book(book_dir: str | Path) -> Dict[str, Any]:
     """

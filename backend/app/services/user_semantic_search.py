@@ -1320,28 +1320,28 @@ def _neo_hierarchy_for_chunks(neo, chunk_ids: List[str]) -> Tuple[Dict[str, dict
             OPTIONAL MATCH (subject:Subject)-[:HAS_TOPIC]->(topic)
             OPTIONAL MATCH (class:Class)-[:HAS_SUBJECT]->(subject)
             WITH chunk, lesson, topic, subject, class,
-                 [(chunk)-[:HAS_IMAGE_GROUP]->(:ImgChunk)-[:HAS_IMAGE]->(img:Image) |
+                 [(chunk)-[:HAS_IMAGE_GROUP]->(img_group)-[:HAS_IMAGE]->(img:Image) |
                     {id: img.pg_id, name: coalesce(img.name, img.pg_id), url: coalesce(img.url, ''), description: coalesce(img.description, ''), mapID: coalesce(img.map_id, ''), mongoID: coalesce(img.mongo_id, ''), followType: 'chunk', followID: chunk.pg_id}
                  ] AS chunk_images,
-                 CASE WHEN lesson IS NULL THEN [] ELSE [(lesson)-[:HAS_IMAGE_GROUP]->(:ImgLesson)-[:HAS_IMAGE]->(img:Image) |
+                 CASE WHEN lesson IS NULL THEN [] ELSE [(lesson)-[:HAS_IMAGE_GROUP]->(img_group)-[:HAS_IMAGE]->(img:Image) |
                     {id: img.pg_id, name: coalesce(img.name, img.pg_id), url: coalesce(img.url, ''), description: coalesce(img.description, ''), mapID: coalesce(img.map_id, ''), mongoID: coalesce(img.mongo_id, ''), followType: 'lesson', followID: lesson.pg_id}
                  ] END AS lesson_images,
-                 CASE WHEN topic IS NULL THEN [] ELSE [(topic)-[:HAS_IMAGE_GROUP]->(:ImgTopic)-[:HAS_IMAGE]->(img:Image) |
+                 CASE WHEN topic IS NULL THEN [] ELSE [(topic)-[:HAS_IMAGE_GROUP]->(img_group)-[:HAS_IMAGE]->(img:Image) |
                     {id: img.pg_id, name: coalesce(img.name, img.pg_id), url: coalesce(img.url, ''), description: coalesce(img.description, ''), mapID: coalesce(img.map_id, ''), mongoID: coalesce(img.mongo_id, ''), followType: 'topic', followID: topic.pg_id}
                  ] END AS topic_images,
-                 CASE WHEN subject IS NULL THEN [] ELSE [(subject)-[:HAS_IMAGE_GROUP]->(:ImgSubject)-[:HAS_IMAGE]->(img:Image) |
+                 CASE WHEN subject IS NULL THEN [] ELSE [(subject)-[:HAS_IMAGE_GROUP]->(img_group)-[:HAS_IMAGE]->(img:Image) |
                     {id: img.pg_id, name: coalesce(img.name, img.pg_id), url: coalesce(img.url, ''), description: coalesce(img.description, ''), mapID: coalesce(img.map_id, ''), mongoID: coalesce(img.mongo_id, ''), followType: 'subject', followID: subject.pg_id}
                  ] END AS subject_images,
-                 [(chunk)-[:HAS_VIDEO_GROUP]->(:VideoChunk)-[:HAS_VIDEO]->(video:Video) |
+                 [(chunk)-[:HAS_VIDEO_GROUP]->(video_group)-[:HAS_VIDEO]->(video:Video) |
                     {id: video.pg_id, name: coalesce(video.name, video.pg_id), url: coalesce(video.url, ''), description: coalesce(video.description, ''), mapID: coalesce(video.map_id, ''), mongoID: coalesce(video.mongo_id, ''), followType: 'chunk', followID: chunk.pg_id}
                  ] AS chunk_videos,
-                 CASE WHEN lesson IS NULL THEN [] ELSE [(lesson)-[:HAS_VIDEO_GROUP]->(:VideoLesson)-[:HAS_VIDEO]->(video:Video) |
+                 CASE WHEN lesson IS NULL THEN [] ELSE [(lesson)-[:HAS_VIDEO_GROUP]->(video_group)-[:HAS_VIDEO]->(video:Video) |
                     {id: video.pg_id, name: coalesce(video.name, video.pg_id), url: coalesce(video.url, ''), description: coalesce(video.description, ''), mapID: coalesce(video.map_id, ''), mongoID: coalesce(video.mongo_id, ''), followType: 'lesson', followID: lesson.pg_id}
                  ] END AS lesson_videos,
-                 CASE WHEN topic IS NULL THEN [] ELSE [(topic)-[:HAS_VIDEO_GROUP]->(:VideoTopic)-[:HAS_VIDEO]->(video:Video) |
+                 CASE WHEN topic IS NULL THEN [] ELSE [(topic)-[:HAS_VIDEO_GROUP]->(video_group)-[:HAS_VIDEO]->(video:Video) |
                     {id: video.pg_id, name: coalesce(video.name, video.pg_id), url: coalesce(video.url, ''), description: coalesce(video.description, ''), mapID: coalesce(video.map_id, ''), mongoID: coalesce(video.mongo_id, ''), followType: 'topic', followID: topic.pg_id}
                  ] END AS topic_videos,
-                 CASE WHEN subject IS NULL THEN [] ELSE [(subject)-[:HAS_VIDEO_GROUP]->(:VideoSubject)-[:HAS_VIDEO]->(video:Video) |
+                 CASE WHEN subject IS NULL THEN [] ELSE [(subject)-[:HAS_VIDEO_GROUP]->(video_group)-[:HAS_VIDEO]->(video:Video) |
                     {id: video.pg_id, name: coalesce(video.name, video.pg_id), url: coalesce(video.url, ''), description: coalesce(video.description, ''), mapID: coalesce(video.map_id, ''), mongoID: coalesce(video.mongo_id, ''), followType: 'subject', followID: subject.pg_id}
                  ] END AS subject_videos
             RETURN chunk.pg_id AS chunk_id,

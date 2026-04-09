@@ -440,24 +440,27 @@ Nếu không chắc chắn 100% => BỎ QUA (không bịa).
 - Có mẫu "<số>." ở ĐẦU DÒNG (ví dụ "1.", "2.", "3.", ...)
 - Phần chữ ngay sau "<số>." là TIÊU ĐỀ IN HOA TOÀN BỘ (không có chữ thường)
 - Không thuộc/không nằm trong các phần: "NHIỆM VỤ", "CÂU HỎI", "BÀI TẬP", "LUYỆN TẬP", "VẬN DỤNG", "HƯỚNG DẪN", "BƯỚC"...
-- Không phải câu mệnh lệnh/thao tác.
+- Không phải câu mệnh lệnh/thao tác (NHÁY, CHỌN, MỞ, THỰC HIỆN, HÃY, EM HÃY...)
 
 RẤT QUAN TRỌNG (CHỐNG BỊA):
 - Nếu KHÔNG nhìn thấy mục "1." thật sự (ở đầu dòng) => trả list_chunk rỗng [].
 - TUYỆT ĐỐI không suy ra "1." chỉ vì thấy chữ IN HOA.
 
-OUTPUT MỖI CHUNK (BẮT BUỘC ĐỦ 4 TRƯỜNG):
+OUTPUT MỖI CHUNK (BẮT BUỘC ĐỦ 3 TRƯỜNG):
 - start: SỐ TRANG PDF (1-based) nơi tiêu đề mục chính xuất hiện lần đầu.
 - content_head: true/false
-- heading: CHỈ CHỨA SỐ MỤC dạng "1." / "2." / "3." ...
+- heading: CHỈ CHỨA SỐ MỤC dạng "1." / "2." / "3." ... (không kèm chữ).
 - title: CHỈ PHẦN CHỮ SAU "<số>.", GIỮ NGUYÊN IN HOA.
+  - Không được có chữ thường.
+  - Nếu tiêu đề xuống dòng, nối lại bằng 1 dấu cách.
 
 content_head:
-- true  nếu trên CÙNG trang start, phía TRÊN tiêu đề còn có nội dung thuộc mục trước.
+- true  nếu trên CÙNG trang start, phía TRÊN tiêu đề còn có nội dung thuộc mục trước
+        (đoạn văn/hình/bảng/câu hỏi/bài tập/tổng kết...). KHÔNG tính header/footer/số trang.
 - false nếu phía trên chỉ có header/footer/số trang hoặc tiêu đề nằm ngay đầu trang nội dung.
 
 RÀNG BUỘC:
-- heading phải tăng dần theo thứ tự xuất hiện.
+- heading phải tăng dần theo thứ tự xuất hiện (1., 2., 3., ...).
 - 1 <= start <= {total_pages}.
 - Nếu bài KHÔNG có mục chính hợp lệ => trả list_chunk rỗng [].
 
@@ -531,6 +534,345 @@ def _compute_chunks_from_start_head(items: List[Tuple[int, bool, str, str]], tot
             }
         )
     return computed
+
+
+_TESSERACT_BAD_TITLE_WORDS = (
+    "NHIEM VU", "CAU HOI", "BAI TAP", "LUYEN TAP", "VAN DUNG",
+    "HUONG DAN", "BUOC", "TIM HIEU", "HOAT DONG",
+)
+
+
+def _strip_accents_upper(text: Any) -> str:
+    import unicodedata
+
+    raw = _clean(text)
+    if not raw:
+        return ""
+    norm = unicodedata.normalize("NFD", raw)
+    norm = "".join(ch for ch in norm if unicodedata.category(ch) != "Mn")
+    norm = re.sub(r"\s+", " ", norm).strip()
+    return norm.upper()
+
+
+def _normalize_match_text(text: Any) -> str:
+    raw = _strip_accents_upper(text)
+    raw = re.sub(r"[^A-Z0-9 ]+", " ", raw)
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def _title_token_overlap(a: str, b: str) -> int:
+    ta = [tok for tok in _normalize_match_text(a).split() if len(tok) >= 2]
+    tb = [tok for tok in _normalize_match_text(b).split() if len(tok) >= 2]
+    if not ta or not tb:
+        return 0
+    sb = set(tb)
+    return sum(1 for tok in ta if tok in sb)
+
+
+def _looks_like_main_chunk_title(title: str) -> bool:
+    norm = _normalize_match_text(title)
+    if not norm:
+        return False
+    letters = [ch for ch in norm if "A" <= ch <= "Z"]
+    if len(letters) < 6:
+        return False
+    if len(norm.split()) < 3:
+        return False
+    if any(bad in norm for bad in _TESSERACT_BAD_TITLE_WORDS):
+        return False
+    return True
+
+
+def _parse_chunk_heading_line(text: str) -> Optional[Tuple[int, str]]:
+    norm = _strip_accents_upper(text).replace("|", "I")
+    norm = re.sub(r"\s+", " ", norm).strip()
+    m = re.match(r"^(\d+)\s*[.:-]\s*(.+)$", norm)
+    if not m:
+        return None
+    try:
+        heading_num = int(m.group(1))
+    except Exception:
+        return None
+    title = _clean(m.group(2))
+    if not _looks_like_main_chunk_title(title):
+        return None
+    return heading_num, title
+
+
+def _render_pdf_page_to_bgr(pdf_path: str, page_index: int, dpi: int = 220):
+    import fitz
+    import cv2
+    import numpy as np
+
+    doc = fitz.open(str(pdf_path))
+    try:
+        page = doc.load_page(max(0, int(page_index)))
+        zoom = float(dpi) / 72.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    finally:
+        doc.close()
+
+
+def _ocr_lines_tesseract(img_bgr) -> List[Dict[str, Any]]:
+    import cv2
+    import pytesseract
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    try:
+        data = pytesseract.image_to_data(gray, lang="eng", output_type=pytesseract.Output.DICT, config="--psm 6")
+    except Exception:
+        return []
+
+    n = len(data.get("text") or [])
+    grouped: Dict[Tuple[int, int, int], List[Tuple[int, int, int, int, str]]] = {}
+    for i in range(n):
+        txt = _clean((data.get("text") or [""])[i])
+        if not txt:
+            continue
+        conf_raw = str((data.get("conf") or [""])[i]).strip()
+        try:
+            conf = float(conf_raw)
+        except Exception:
+            conf = -1.0
+        if conf < 0:
+            continue
+        key = (
+            int((data.get("block_num") or [0])[i] or 0),
+            int((data.get("par_num") or [0])[i] or 0),
+            int((data.get("line_num") or [0])[i] or 0),
+        )
+        grouped.setdefault(key, []).append((
+            int((data.get("left") or [0])[i] or 0),
+            int((data.get("top") or [0])[i] or 0),
+            int((data.get("width") or [0])[i] or 0),
+            int((data.get("height") or [0])[i] or 0),
+            txt,
+        ))
+
+    lines: List[Dict[str, Any]] = []
+    for items in grouped.values():
+        items.sort(key=lambda row: row[0])
+        text = " ".join(part[4] for part in items).strip()
+        if not text:
+            continue
+        x0 = min(part[0] for part in items)
+        y0 = min(part[1] for part in items)
+        x1 = max(part[0] + part[2] for part in items)
+        y1 = max(part[1] + part[3] for part in items)
+        lines.append({"text": text, "x0": x0, "y0": y0, "x1": x1, "y1": y1})
+
+    lines.sort(key=lambda row: (row["y0"], row["x0"]))
+    return lines
+
+
+def _extract_chunk_items_via_tesseract(lesson_pdf: str, total_pages: int) -> List[Tuple[int, bool, str, str]]:
+    found: List[Tuple[int, bool, str, str, int]] = []
+    seen_nums = set()
+    for page_idx in range(total_pages):
+        try:
+            img = _render_pdf_page_to_bgr(lesson_pdf, page_idx)
+            lines = _ocr_lines_tesseract(img)
+        except Exception:
+            continue
+        if not lines:
+            continue
+        page_h = int(img.shape[0]) if getattr(img, "shape", None) is not None else 0
+        for line_idx, line in enumerate(lines):
+            parsed = _parse_chunk_heading_line(str(line.get("text") or ""))
+            if not parsed:
+                continue
+            heading_num, title = parsed
+            if heading_num in seen_nums:
+                continue
+
+            merged_title = title
+            if line_idx + 1 < len(lines):
+                next_text = _normalize_match_text(lines[line_idx + 1].get("text"))
+                gap = int(lines[line_idx + 1].get("y0") or 0) - int(line.get("y1") or 0)
+                line_h = max(1, int(line.get("y1") or 0) - int(line.get("y0") or 0))
+                if next_text and _looks_like_main_chunk_title(next_text) and gap <= max(40, line_h * 2):
+                    merged_title = f"{merged_title} {next_text}".strip()
+
+            y0 = int(line.get("y0") or 0)
+            content_head = False if not found else bool(page_h and y0 > int(page_h * 0.18))
+            found.append((page_idx + 1, content_head, f"{heading_num}.", merged_title, heading_num))
+            seen_nums.add(heading_num)
+            break
+
+    found.sort(key=lambda row: (row[0], row[4]))
+    return [(start, content_head, heading, title) for start, content_head, heading, title, _num in found]
+
+
+def _find_heading_line_via_tesseract(*, pdf_path: str, heading: str, title: str) -> Optional[Dict[str, Any]]:
+    heading_num = _extract_heading_number(heading)
+    if heading_num is None:
+        return None
+    try:
+        img = _render_pdf_page_to_bgr(pdf_path, 0)
+        lines = _ocr_lines_tesseract(img)
+    except Exception:
+        return None
+
+    best: Optional[Tuple[int, Dict[str, Any]]] = None
+    for line in lines:
+        parsed = _parse_chunk_heading_line(str(line.get("text") or ""))
+        if not parsed:
+            continue
+        cand_num, cand_title = parsed
+        if cand_num != heading_num:
+            continue
+        score = _title_token_overlap(cand_title, title)
+        payload = dict(line)
+        payload["parsed_title"] = cand_title
+        if best is None or score > best[0] or (score == best[0] and int(payload.get("y0") or 0) < int(best[1].get("y0") or 0)):
+            best = (score, payload)
+
+    if best is not None:
+        return best[1]
+
+    for line in lines:
+        norm = _strip_accents_upper(line.get("text")).replace("|", "I")
+        norm = re.sub(r"\s+", " ", norm).strip()
+        if re.match(rf"^{heading_num}\s*[.:-]\s+", norm):
+            return dict(line)
+    return None
+
+
+def _fit_rect_on_page(page_rect, img_w: int, img_h: int, align: str = "top"):
+    pw = float(page_rect.width)
+    ph = float(page_rect.height)
+    scale = min(pw / max(1.0, float(img_w)), ph / max(1.0, float(img_h)))
+    draw_w = float(img_w) * scale
+    draw_h = float(img_h) * scale
+    x0 = (pw - draw_w) / 2.0
+    y0 = 0.0 if align == "top" else (ph - draw_h) / 2.0
+    return (x0, y0, x0 + draw_w, y0 + draw_h)
+
+
+def _replace_pdf_page_with_bgr_image(pdf_path: str, page_index: int, img_bgr, *, align: str = "top") -> None:
+    import cv2
+    import fitz
+
+    ok, enc = cv2.imencode(".png", img_bgr)
+    if not ok:
+        raise RuntimeError("Không mã hoá được ảnh PNG để cập nhật PDF")
+    image_bytes = enc.tobytes()
+
+    src = fitz.open(str(pdf_path))
+    out = fitz.open()
+    try:
+        for idx in range(len(src)):
+            rect = src[idx].rect
+            page = out.new_page(width=rect.width, height=rect.height)
+            if idx == int(page_index):
+                h, w = img_bgr.shape[:2]
+                draw_rect = _fit_rect_on_page(rect, int(w), int(h), align=align)
+                page.insert_image(draw_rect, stream=image_bytes)
+            else:
+                page.show_pdf_page(rect, src, idx)
+        fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        out.save(tmp_path)
+    finally:
+        out.close()
+        src.close()
+    os.replace(tmp_path, str(pdf_path))
+
+
+def _infer_prev_chunk_pdf_path(cur_chunk_pdf: str) -> Optional[str]:
+    cur_path = Path(cur_chunk_pdf)
+    m = re.search(r"chunk_(\d+)$", cur_path.parent.name, re.I)
+    if not m:
+        return None
+    idx = int(m.group(1))
+    if idx <= 1:
+        return None
+    prev_name = f"chunk_{idx-1:02d}"
+    prev_dir = cur_path.parent.parent / prev_name
+    prev_pdf = prev_dir / cur_path.name.replace(cur_path.parent.name, prev_name)
+    if prev_pdf.exists():
+        return str(prev_pdf)
+    alt = sorted(prev_dir.glob("*.pdf"))
+    return str(alt[0]) if alt else None
+
+
+def _apply_tesseract_cutline_fallback(*, chunk_pdf_path: str, chunk_meta_path: str, out_dir: Path) -> Optional[Dict[str, Any]]:
+    import cv2
+
+    meta = json.loads(Path(chunk_meta_path).read_text(encoding="utf-8"))
+    heading = _clean(meta.get("heading"))
+    title = _clean(meta.get("title"))
+    heading_num = _extract_heading_number(heading)
+    if heading_num is None:
+        return None
+
+    line = _find_heading_line_via_tesseract(pdf_path=chunk_pdf_path, heading=heading, title=title)
+    if not line:
+        return None
+
+    img = _render_pdf_page_to_bgr(chunk_pdf_path, 0)
+    h, w = img.shape[:2]
+    y_line = max(0, min(int(line.get("y0") or 0) - 10, h - 1))
+    top_img = img[:y_line, :].copy() if y_line > 0 else None
+    bot_img = img[y_line:, :].copy() if y_line < h else None
+
+    if bot_img is None or bot_img.size == 0:
+        return None
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(chunk_pdf_path).stem
+    debug_png = out_dir / f"{stem}_cutline.png"
+    top_png = out_dir / f"{stem}_cutline_top.png"
+    bot_png = out_dir / f"{stem}_cutline_bot.png"
+    cut_json = out_dir / f"{stem}_cutline.json"
+
+    debug_img = img.copy()
+    cv2.line(debug_img, (0, y_line), (w - 1, y_line), (0, 0, 255), 3)
+    cv2.imwrite(str(debug_png), debug_img)
+
+    is_content_head = bool(meta.get("content_head", False))
+    pdf_update: Dict[str, Any] = {"mode": "tesseract"}
+
+    if is_content_head and top_img is not None and top_img.size > 0:
+        cv2.imwrite(str(top_png), top_img)
+        cv2.imwrite(str(bot_png), bot_img)
+        prev_pdf = _infer_prev_chunk_pdf_path(chunk_pdf_path)
+        if prev_pdf and os.path.exists(prev_pdf):
+            prev_total = len(PdfReader(prev_pdf).pages)
+            _replace_pdf_page_with_bgr_image(prev_pdf, max(0, prev_total - 1), top_img, align="top")
+            pdf_update["prev_chunk_pdf"] = prev_pdf
+        _replace_pdf_page_with_bgr_image(chunk_pdf_path, 0, bot_img, align="top")
+        mode = "content_head"
+    else:
+        cv2.imwrite(str(bot_png), bot_img)
+        _replace_pdf_page_with_bgr_image(chunk_pdf_path, 0, bot_img, align="top")
+        mode = "heading_bot_only"
+
+    payload = {
+        "chunk_json": str(Path(chunk_meta_path).resolve()),
+        "chunk_pdf": str(Path(chunk_pdf_path).resolve()),
+        "heading": heading,
+        "heading_num": int(heading_num),
+        "title": title,
+        "y_line": int(y_line),
+        "line_bbox": {"x0": int(line.get("x0") or 0), "y0": int(line.get("y0") or 0), "x1": int(line.get("x1") or 0), "y1": int(line.get("y1") or 0)},
+        "image_size": {"w": int(w), "h": int(h)},
+        "best_mode": "tesseract_fallback",
+        "mode": mode,
+        "run_mode": mode,
+        "failed": False,
+        "soft_fail": False,
+        "weak_cut": False,
+        "manual_override": False,
+        "debug_png": str(debug_png),
+        "top_png": str(top_png) if top_png.exists() else "",
+        "bot_png": str(bot_png) if bot_png.exists() else "",
+        "pdf_update": pdf_update,
+    }
+    cut_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
 
 
 def _load_chunk_postprocess_module():
@@ -649,14 +991,27 @@ def _extract_chunks_for_lesson_pdf(
     total_pages = len(PdfReader(lesson_pdf).pages)
     raw = _gemini_extract_pdf(pdf_path=lesson_pdf, prompt=_build_chunk_prompt(total_pages), model=model)
     items = _flatten_chunk_start_head(raw.get("list_chunk") or [])
+    tesseract_items: List[Tuple[int, bool, str, str]] = []
+    should_try_tesseract = (
+        (not items)
+        or (len(items) <= 1 and total_pages > 1)
+        or all((not _clean(h) and not _clean(t)) for _s, _ch, h, t in items)
+    )
+    if should_try_tesseract:
+        try:
+            tesseract_items = _extract_chunk_items_via_tesseract(lesson_pdf, total_pages)
+        except Exception:
+            tesseract_items = []
+        if tesseract_items and (len(tesseract_items) > len(items) or not items):
+            items = tesseract_items
     computed = _compute_chunks_from_start_head(items, total_pages)
 
     chunk_root = Path(temp_dir) / "chunks"
     lesson_chunk_dir = chunk_root / lesson_name
     lesson_chunk_dir.mkdir(parents=True, exist_ok=True)
-    outputs: List[Dict[str, Any]] = []
 
-    for idx, item in enumerate(computed, start=1):
+    split_rows: List[Dict[str, Any]] = []
+    for item in computed:
         chunk_name, obj = next(iter(item.items()))
         start = int(obj.get("start") or 1)
         end = int(obj.get("end") or start)
@@ -665,6 +1020,7 @@ def _extract_chunks_for_lesson_pdf(
         paths = _split_pdf_by_ranges(lesson_pdf, [(chunk_name, start, end)], chunk_dir, lesson_name)
         if not paths:
             continue
+
         chunk_pdf_path = paths[0]
         chunk_meta_path = chunk_pdf_path.with_suffix('.json')
         payload = {
@@ -681,6 +1037,26 @@ def _extract_chunks_for_lesson_pdf(
         }
         chunk_meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
 
+        split_rows.append({
+            'chunk_name': chunk_name,
+            'obj': obj,
+            'start': start,
+            'end': end,
+            'chunk_dir': chunk_dir,
+            'chunk_pdf_path': chunk_pdf_path,
+            'chunk_meta_path': chunk_meta_path,
+        })
+
+    outputs: List[Dict[str, Any]] = []
+    for row in split_rows:
+        chunk_name = row['chunk_name']
+        obj = row['obj']
+        start = row['start']
+        end = row['end']
+        chunk_dir = row['chunk_dir']
+        chunk_pdf_path = row['chunk_pdf_path']
+        chunk_meta_path = row['chunk_meta_path']
+
         debug_dir = chunk_dir / 'DebugCutlines'
         cut_payload = None
         cut_error = None
@@ -693,6 +1069,7 @@ def _extract_chunks_for_lesson_pdf(
             )
         except Exception as exc:
             cut_error = str(exc)
+            print(f"[CUTLINE ERROR] {chunk_meta_path.name} => {exc}")
 
         cut_json = debug_dir / f"{chunk_pdf_path.stem}_cutline.json"
         if cut_payload is None and cut_json.exists():
@@ -701,9 +1078,24 @@ def _extract_chunks_for_lesson_pdf(
             except Exception:
                 pass
 
+        if cut_payload is None:
+            try:
+                cut_payload = _apply_tesseract_cutline_fallback(
+                    chunk_pdf_path=str(chunk_pdf_path),
+                    chunk_meta_path=str(chunk_meta_path),
+                    out_dir=debug_dir,
+                )
+                if cut_payload:
+                    cut_error = ""
+            except Exception as exc:
+                if not cut_error:
+                    cut_error = str(exc)
+
         weak = False
         failed = False
         reason = cut_error or ""
+        if cut_error:
+            print(f"[CUTLINE FALLBACK] {chunk_meta_path.name} => {cut_error}")
         y_line = None
         debug_png = ""
         top_png = ""
