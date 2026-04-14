@@ -1600,6 +1600,8 @@ def _build_chunk_items(
             "chunkNumber": neo_base.get("chunkNumber") if neo_base.get("chunkNumber") is not None else pg_base.get("chunkNumber"),
             "chunkUrl": (chunk_doc.get("chunkUrl") if chunk_doc else None),
             "chunkDescription": (chunk_doc.get("chunkDescription") if chunk_doc else None),
+            "createdAt": (chunk_doc.get("createdAt") if chunk_doc else None),
+            "updatedAt": (chunk_doc.get("updatedAt") if chunk_doc else None),
             "keywords": _read_keywords_from_chunk_doc(chunk_doc),
             "matchedKeywords": matched_kw,
             "images": images,

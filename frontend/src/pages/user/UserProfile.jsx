@@ -222,15 +222,26 @@ export default function UserProfile() {
     setSuccess("");
   }
 
-  function removeAvatar() {
-    revokeLocalPreview();
-    setAvatarFile(null);
-    setAvatarRemoved(Boolean(sessionProfile.avatar || form.avatar));
-    updateField("avatar", "");
-    if (fileInputRef.current) fileInputRef.current.value = "";
-    setError("");
+function removeAvatar() {
+  const hasAvatar = Boolean(sessionProfile.avatar || form.avatar || avatarFile);
+  if (!hasAvatar) {
+    setError("Hiện tại chưa có ảnh đại diện để xóa.");
     setSuccess("");
+    return;
   }
+
+  if (!window.confirm("Bạn có chắc chắn muốn xóa avatar không?")) {
+    return;
+  }
+
+  revokeLocalPreview();
+  setAvatarFile(null);
+  setAvatarRemoved(Boolean(sessionProfile.avatar || form.avatar));
+  updateField("avatar", "");
+  if (fileInputRef.current) fileInputRef.current.value = "";
+  setError("");
+  setSuccess("");
+}
 
   async function parseJsonResponse(response, fallbackMessage) {
     const data = await response.json().catch(() => ({}));
@@ -264,13 +275,17 @@ export default function UserProfile() {
       return;
     }
 
-    if (!changed) {
-      setSuccess("Chưa có thay đổi nào để lưu.");
-      return;
-    }
+  if (!changed) {
+    setSuccess("Chưa có thay đổi nào để lưu.");
+    return;
+  }
 
-    setIsSaving(true);
-    let textProfile = null;
+  if (!window.confirm("Bạn có chắc chắn muốn xác nhận các thay đổi không?")) {
+    return;
+  }
+
+setIsSaving(true);
+let textProfile = null;
 
     try {
       const profilePayload = {

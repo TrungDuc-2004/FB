@@ -1,8 +1,12 @@
 .user-profile-page {
+  --brand-primary: var(--user-shell-accent);
+  --brand-primary-dark: #0d3657;
+  --brand-primary-soft: var(--user-shell-accent-soft);
+  --brand-highlight: var(--user-shell-highlight);
+
   display: grid;
   gap: 18px;
 }
-
 .user-profile-head {
   border: 1px solid rgba(15, 23, 42, 0.08);
   border-radius: 24px;

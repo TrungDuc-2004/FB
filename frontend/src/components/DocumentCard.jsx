@@ -119,9 +119,9 @@ function getCoverText(kind) {
 
 function getPreviewImage(doc) {
   const kind = getItemType(doc);
-  if (kind === "image" && safeText(doc?.chunkUrl)) return safeText(doc.chunkUrl);
-  const firstImage = safeArray(doc?.images).find((item) => safeText(item?.url));
-  if (firstImage?.url) return firstImage.url;
+  if (kind === "image" && safeText(doc?.chunkUrl)) {
+    return safeText(doc.chunkUrl);
+  }
   return "";
 }
 
