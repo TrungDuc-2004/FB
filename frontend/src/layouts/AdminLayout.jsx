@@ -21,6 +21,7 @@ export default function AdminLayout() {
       showSidebarUser={false}
       topbarTitle="TRANG QUẢN TRỊ"
       accountInfoTitle="Tài khoản"
+      shellClassName="admin-shell"
     />
   );
 }

@@ -699,6 +699,7 @@ export default function DashboardShell({
   const resolvedBrandSubtitle =
     brandSubtitle || (role === "admin" ? "Data Management" : "Tra cứu tài liệu");
   const subtitle = routeTitleFromNav(location.pathname, navItems);
+  const isAdminShell = shellClassName.split(" ").includes("admin-shell");
 
   function logout() {
     localStorage.removeItem("role");
@@ -782,6 +783,13 @@ export default function DashboardShell({
           </div>
 
           <div className="topbar-right">
+            {isAdminShell ? (
+              <div className="topbar-status-chip" aria-hidden="true">
+                <span className="pulse-dot" />
+                <span>Admin Portal</span>
+              </div>
+            ) : null}
+
             <button
               className={`icon-btn account-btn ${accountOpen ? "open" : ""}`}
               type="button"
