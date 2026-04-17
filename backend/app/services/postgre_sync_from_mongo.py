@@ -71,6 +71,24 @@ def _get_pk_by_mongo(conn, table: str, pk_col: str, mongo_id: str) -> Optional[s
     return row[0] if row else None
 
 
+
+
+def _extract_chunk_type(chunk_doc: Optional[dict] = None, lesson_doc: Optional[dict] = None) -> Optional[str]:
+    """Lấy chunk_type với fallback rộng hơn để tránh mất dữ liệu khi sync sang PostgreSQL."""
+    chunk_doc = chunk_doc or {}
+    lesson_doc = lesson_doc or {}
+    for value in (
+        chunk_doc.get("chunkType"),
+        chunk_doc.get("chunk_type"),
+        chunk_doc.get("type"),
+        lesson_doc.get("lessonType"),
+        lesson_doc.get("lesson_type"),
+    ):
+        clean = _clean(value)
+        if clean:
+            return clean
+    return None
+
 def _get_keywords_for_chunk(db, *, chunk_map: str, chunk_doc: Optional[dict] = None) -> List[dict]:
     """Lấy keyword theo chuẩn mới: collection `keywords`.
 
@@ -487,7 +505,7 @@ def sync_postgre_from_mongo_ids(
     topic_name = _clean(t_doc.get("topicName"))
     lesson_name = _clean(l_doc.get("lessonName"))
     chunk_name = _clean(ch_doc.get("chunkName"))
-    chunk_type = _clean(ch_doc.get("chunkType"))
+    chunk_type = _extract_chunk_type(ch_doc, l_doc)
 
     topic_map = _clean(t_doc.get("topicID"))
     lesson_map = _clean(l_doc.get("lessonID"))
@@ -717,7 +735,7 @@ def sync_postgre_from_mongo_maps(
     topic_name = _clean((topic_doc or {}).get("topicName")) or topic_id
     lesson_name = _clean((lesson_doc or {}).get("lessonName")) or lesson_id
     chunk_name = _clean((chunk_doc or {}).get("chunkName")) or chunk_id
-    chunk_type = _clean((chunk_doc or {}).get("chunkType"))
+    chunk_type = _extract_chunk_type(chunk_doc, lesson_doc)
 
     mongo_class_id = str((class_doc or {}).get("_id")) if class_doc else None
     mongo_subject_id = str((subject_doc or {}).get("_id")) if subject_doc else None
@@ -912,7 +930,7 @@ def sync_postgre_from_mongo_auto_ids(
     topic_name = _clean((topic_doc or {}).get("topicName")) or (topic_map or "")
     lesson_name = _clean((lesson_doc or {}).get("lessonName")) or (lesson_map or "")
     chunk_name = _clean((chunk_doc or {}).get("chunkName")) or (chunk_map or "")
-    chunk_type = _clean((chunk_doc or {}).get("chunkType"))
+    chunk_type = _extract_chunk_type(chunk_doc, lesson_doc)
 
     mongo_class_id = str((class_doc or {}).get("_id")) if class_doc else None
     mongo_subject_id = str((subject_doc or {}).get("_id")) if subject_doc else None

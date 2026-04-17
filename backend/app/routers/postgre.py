@@ -12,8 +12,10 @@ Endpoints chính:
 
 from __future__ import annotations
 
+import csv
 import io
-from datetime import datetime, timezone
+import zipfile
+from datetime import date, datetime, time, timezone
 from pathlib import Path as FilePath
 from typing import Any, Dict, List, Tuple, Annotated
 from urllib.parse import parse_qs, quote_plus, urlparse
@@ -21,6 +23,7 @@ from uuid import uuid4
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, UploadFile, File, Form, Body
+from fastapi.responses import StreamingResponse
 from fastapi.encoders import jsonable_encoder
 from minio.error import S3Error
 from pydantic import BaseModel
@@ -871,6 +874,87 @@ def _get_model(table_name: str):
     return TABLE_MODEL_MAP[table_name]
 
 
+def _allowed_existing_tables(db: Session) -> List[str]:
+    inspector = inspect(db.bind)
+    existing = set(inspector.get_table_names(schema="public"))
+    return [t for t in TABLE_MODEL_MAP.keys() if t in existing]
+
+
+def _format_export_scalar(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, (list, tuple, dict)):
+        return jsonable_encoder(value)
+    return value
+
+
+def _sql_escape_string(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def _sql_literal(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (datetime, date, time)):
+        return f"'{_sql_escape_string(value.isoformat())}'"
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return "'{}'"
+        return "ARRAY[" + ", ".join(_sql_literal(v) for v in value) + "]"
+    return f"'{_sql_escape_string(str(value))}'"
+
+
+def _table_csv_bytes(db: Session, table_name: str, model) -> bytes:
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    columns = [col.name for col in model.__table__.columns]
+    writer.writerow(columns)
+
+    rows = db.query(model).all()
+    for row in rows:
+        writer.writerow([_format_export_scalar(getattr(row, col)) for col in columns])
+
+    return output.getvalue().encode("utf-8-sig")
+
+
+def _table_sql_text(db: Session, table_name: str, model) -> str:
+    columns = [col.name for col in model.__table__.columns]
+    rows = db.query(model).all()
+
+    lines = [
+        f"-- Export table: {table_name}",
+        f"-- Generated at: {_now_utc().isoformat()}",
+        "",
+    ]
+
+    if not rows:
+        lines.append(f"-- Table '{table_name}' has no rows.")
+        lines.append("")
+        return "\n".join(lines)
+
+    quoted_columns = ", ".join(f'"{col}"' for col in columns)
+    for row in rows:
+        values_sql = ", ".join(_sql_literal(getattr(row, col)) for col in columns)
+        lines.append(f'INSERT INTO "{table_name}" ({quoted_columns}) VALUES ({values_sql});')
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _download_response(body: bytes, filename: str, media_type: str) -> StreamingResponse:
+    return StreamingResponse(
+        io.BytesIO(body),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 
 def _pk_cols(model) -> List[str]:
     return [c.name for c in model.__table__.primary_key.columns]
@@ -950,6 +1034,83 @@ def list_rows(
         "count": len(rows),
         "rows": [_row_to_dict(model, r) for r in rows],
     }
+
+
+@router.get("/export", summary="Export all allowed PostgreSQL tables as CSV ZIP or SQL")
+def export_all_tables(
+    format: str = Query("csv", description="csv | sql"),
+    db: db_dependency = None,
+):
+    export_format = (format or "csv").strip().lower()
+    if export_format not in {"csv", "sql"}:
+        raise HTTPException(status_code=422, detail="format must be 'csv' or 'sql'")
+
+    tables = _allowed_existing_tables(db)
+    if not tables:
+        raise HTTPException(status_code=404, detail="Không có bảng PostgreSQL nào để export")
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if export_format == "csv":
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for table_name in tables:
+                model = _get_model(table_name)
+                zf.writestr(f"{table_name}.csv", _table_csv_bytes(db, table_name, model))
+
+        return _download_response(
+            buffer.getvalue(),
+            filename=f"postgres_all_tables_{stamp}.zip",
+            media_type="application/zip",
+        )
+
+    sections = [
+        "-- PostgreSQL data-only export",
+        f"-- Generated at: {_now_utc().isoformat()}",
+        "BEGIN;",
+        "",
+    ]
+    for table_name in tables:
+        model = _get_model(table_name)
+        sections.append(_table_sql_text(db, table_name, model))
+    sections.append("COMMIT;\n")
+
+    return _download_response(
+        "\n".join(sections).encode("utf-8"),
+        filename=f"postgres_all_tables_{stamp}.sql",
+        media_type="application/sql",
+    )
+
+
+@router.get("/tables/{table_name}/export", summary="Export one PostgreSQL table as CSV or SQL")
+def export_table(
+    table_name: str = Path(...),
+    format: str = Query("csv", description="csv | sql"),
+    db: db_dependency = None,
+):
+    export_format = (format or "csv").strip().lower()
+    if export_format not in {"csv", "sql"}:
+        raise HTTPException(status_code=422, detail="format must be 'csv' or 'sql'")
+
+    model = _get_model(table_name)
+    allowed_tables = set(_allowed_existing_tables(db))
+    if table_name not in allowed_tables:
+        raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found in PostgreSQL")
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if export_format == "csv":
+        return _download_response(
+            _table_csv_bytes(db, table_name, model),
+            filename=f"{table_name}_{stamp}.csv",
+            media_type="text/csv; charset=utf-8",
+        )
+
+    return _download_response(
+        _table_sql_text(db, table_name, model).encode("utf-8"),
+        filename=f"{table_name}_{stamp}.sql",
+        media_type="application/sql",
+    )
 
 
 @router.get("/tables/{table_name}/rows/{pk}", summary="Get one row by PK (read-only)")

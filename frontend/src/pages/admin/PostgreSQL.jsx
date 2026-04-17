@@ -32,8 +32,11 @@ export default function PostgreSQL() {
   const [tables, setTables] = useState([]); // [{id,name}]
   const [rows, setRows] = useState([]); // raw rows from API
   const [totalRows, setTotalRows] = useState(0);
+  const [selectedRow, setSelectedRow] = useState(null);
+  const [loadingRowDetail, setLoadingRowDetail] = useState(false);
 
   const [err, setErr] = useState("");
+  const [exporting, setExporting] = useState("");
 
   const isRoot = currentTable === "";
   const isRowDetail = !!currentPk;
@@ -61,6 +64,25 @@ export default function PostgreSQL() {
       setErr(String(e?.message || e));
       setRows([]);
       setTotalRows(0);
+    }
+  }
+
+  async function reloadSelectedRow(tableName, pk) {
+    if (!tableName || !pk) {
+      setSelectedRow(null);
+      return;
+    }
+
+    setLoadingRowDetail(true);
+    setErr("");
+    try {
+      const data = await pgApi.getRow(tableName, pk);
+      setSelectedRow(data?.row || data || null);
+    } catch (e) {
+      setErr(String(e?.message || e));
+      setSelectedRow(null);
+    } finally {
+      setLoadingRowDetail(false);
     }
   }
 
@@ -92,14 +114,33 @@ export default function PostgreSQL() {
     };
   }, [currentTable]);
 
+  useEffect(() => {
+    if (!currentTable || !currentPk) {
+      setSelectedRow(null);
+      setLoadingRowDetail(false);
+      return undefined;
+    }
+
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      if (cancelled) return;
+      await reloadSelectedRow(currentTable, currentPk);
+    }, 0);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [currentTable, currentPk]);
+
   const headerTitle = useMemo(() => {
     if (isRoot) return "Dữ liệu có cấu trúc";
     if (isRowDetail) {
-      const r = rows.find((x) => String(x._pk) === String(currentPk)) || null;
-      return rowTitle(r) || String(currentPk);
+      const fallbackRow = rows.find((x) => String(x._pk) === String(currentPk)) || null;
+      return rowTitle(selectedRow || fallbackRow) || String(currentPk);
     }
     return currentTable;
-  }, [isRoot, isRowDetail, currentTable, currentPk, rows]);
+  }, [isRoot, isRowDetail, currentTable, currentPk, rows, selectedRow]);
 
   const breadcrumbParts = useMemo(() => {
     if (isRoot) return [];
@@ -121,6 +162,31 @@ export default function PostgreSQL() {
     setCurrentTable(row.name);
     setCurrentPk("");
     setQ("");
+  }
+
+  async function handleExportAll(format) {
+    setErr("");
+    setExporting(`all-${format}`);
+    try {
+      await pgApi.exportAll(format);
+    } catch (e) {
+      setErr(String(e?.message || e));
+    } finally {
+      setExporting("");
+    }
+  }
+
+  async function handleExportTable(format) {
+    if (!currentTable) return;
+    setErr("");
+    setExporting(`table-${format}`);
+    try {
+      await pgApi.exportTable(currentTable, format);
+    } catch (e) {
+      setErr(String(e?.message || e));
+    } finally {
+      setExporting("");
+    }
   }
 
   // ===== Root: tables =====
@@ -162,11 +228,6 @@ export default function PostgreSQL() {
   }, [rows, q]);
 
   // ===== Detail: selected row =====
-  const selectedRow = useMemo(() => {
-    if (!currentTable || !currentPk) return null;
-    return rows.find((r) => String(r._pk) === String(currentPk)) || null;
-  }, [rows, currentTable, currentPk]);
-
   const fieldRows = useMemo(() => {
     if (!selectedRow) return [];
     const out = [];
@@ -311,10 +372,46 @@ export default function PostgreSQL() {
           </div>
 
           <span className="crumb" style={{ opacity: 0.7 }}>
-            View only
+            {isRowDetail && loadingRowDetail ? "Đang tải chi tiết..." : "View only"}
           </span>
 
-          <div className="header-actions" />
+          <div className="header-actions">
+            {isRoot ? (
+              <>
+                <button
+                  className="btn"
+                  onClick={() => handleExportAll("csv")}
+                  disabled={!!exporting}
+                >
+                  {exporting === "all-csv" ? "Đang export..." : "Export tất cả CSV"}
+                </button>
+                <button
+                  className="btn btn-primary"
+                  onClick={() => handleExportAll("sql")}
+                  disabled={!!exporting}
+                >
+                  {exporting === "all-sql" ? "Đang export..." : "Export tất cả SQL"}
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  className="btn"
+                  onClick={() => handleExportTable("csv")}
+                  disabled={!!exporting}
+                >
+                  {exporting === "table-csv" ? "Đang export..." : "Export bảng CSV"}
+                </button>
+                <button
+                  className="btn btn-primary"
+                  onClick={() => handleExportTable("sql")}
+                  disabled={!!exporting}
+                >
+                  {exporting === "table-sql" ? "Đang export..." : "Export bảng SQL"}
+                </button>
+              </>
+            )}
+          </div>
         </div>
       </div>
 

@@ -47,3 +47,46 @@ export function updateRow(tableName, pk, payload) {
     body: JSON.stringify(payload),
   });
 }
+
+function getFilenameFromContentDisposition(value = "") {
+  const utf8Match = value.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) return decodeURIComponent(utf8Match[1]);
+
+  const plainMatch = value.match(/filename="?([^";]+)"?/i);
+  if (plainMatch?.[1]) return plainMatch[1];
+
+  return "download";
+}
+
+async function downloadFile(url) {
+  const res = await fetch(url, { method: "GET" });
+
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data?.detail || "Download failed");
+  }
+
+  const blob = await res.blob();
+  const filename = getFilenameFromContentDisposition(res.headers.get("Content-Disposition") || "");
+  const objectUrl = window.URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(objectUrl);
+}
+
+export function exportAll(format = "csv") {
+  const url = new URL(`${API_BASE}/admin/postgre/export`);
+  url.searchParams.set("format", format);
+  return downloadFile(url.toString());
+}
+
+export function exportTable(tableName, format = "csv") {
+  const t = encodeURIComponent(tableName);
+  const url = new URL(`${API_BASE}/admin/postgre/tables/${t}/export`);
+  url.searchParams.set("format", format);
+  return downloadFile(url.toString());
+}

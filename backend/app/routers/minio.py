@@ -2460,6 +2460,39 @@ def _slug_filename(text: str, fallback: str) -> str:
     return base or fallback
 
 
+def _display_filename_base(text: str, fallback: str) -> str:
+    base = _clean(text) or _clean(fallback)
+    if not base:
+        base = "file"
+    base = re.sub(r'[\/:*?"<>|]+', ' ', base)
+    base = re.sub(r'\s+', ' ', base).strip().strip('.')
+    return base or (_clean(fallback) or 'file')
+
+
+def _display_pdf_filename(text: str, fallback: str) -> str:
+    base = _display_filename_base(text, fallback)
+    if base.lower().endswith('.pdf'):
+        return base
+    return f"{base}.pdf"
+
+
+def _reserve_batch_filename(used_by_folder: Dict[str, Set[str]], folder: str, desired_filename: str) -> str:
+    used = used_by_folder.setdefault(folder, set())
+    candidate = desired_filename.strip() or 'file.pdf'
+    if candidate not in used:
+        used.add(candidate)
+        return candidate
+
+    stem, ext = os.path.splitext(candidate)
+    counter = 2
+    while True:
+        alt = f"{stem} ({counter}){ext}"
+        if alt not in used:
+            used.add(alt)
+            return alt
+        counter += 1
+
+
 def _next_topic_number(subject_map: str) -> int:
     try:
         db = get_mongo_client()["db"]
@@ -2876,15 +2909,22 @@ def _approve_auto_review_session(
 
     approved_dir = tempfile.mkdtemp(prefix='auto_review_approve_')
     tasks: List[Dict[str, Any]] = []
+    used_display_filenames: Dict[str, Set[str]] = {}
     dirty_lessons: Set[str] = set()
     dirty_topics: Set[str] = set()
     dirty_subjects: Set[str] = {subject_map} if subject_map else set()
 
     if mode == 'subject':
+        subject_folder = f"{root_path}/subjects"
+        subject_filename = _reserve_batch_filename(
+            used_display_filenames,
+            subject_folder,
+            _display_pdf_filename(subject_stem, subject_map),
+        )
         tasks.append({
-            'folder': f"{root_path}/subjects",
+            'folder': subject_folder,
             'file_path': source_pdf,
-            'filename': f"{_slug_filename(subject_map, subject_map)}.pdf",
+            'filename': subject_filename,
             'meta': {
                 'folderType': 'subject',
                 'classMap': class_map,
@@ -2911,14 +2951,21 @@ def _approve_auto_review_session(
                 _split_single_pdf(source_pdf, int(topic.get('start') or 1), int(topic.get('end') or topic.get('start') or 1), str(topic_file))
             topic_file_map[_clean(topic.get('reviewId'))] = str(topic_file)
             dirty_topics.add(topic_map)
+            topic_folder = f"{root_path}/topics"
+            topic_title = _clean(topic.get('title')) or _clean(topic.get('heading')) or _clean(topic.get('name')) or topic_map
+            topic_filename = _reserve_batch_filename(
+                used_display_filenames,
+                topic_folder,
+                _display_pdf_filename(topic_title, topic_map),
+            )
             tasks.append({
-                'folder': f"{root_path}/topics",
+                'folder': topic_folder,
                 'file_path': str(topic_file),
-                'filename': f"{_slug_filename(topic_map, topic_map)}.pdf",
+                'filename': topic_filename,
                 'meta': {
                     'folderType': 'topic', 'classMap': class_map, 'subjectMap': subject_map, 'topicMap': topic_map,
-                    'topicName': _clean(topic.get('title')) or _clean(topic.get('heading')) or topic_map,
-                    'name': _clean(topic.get('title')) or topic_map,
+                    'topicName': topic_title,
+                    'name': topic_title,
                 },
             })
 
@@ -2955,16 +3002,23 @@ def _approve_auto_review_session(
         lesson_file_map[_clean(lesson.get('reviewId'))] = str(lesson_file)
         dirty_lessons.add(lesson_map)
         dirty_topics.add(topic_map)
+        lesson_folder = f"{root_path}/lessons"
+        lesson_title = _clean(lesson.get('title')) or _clean(lesson.get('heading')) or _clean(lesson.get('name')) or lesson_map
+        lesson_filename = _reserve_batch_filename(
+            used_display_filenames,
+            lesson_folder,
+            _display_pdf_filename(lesson_title, lesson_map),
+        )
         tasks.append({
-            'folder': f"{root_path}/lessons",
+            'folder': lesson_folder,
             'file_path': str(lesson_file),
-            'filename': f"{_slug_filename(lesson_map, lesson_map)}.pdf",
+            'filename': lesson_filename,
             'meta': {
                 'folderType': 'lesson', 'classMap': class_map, 'subjectMap': subject_map, 'topicMap': topic_map,
                 'lessonMap': lesson_map,
                 'topicName': topic_map,
-                'lessonName': _clean(lesson.get('title')) or _clean(lesson.get('heading')) or lesson_map,
-                'name': _clean(lesson.get('title')) or lesson_map,
+                'lessonName': lesson_title,
+                'name': lesson_title,
             },
         })
 
@@ -3017,18 +3071,25 @@ def _approve_auto_review_session(
             except Exception:
                 pass
             lesson_map = lesson_map_by_review.get(lesson_review_id, '')
+            chunk_folder = f"{root_path}/chunks"
+            chunk_title = _clean(chunk.get('title')) or _clean(chunk.get('heading')) or _clean(chunk.get('name')) or f"{lesson_map}_C{cidx}"
+            chunk_filename = _reserve_batch_filename(
+                used_display_filenames,
+                chunk_folder,
+                _display_pdf_filename(chunk_title, f"{lesson_map}_C{cidx}"),
+            )
             tasks.append({
-                'folder': f"{root_path}/chunks",
+                'folder': chunk_folder,
                 'file_path': str(chunk_pdf),
-                'filename': f"{_slug_filename(lesson_map + '_C' + str(cidx), lesson_map + '_C' + str(cidx))}.pdf",
+                'filename': chunk_filename,
                 'meta': {
                     'folderType': 'chunk', 'classMap': class_map, 'subjectMap': subject_map,
                     'topicMap': lesson_map.rsplit('_B', 1)[0] if '_B' in lesson_map else '',
                     'lessonMap': lesson_map,
                     'chunkMap': f"{lesson_map}_C{cidx}",
                     'lessonName': _clean((lesson_meta_item or {}).get('title')) or lesson_map,
-                    'chunkName': _clean(chunk.get('title')) or _clean(chunk.get('heading')) or f"{lesson_map}_C{cidx}",
-                    'name': _clean(chunk.get('title')) or f"{lesson_map}_C{cidx}",
+                    'chunkName': chunk_title,
+                    'name': chunk_title,
                 },
             })
 

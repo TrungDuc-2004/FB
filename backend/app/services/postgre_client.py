@@ -25,10 +25,13 @@ def _load_env() -> None:
     """Load env from common locations (first match wins)."""
     # backend/app/services -> parents[2] == backend/
     base_dir = Path(__file__).resolve().parents[2]
+    project_root = base_dir.parent
     for env_path in (
         base_dir / "core" / "config.env",
         base_dir / ".env",
+        project_root / ".env",
         base_dir / "core" / "config.env.example",
+        project_root / ".env.example",
     ):
         if env_path.exists():
             load_dotenv(env_path)
@@ -49,11 +52,11 @@ def get_engine() -> Engine:
     if _engine is None:
         _load_env()
 
-        host = os.getenv("PG_HOST", "127.0.0.1")
+        host = os.getenv("PG_HOST", "localhost")
         port = os.getenv("PG_PORT", "5432")
         user = os.getenv("PG_USER", "postgres")
-        password = os.getenv("PG_PASSWORD", "")  # allow empty password in dev
-        name = os.getenv("PG_NAME", "Data")
+        password = os.getenv("PG_PASSWORD", "12345678")  # allow empty password in dev
+        name = os.getenv("PG_NAME", "dataa")
 
         url = f"postgresql://{user}:{password}@{host}:{port}/{name}"
         _engine = create_engine(url, pool_pre_ping=True)
