@@ -952,11 +952,11 @@ def _score_entity_keyword_rows(
     norm_q = _norm_keyword_text(clean_query)
 
     if keep_ratio is None:
-        keep_ratio = 0.96 if token_count <= 1 else (0.91 if token_count == 2 else 0.89)
+        keep_ratio = 0.96 if token_count <= 1 else (0.88 if token_count == 2 else 0.89)
     if absolute_floor is None:
-        absolute_floor = 0.82 if token_count <= 1 else (0.75 if token_count == 2 else 0.72)
+        absolute_floor = 0.82 if token_count <= 1 else (0.70 if token_count == 2 else 0.72)
     if keep_limit is None:
-        keep_limit = 4 if token_count <= 1 else (10 if token_count == 2 else 14)
+        keep_limit = 4 if token_count <= 1 else (12 if token_count == 2 else 12)
 
     best_score_by_owner: Dict[str, float] = {}
     final_score_by_owner: Dict[str, float] = {}
@@ -987,31 +987,39 @@ def _score_entity_keyword_rows(
         shared_ratio = float(len(shared_tokens) / token_count) if token_count > 0 else 0.0
         if norm_kw and norm_q:
             if norm_kw == norm_q:
-                exact_bonus = 0.16
+                exact_bonus = 0.09
                 phrase_hit = True
             elif norm_q in norm_kw:
                 exact_bonus = 0.12
                 phrase_hit = True
             elif norm_kw in norm_q:
                 if shared_ratio >= 0.75:
-                    exact_bonus = 0.08
+                    exact_bonus = 0.06
                     phrase_hit = True
                 else:
-                    exact_bonus = 0.02
+                    exact_bonus = 0.015
                     partial_phrase_hit = True
 
         if token_count >= 2:
             if len(shared_tokens) >= min(token_count, 2):
-                exact_bonus += 0.06
+                exact_bonus += 0.03
             elif overlap >= 0.5:
-                exact_bonus += 0.04
+                exact_bonus += 0.03
 
-        score = float(cosine + 0.10 * overlap + exact_bonus)
+        max_exact_bonus = 0.16
+        exact_bonus_norm = min(max(exact_bonus / max_exact_bonus, 0.0), 1.0)
+        score = float((0.74 * cosine) + (0.14 * overlap) + (0.12 * exact_bonus_norm))
+        score = min(max(score, 0.0), 1.0)
         current_best = best_score_by_owner.get(owner_key)
         if current_best is None or score > current_best:
             best_score_by_owner[owner_key] = score
 
-        keyword_is_relevant = bool(shared_tokens or phrase_hit or partial_phrase_hit or overlap >= 0.34)
+        if token_count <= 1:
+            keyword_is_relevant = bool(phrase_hit or shared_tokens)
+        elif token_count == 2:
+            keyword_is_relevant = bool(phrase_hit or (len(shared_tokens) == 2 and overlap >= 0.65 and cosine >= 0.86) or (len(shared_tokens) >= 1 and overlap >= 0.58 and cosine >= 0.88))
+        else:
+            keyword_is_relevant = bool(phrase_hit or len(shared_tokens) >= 2 or overlap >= 0.60)
         if keyword_is_relevant:
             owner_token_hits[owner_key].update(shared_tokens)
             owner_keyword_hit_count[owner_key] += 1
@@ -1032,13 +1040,19 @@ def _score_entity_keyword_rows(
         keyword_hit_count = int(owner_keyword_hit_count.get(owner_key) or 0)
         phrase_hits = int(owner_phrase_hits.get(owner_key) or 0)
         support_bonus = 0.0
-        support_bonus += 0.05 * min(4, max(0, keyword_hit_count - 1))
-        support_bonus += 0.08 * coverage
+        support_bonus += 0.01 * min(3, max(0, keyword_hit_count - 1))
+        support_bonus += 0.012 * coverage
         if keyword_hit_count >= 3:
-            support_bonus += 0.03
-        if phrase_hits > 0:
-            support_bonus += 0.03
-        final_score_by_owner[owner_key] = float(best_score + support_bonus)
+            support_bonus += 0.01
+        if phrase_hits > 1:
+            support_bonus += 0.012
+        single_evidence_penalty = 0.0
+        if token_count == 2 and keyword_hit_count == 1 and phrase_hits == 1:
+            single_evidence_penalty = 0.05
+        elif token_count >= 3 and keyword_hit_count == 1 and phrase_hits <= 1:
+            single_evidence_penalty = 0.08
+        support_bonus = min(max(support_bonus, 0.0), 0.08)
+        final_score_by_owner[owner_key] = float(min(1.0, max(0.0, best_score + support_bonus - single_evidence_penalty)))
 
     ranked = sorted(final_score_by_owner.items(), key=lambda item: item[1], reverse=True)
     if not ranked:
@@ -1058,9 +1072,11 @@ def _score_entity_keyword_rows(
         keep_by_threshold = float(score) >= min_score
         keep_by_evidence = False
         if token_count <= 1:
-            keep_by_evidence = has_phrase
+            keep_by_evidence = has_phrase or keyword_hit_count >= 1
+        elif token_count == 2:
+            keep_by_evidence = phrase_hits >= 1 or keyword_hit_count >= 2 or (keyword_hit_count >= 1 and coverage >= 0.5 and float(score) >= 0.84)
         else:
-            keep_by_evidence = has_phrase or coverage >= 0.50 or keyword_hit_count >= 2
+            keep_by_evidence = has_phrase or (coverage >= 0.67 and keyword_hit_count >= 2) or keyword_hit_count >= 3
         evidence_by_owner[owner_key] = {
             "score": float(score),
             "coverage": coverage,
@@ -1069,7 +1085,7 @@ def _score_entity_keyword_rows(
             "keep_by_threshold": keep_by_threshold,
             "keep_by_evidence": keep_by_evidence,
         }
-        if keep_by_threshold or keep_by_evidence:
+        if keep_by_evidence or (keep_by_threshold and ((token_count <= 1 and keyword_hit_count >= 1) or (token_count == 2 and keyword_hit_count >= 1 and coverage >= 0.5) or (token_count >= 3 and keyword_hit_count >= 2))):
             matched_aliases.append(owner_key)
 
     if not matched_aliases and ranked:
@@ -1080,12 +1096,13 @@ def _score_entity_keyword_rows(
     debug = {
         "keyword_rows": len(rows),
         "query_token_count": token_count,
-        "top_score": top_score,
-        "min_score": min_score,
+        "top_score": min(1.0, top_score),
+        "min_score": min(1.0, min_score),
         "matched_count": len(matched_aliases),
         "matched_aliases": matched_aliases[:20],
         "owner_ids_by_alias": {alias: ids[:5] for alias, ids in list(owner_ids_by_alias.items())[:20]},
         "owner_evidence": {alias: evidence_by_owner.get(alias) for alias in matched_aliases[:20]},
+        "score_range": {"min": 0, "max": 1},
     }
     return matched_aliases, final_score_by_owner, matched_keywords, debug
 
@@ -1593,7 +1610,7 @@ def _build_chunk_items(
             "type": "chunk",
             "id": chunk_id,
             "name": (neo_base.get("chunkName") or pg_base.get("chunkName") or (chunk_doc or {}).get("chunkName") or chunk_id),
-            "score": float(score_by_chunk.get(chunk_id, 0.0)),
+            "score": float(min(1.0, max(0.0, score_by_chunk.get(chunk_id, 0.0)))),
             "chunkID": chunk_id,
             "chunkName": (chunk_doc.get("chunkName") if chunk_doc else None) or neo_base.get("chunkName") or pg_base.get("chunkName") or chunk_id,
             "chunkType": (chunk_doc.get("chunkType") if chunk_doc else None) or pg_base.get("chunkType"),
