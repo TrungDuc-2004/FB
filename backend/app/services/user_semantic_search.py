@@ -952,11 +952,11 @@ def _score_entity_keyword_rows(
     norm_q = _norm_keyword_text(clean_query)
 
     if keep_ratio is None:
-        keep_ratio = 0.96 if token_count <= 1 else (0.88 if token_count == 2 else 0.89)
+        keep_ratio = 0.96 if token_count <= 1 else (0.91 if token_count == 2 else 0.89)
     if absolute_floor is None:
-        absolute_floor = 0.82 if token_count <= 1 else (0.70 if token_count == 2 else 0.72)
+        absolute_floor = 0.82 if token_count <= 1 else (0.75 if token_count == 2 else 0.72)
     if keep_limit is None:
-        keep_limit = 4 if token_count <= 1 else (12 if token_count == 2 else 12)
+        keep_limit = 4 if token_count <= 1 else (10 if token_count == 2 else 14)
 
     best_score_by_owner: Dict[str, float] = {}
     final_score_by_owner: Dict[str, float] = {}
@@ -987,39 +987,31 @@ def _score_entity_keyword_rows(
         shared_ratio = float(len(shared_tokens) / token_count) if token_count > 0 else 0.0
         if norm_kw and norm_q:
             if norm_kw == norm_q:
-                exact_bonus = 0.09
+                exact_bonus = 0.16
                 phrase_hit = True
             elif norm_q in norm_kw:
                 exact_bonus = 0.12
                 phrase_hit = True
             elif norm_kw in norm_q:
                 if shared_ratio >= 0.75:
-                    exact_bonus = 0.06
+                    exact_bonus = 0.08
                     phrase_hit = True
                 else:
-                    exact_bonus = 0.015
+                    exact_bonus = 0.02
                     partial_phrase_hit = True
 
         if token_count >= 2:
             if len(shared_tokens) >= min(token_count, 2):
-                exact_bonus += 0.03
+                exact_bonus += 0.06
             elif overlap >= 0.5:
-                exact_bonus += 0.03
+                exact_bonus += 0.04
 
-        max_exact_bonus = 0.16
-        exact_bonus_norm = min(max(exact_bonus / max_exact_bonus, 0.0), 1.0)
-        score = float((0.74 * cosine) + (0.14 * overlap) + (0.12 * exact_bonus_norm))
-        score = min(max(score, 0.0), 1.0)
+        score = float(cosine + 0.10 * overlap + exact_bonus)
         current_best = best_score_by_owner.get(owner_key)
         if current_best is None or score > current_best:
             best_score_by_owner[owner_key] = score
 
-        if token_count <= 1:
-            keyword_is_relevant = bool(phrase_hit or shared_tokens)
-        elif token_count == 2:
-            keyword_is_relevant = bool(phrase_hit or (len(shared_tokens) == 2 and overlap >= 0.65 and cosine >= 0.86) or (len(shared_tokens) >= 1 and overlap >= 0.58 and cosine >= 0.88))
-        else:
-            keyword_is_relevant = bool(phrase_hit or len(shared_tokens) >= 2 or overlap >= 0.60)
+        keyword_is_relevant = bool(shared_tokens or phrase_hit or partial_phrase_hit or overlap >= 0.34)
         if keyword_is_relevant:
             owner_token_hits[owner_key].update(shared_tokens)
             owner_keyword_hit_count[owner_key] += 1
@@ -1040,19 +1032,13 @@ def _score_entity_keyword_rows(
         keyword_hit_count = int(owner_keyword_hit_count.get(owner_key) or 0)
         phrase_hits = int(owner_phrase_hits.get(owner_key) or 0)
         support_bonus = 0.0
-        support_bonus += 0.01 * min(3, max(0, keyword_hit_count - 1))
-        support_bonus += 0.012 * coverage
+        support_bonus += 0.05 * min(4, max(0, keyword_hit_count - 1))
+        support_bonus += 0.08 * coverage
         if keyword_hit_count >= 3:
-            support_bonus += 0.01
-        if phrase_hits > 1:
-            support_bonus += 0.012
-        single_evidence_penalty = 0.0
-        if token_count == 2 and keyword_hit_count == 1 and phrase_hits == 1:
-            single_evidence_penalty = 0.05
-        elif token_count >= 3 and keyword_hit_count == 1 and phrase_hits <= 1:
-            single_evidence_penalty = 0.08
-        support_bonus = min(max(support_bonus, 0.0), 0.08)
-        final_score_by_owner[owner_key] = float(min(1.0, max(0.0, best_score + support_bonus - single_evidence_penalty)))
+            support_bonus += 0.03
+        if phrase_hits > 0:
+            support_bonus += 0.03
+        final_score_by_owner[owner_key] = float(best_score + support_bonus)
 
     ranked = sorted(final_score_by_owner.items(), key=lambda item: item[1], reverse=True)
     if not ranked:
@@ -1072,11 +1058,9 @@ def _score_entity_keyword_rows(
         keep_by_threshold = float(score) >= min_score
         keep_by_evidence = False
         if token_count <= 1:
-            keep_by_evidence = has_phrase or keyword_hit_count >= 1
-        elif token_count == 2:
-            keep_by_evidence = phrase_hits >= 1 or keyword_hit_count >= 2 or (keyword_hit_count >= 1 and coverage >= 0.5 and float(score) >= 0.84)
+            keep_by_evidence = has_phrase
         else:
-            keep_by_evidence = has_phrase or (coverage >= 0.67 and keyword_hit_count >= 2) or keyword_hit_count >= 3
+            keep_by_evidence = has_phrase or coverage >= 0.50 or keyword_hit_count >= 2
         evidence_by_owner[owner_key] = {
             "score": float(score),
             "coverage": coverage,
@@ -1085,7 +1069,7 @@ def _score_entity_keyword_rows(
             "keep_by_threshold": keep_by_threshold,
             "keep_by_evidence": keep_by_evidence,
         }
-        if keep_by_evidence or (keep_by_threshold and ((token_count <= 1 and keyword_hit_count >= 1) or (token_count == 2 and keyword_hit_count >= 1 and coverage >= 0.5) or (token_count >= 3 and keyword_hit_count >= 2))):
+        if keep_by_threshold or keep_by_evidence:
             matched_aliases.append(owner_key)
 
     if not matched_aliases and ranked:
@@ -1096,13 +1080,12 @@ def _score_entity_keyword_rows(
     debug = {
         "keyword_rows": len(rows),
         "query_token_count": token_count,
-        "top_score": min(1.0, top_score),
-        "min_score": min(1.0, min_score),
+        "top_score": top_score,
+        "min_score": min_score,
         "matched_count": len(matched_aliases),
         "matched_aliases": matched_aliases[:20],
         "owner_ids_by_alias": {alias: ids[:5] for alias, ids in list(owner_ids_by_alias.items())[:20]},
         "owner_evidence": {alias: evidence_by_owner.get(alias) for alias in matched_aliases[:20]},
-        "score_range": {"min": 0, "max": 1},
     }
     return matched_aliases, final_score_by_owner, matched_keywords, debug
 
@@ -1610,7 +1593,7 @@ def _build_chunk_items(
             "type": "chunk",
             "id": chunk_id,
             "name": (neo_base.get("chunkName") or pg_base.get("chunkName") or (chunk_doc or {}).get("chunkName") or chunk_id),
-            "score": float(min(1.0, max(0.0, score_by_chunk.get(chunk_id, 0.0)))),
+            "score": float(score_by_chunk.get(chunk_id, 0.0)),
             "chunkID": chunk_id,
             "chunkName": (chunk_doc.get("chunkName") if chunk_doc else None) or neo_base.get("chunkName") or pg_base.get("chunkName") or chunk_id,
             "chunkType": (chunk_doc.get("chunkType") if chunk_doc else None) or pg_base.get("chunkType"),
@@ -1698,39 +1681,35 @@ def semantic_search(
         "category": category,
         "search_mode": "neo4j_graph_hierarchical_keyword_branch_gate_exact_pg_id",
         "raw_query": query,
+        "query_context": "disabled",
     }
 
-    ctx = _parse_query_context(query)
-    dbg["query_context"] = ctx
-    class_scope = _normalize_class_scope(classID, ctx.get("classNumber"))
+    class_scope = (classID or "").strip()
 
-    topic_number = None if topicID else ctx.get("topicNumber")
-    lesson_number = None if lessonID else ctx.get("lessonNumber")
-    chunk_number = ctx.get("chunkNumber")
-
-    topic_rows, topic_neo_error = _load_topic_rows_neo(neo=neo, class_id=class_scope, subject_id=subjectID, topic_id=topicID)
-    topic_rows = _filter_by_number(topic_rows, "topicNumber", topic_number)
+    topic_rows, topic_neo_error = _load_topic_rows_neo(
+        neo=neo,
+        class_id=class_scope,
+        subject_id=subjectID,
+        topic_id=topicID,
+    )
     dbg["topic_rows"] = len(topic_rows)
     if topic_neo_error:
         dbg["topic_rows_neo_error"] = topic_neo_error
-    topic_ids, _topic_score_map, topic_dbg = _filter_scope_by_name_hint(
-        rows=topic_rows,
-        id_key="topicID",
-        name_key="topicName",
-        name_hint=str(ctx.get("topicNameHint") or ""),
-        label="Topic",
-    )
-    dbg["topic_scope"] = topic_dbg
-    topic_scope_active = bool(topicID or topic_number is not None or str(ctx.get("topicNameHint") or ""))
+
+    topic_scope_active = bool(topicID)
+    topic_ids = _collect_ids_keep_case(topic_rows, "topicID")
+    dbg["topic_scope"] = {
+        "active": topic_scope_active,
+        "input_topic_id": (topicID or "").strip(),
+        "matched_count": len(topic_ids),
+        "matched_ids": topic_ids[:10],
+    }
     if topic_scope_active and not topic_ids:
         res = {"total": 0, "items": []}
         if debug:
             dbg["reason"] = "topic_scope_no_match"
             res["debug"] = dbg
         return res
-    if topic_scope_active:
-        topic_id_set = set(topic_ids)
-        topic_rows = [row for row in topic_rows if str(row.get("topicID") or "") in topic_id_set]
 
     lessons_rows, lesson_rows_neo_error = _load_lesson_rows_neo(
         neo=neo,
@@ -1739,28 +1718,24 @@ def semantic_search(
         topic_ids=topic_ids if topic_scope_active else None,
         lesson_id=lessonID,
     )
-    lessons_rows = _filter_by_number(lessons_rows, "lessonNumber", lesson_number)
     dbg["lesson_rows"] = len(lessons_rows)
     if lesson_rows_neo_error:
         dbg["lesson_rows_neo_error"] = lesson_rows_neo_error
-    lesson_ids, _lesson_score_map, lesson_dbg = _filter_scope_by_name_hint(
-        rows=lessons_rows,
-        id_key="lessonID",
-        name_key="lessonName",
-        name_hint=str(ctx.get("lessonNameHint") or ""),
-        label="Lesson",
-    )
-    dbg["lesson_scope"] = lesson_dbg
-    lesson_scope_active = bool(lessonID or lesson_number is not None or str(ctx.get("lessonNameHint") or ""))
+
+    lesson_scope_active = bool(lessonID)
+    lesson_ids = _collect_ids_keep_case(lessons_rows, "lessonID")
+    dbg["lesson_scope"] = {
+        "active": lesson_scope_active,
+        "input_lesson_id": (lessonID or "").strip(),
+        "matched_count": len(lesson_ids),
+        "matched_ids": lesson_ids[:10],
+    }
     if lesson_scope_active and not lesson_ids:
         res = {"total": 0, "items": []}
         if debug:
             dbg["reason"] = "lesson_scope_no_match"
             res["debug"] = dbg
         return res
-    if lesson_scope_active:
-        lesson_id_set = set(lesson_ids)
-        lessons_rows = [row for row in lessons_rows if str(row.get("lessonID") or "") in lesson_id_set]
 
     chunk_rows, chunk_rows_neo_error = _load_chunk_rows_neo(
         neo=neo,
@@ -1769,40 +1744,27 @@ def semantic_search(
         topic_ids=topic_ids if topic_scope_active else None,
         lesson_ids=lesson_ids if lesson_scope_active else None,
     )
-    chunk_rows = _filter_by_number(chunk_rows, "chunkNumber", chunk_number)
     dbg["chunk_rows"] = len(chunk_rows)
     if chunk_rows_neo_error:
         dbg["chunk_rows_neo_error"] = chunk_rows_neo_error
-    explicit_chunk_ids, _explicit_chunk_score_map, chunk_dbg = _filter_scope_by_name_hint(
-        rows=chunk_rows,
-        id_key="chunkID",
-        name_key="chunkName",
-        name_hint=str(ctx.get("chunkNameHint") or ""),
-        label="Chunk",
-    )
-    dbg["chunk_scope"] = chunk_dbg
-    chunk_scope_active = bool(chunk_number is not None or str(ctx.get("chunkNameHint") or ""))
-    if chunk_scope_active and not explicit_chunk_ids:
-        res = {"total": 0, "items": []}
-        if debug:
-            dbg["reason"] = "chunk_scope_no_match"
-            res["debug"] = dbg
-        return res
-    if chunk_scope_active:
-        explicit_chunk_set = set(explicit_chunk_ids)
-        chunk_rows = [row for row in chunk_rows if str(row.get("chunkID") or "") in explicit_chunk_set]
 
-    generic_query = str(ctx.get("genericQuery") or "")
-    keyword_query = _strip_keyword_filler(generic_query or query)
+    keyword_query = _strip_keyword_filler(query)
     if not keyword_query:
         keyword_query = _core_query_text(query)
     dbg["keyword_query"] = keyword_query
+
     query_parts = _split_keyword_query_parts(query, keyword_query)
     dbg["query_parts"] = query_parts
     dbg["branch_mode"] = "keep_enough_correct_branches"
 
     if not keyword_query:
-        return_mode = _pick_return_mode(ctx, topicID=topicID, lessonID=lessonID)
+        if lessonID:
+            return_mode = "chunk"
+        elif topicID:
+            return_mode = "lesson"
+        else:
+            return_mode = "topic"
+
         dbg["return_mode"] = f"structured_{return_mode}"
         if return_mode == "chunk":
             page_rows = chunk_rows[offset : offset + limit]
@@ -1830,12 +1792,14 @@ def semantic_search(
                 dbg["items_built"] = len(items)
                 res["debug"] = dbg
             return res
+
         if return_mode == "lesson":
             items = _build_lesson_items(lessons_rows[offset : offset + limit])
             res = {"total": len(lessons_rows), "items": items}
             if debug:
                 res["debug"] = dbg
             return res
+
         items = _build_topic_items(topic_rows[offset : offset + limit])
         res = {"total": len(topic_rows), "items": items}
         if debug:

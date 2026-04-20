@@ -479,9 +479,6 @@ export default function UploadAutoReview() {
             <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
               <div>
                 <h3 style={{ marginTop: 0, marginBottom: 8 }}>Kết quả cắt đã có sẵn để duyệt</h3>
-                <div style={{ color: "#475569", lineHeight: 1.6 }}>
-                  Chunk có crop kéo ngang như iLovePDF. Topic và lesson có thanh split để chỉnh lại trang bắt đầu và trang kết thúc.
-                </div>
               </div>
               <div className="upload-auto-stats-grid">
                 <StatCard label="Topic" value={review.counts?.topics || 0} />
@@ -693,9 +690,6 @@ export default function UploadAutoReview() {
           </div>
 
           <div className="table-wrapper" style={{ marginTop: 20, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, flexWrap: "wrap", padding: 20, overflow: "visible" }}>
-            <div style={{ color: "#475569" }}>
-              Bạn cần duyệt từng mục đang bật sync. Sau đó bấm nút bên phải để hệ thống sinh description, lấy keyword ở chunk rồi đẩy lên lesson, topic và subject. Mục có độ tin cậy cao sẽ được tự đánh dấu duyệt, nhưng bạn vẫn có thể bỏ đánh dấu để kiểm tra lại.
-            </div>
             <button className="btn btn-primary" type="button" onClick={handleApprove} disabled={!allReviewed || busyApprove || busyRefresh}>
               {busyApprove ? "Đang sync..." : allReviewed ? "Duyệt xong và bắt đầu sync" : "Hãy duyệt hết từng mục trước"}
             </button>
