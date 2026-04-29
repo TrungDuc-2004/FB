@@ -1,0 +1,602 @@
+[
+  {
+    "stt": 1,
+    "query": "internet",
+    "searchTimeMs": 2149.81,
+    "total": 10
+  },
+  {
+    "stt": 2,
+    "query": "byte",
+    "searchTimeMs": 1392.72,
+    "total": 1
+  },
+  {
+    "stt": 3,
+    "query": "bit",
+    "searchTimeMs": 1369.18,
+    "total": 3
+  },
+  {
+    "stt": 4,
+    "query": "dữ liệu",
+    "searchTimeMs": 2915.91,
+    "total": 47
+  },
+  {
+    "stt": 5,
+    "query": "thuật toán",
+    "searchTimeMs": 2462.83,
+    "total": 31
+  },
+  {
+    "stt": 6,
+    "query": "mạng",
+    "searchTimeMs": 2385.85,
+    "total": 18
+  },
+  {
+    "stt": 7,
+    "query": "ip",
+    "searchTimeMs": 1544.88,
+    "total": 1
+  },
+  {
+    "stt": 8,
+    "query": "máy tính",
+    "searchTimeMs": 8088.59,
+    "total": 28
+  },
+  {
+    "stt": 9,
+    "query": "phần mềm",
+    "searchTimeMs": 3157.11,
+    "total": 33
+  },
+  {
+    "stt": 10,
+    "query": "phần cứng",
+    "searchTimeMs": 2897.47,
+    "total": 35
+  },
+  {
+    "stt": 11,
+    "query": "bảng tính",
+    "searchTimeMs": 2827.22,
+    "total": 28
+  },
+  {
+    "stt": 12,
+    "query": "tệp tin",
+    "searchTimeMs": 2557.48,
+    "total": 24
+  },
+  {
+    "stt": 13,
+    "query": "thư mục",
+    "searchTimeMs": 1378.72,
+    "total": 2
+  },
+  {
+    "stt": 14,
+    "query": "hệ điều hành",
+    "searchTimeMs": 2630.38,
+    "total": 17
+  },
+  {
+    "stt": 15,
+    "query": "trình duyệt",
+    "searchTimeMs": 2748.75,
+    "total": 35
+  },
+  {
+    "stt": 16,
+    "query": "thông tin",
+    "searchTimeMs": 709.96,
+    "total": 0
+  },
+  {
+    "stt": 17,
+    "query": "an toàn mạng",
+    "searchTimeMs": 2582.29,
+    "total": 22
+  },
+  {
+    "stt": 18,
+    "query": "địa chỉ ip",
+    "searchTimeMs": 1852.32,
+    "total": 50
+  },
+  {
+    "stt": 19,
+    "query": "mạng máy tính",
+    "searchTimeMs": 2995.39,
+    "total": 19
+  },
+  {
+    "stt": 20,
+    "query": "thiết bị số",
+    "searchTimeMs": 2826.58,
+    "total": 24
+  },
+  {
+    "stt": 21,
+    "query": "dữ liệu số",
+    "searchTimeMs": 2638.39,
+    "total": 43
+  },
+  {
+    "stt": 22,
+    "query": "lưu trữ",
+    "searchTimeMs": 1935.76,
+    "total": 14
+  },
+  {
+    "stt": 23,
+    "query": "kết nối",
+    "searchTimeMs": 2480.0,
+    "total": 15
+  },
+  {
+    "stt": 24,
+    "query": "virus máy tính",
+    "searchTimeMs": 2714.25,
+    "total": 17
+  },
+  {
+    "stt": 25,
+    "query": "bảo mật",
+    "searchTimeMs": 1906.43,
+    "total": 11
+  },
+  {
+    "stt": 26,
+    "query": "internet là gì",
+    "searchTimeMs": 1890.86,
+    "total": 10
+  },
+  {
+    "stt": 27,
+    "query": "byte là gì",
+    "searchTimeMs": 1345.27,
+    "total": 1
+  },
+  {
+    "stt": 28,
+    "query": "bit là gì",
+    "searchTimeMs": 1332.4,
+    "total": 2
+  },
+  {
+    "stt": 29,
+    "query": "dữ liệu là gì",
+    "searchTimeMs": 2757.25,
+    "total": 39
+  },
+  {
+    "stt": 30,
+    "query": "thuật toán là gì",
+    "searchTimeMs": 2215.02,
+    "total": 20
+  },
+  {
+    "stt": 31,
+    "query": "mạng máy tính là gì",
+    "searchTimeMs": 2863.96,
+    "total": 19
+  },
+  {
+    "stt": 32,
+    "query": "địa chỉ ip là gì",
+    "searchTimeMs": 1887.53,
+    "total": 50
+  },
+  {
+    "stt": 33,
+    "query": "phần mềm là gì",
+    "searchTimeMs": 2848.72,
+    "total": 24
+  },
+  {
+    "stt": 34,
+    "query": "phần cứng là gì",
+    "searchTimeMs": 2635.15,
+    "total": 15
+  },
+  {
+    "stt": 35,
+    "query": "bảng tính là gì",
+    "searchTimeMs": 2726.78,
+    "total": 16
+  },
+  {
+    "stt": 36,
+    "query": "hệ điều hành là gì",
+    "searchTimeMs": 2808.92,
+    "total": 17
+  },
+  {
+    "stt": 37,
+    "query": "trình duyệt web là gì",
+    "searchTimeMs": 2645.96,
+    "total": 13
+  },
+  {
+    "stt": 38,
+    "query": "dữ liệu số là gì",
+    "searchTimeMs": 2939.96,
+    "total": 29
+  },
+  {
+    "stt": 39,
+    "query": "tệp và thư mục",
+    "searchTimeMs": 2523.41,
+    "total": 11
+  },
+  {
+    "stt": 40,
+    "query": "kết nối internet",
+    "searchTimeMs": 2335.14,
+    "total": 16
+  },
+  {
+    "stt": 41,
+    "query": "an toàn thông tin mạng",
+    "searchTimeMs": 2490.59,
+    "total": 22
+  },
+  {
+    "stt": 42,
+    "query": "virus máy tính là gì",
+    "searchTimeMs": 2723.81,
+    "total": 17
+  },
+  {
+    "stt": 43,
+    "query": "thiết bị vào ra",
+    "searchTimeMs": 2505.77,
+    "total": 18
+  },
+  {
+    "stt": 44,
+    "query": "các loại phần mềm",
+    "searchTimeMs": 2724.1,
+    "total": 24
+  },
+  {
+    "stt": 45,
+    "query": "cách lưu trữ dữ liệu",
+    "searchTimeMs": 2548.47,
+    "total": 29
+  },
+  {
+    "stt": 46,
+    "query": "máy tính hoạt động ra sao",
+    "searchTimeMs": 2601.66,
+    "total": 11
+  },
+  {
+    "stt": 47,
+    "query": "thông tin trong máy tính",
+    "searchTimeMs": 2661.02,
+    "total": 28
+  },
+  {
+    "stt": 48,
+    "query": "biểu diễn dữ liệu trong máy tính",
+    "searchTimeMs": 2691.93,
+    "total": 31
+  },
+  {
+    "stt": 49,
+    "query": "khái niệm mạng internet",
+    "searchTimeMs": 2337.07,
+    "total": 9
+  },
+  {
+    "stt": 50,
+    "query": "thiết bị mạng cơ bản",
+    "searchTimeMs": 5450.51,
+    "total": 20
+  },
+  {
+    "stt": 51,
+    "query": "cho tôi tài liệu về internet",
+    "searchTimeMs": 1854.74,
+    "total": 10
+  },
+  {
+    "stt": 52,
+    "query": "tìm tài liệu về byte",
+    "searchTimeMs": 1294.79,
+    "total": 1
+  },
+  {
+    "stt": 53,
+    "query": "tìm hiểu về bit trong máy tính",
+    "searchTimeMs": 2801.84,
+    "total": 16
+  },
+  {
+    "stt": 54,
+    "query": "tài liệu về dữ liệu số",
+    "searchTimeMs": 2588.43,
+    "total": 43
+  },
+  {
+    "stt": 55,
+    "query": "tài liệu về mạng máy tính",
+    "searchTimeMs": 2738.08,
+    "total": 19
+  },
+  {
+    "stt": 56,
+    "query": "tài liệu về địa chỉ ip",
+    "searchTimeMs": 1799.19,
+    "total": 50
+  },
+  {
+    "stt": 57,
+    "query": "tài liệu về phần mềm máy tính",
+    "searchTimeMs": 2825.56,
+    "total": 31
+  },
+  {
+    "stt": 58,
+    "query": "tài liệu về phần cứng máy tính",
+    "searchTimeMs": 2771.91,
+    "total": 27
+  },
+  {
+    "stt": 59,
+    "query": "tài liệu về hệ điều hành",
+    "searchTimeMs": 2710.07,
+    "total": 17
+  },
+  {
+    "stt": 60,
+    "query": "tài liệu về bảng tính",
+    "searchTimeMs": 2644.35,
+    "total": 28
+  },
+  {
+    "stt": 61,
+    "query": "cách kết nối internet là gì",
+    "searchTimeMs": 2235.96,
+    "total": 13
+  },
+  {
+    "stt": 62,
+    "query": "mạng máy tính hoạt động như thế nào",
+    "searchTimeMs": 2774.09,
+    "total": 15
+  },
+  {
+    "stt": 63,
+    "query": "dữ liệu trong máy tính được lưu như thế nào",
+    "searchTimeMs": 2830.22,
+    "total": 31
+  },
+  {
+    "stt": 64,
+    "query": "sự khác nhau giữa byte và bit",
+    "searchTimeMs": 3102.46,
+    "total": 49
+  },
+  {
+    "stt": 65,
+    "query": "các thành phần của máy tính",
+    "searchTimeMs": 2870.0,
+    "total": 26
+  },
+  {
+    "stt": 66,
+    "query": "tìm hiểu về an toàn thông tin mạng",
+    "searchTimeMs": 2094.71,
+    "total": 8
+  },
+  {
+    "stt": 67,
+    "query": "vai trò của hệ điều hành",
+    "searchTimeMs": 2609.59,
+    "total": 17
+  },
+  {
+    "stt": 68,
+    "query": "chức năng của phần mềm máy tính",
+    "searchTimeMs": 2946.83,
+    "total": 23
+  },
+  {
+    "stt": 69,
+    "query": "cách tổ chức tệp và thư mục",
+    "searchTimeMs": 3001.42,
+    "total": 10
+  },
+  {
+    "stt": 70,
+    "query": "máy tính xử lý dữ liệu như thế nào",
+    "searchTimeMs": 2757.17,
+    "total": 30
+  },
+  {
+    "stt": 71,
+    "query": "tìm hiểu về virus máy tính",
+    "searchTimeMs": 2743.95,
+    "total": 17
+  },
+  {
+    "stt": 72,
+    "query": "địa chỉ ip dùng để làm gì",
+    "searchTimeMs": 2284.86,
+    "total": 50
+  },
+  {
+    "stt": 73,
+    "query": "internet có vai trò gì",
+    "searchTimeMs": 2136.19,
+    "total": 7
+  },
+  {
+    "stt": 74,
+    "query": "thiết bị mạng gồm những gì",
+    "searchTimeMs": 2533.22,
+    "total": 21
+  },
+  {
+    "stt": 75,
+    "query": "bảng tính dùng để làm gì",
+    "searchTimeMs": 2675.43,
+    "total": 16
+  },
+  {
+    "stt": 76,
+    "query": "cho tôi tài liệu về internet và mạng máy tính",
+    "searchTimeMs": 3282.2,
+    "total": 24
+  },
+  {
+    "stt": 77,
+    "query": "tìm hiểu về byte và bit trong máy tính",
+    "searchTimeMs": 3387.92,
+    "total": 17
+  },
+  {
+    "stt": 78,
+    "query": "dữ liệu trong máy tính được biểu diễn như thế nào",
+    "searchTimeMs": 2859.47,
+    "total": 31
+  },
+  {
+    "stt": 79,
+    "query": "sự khác nhau giữa phần mềm và phần cứng là gì",
+    "searchTimeMs": 3288.82,
+    "total": 15
+  },
+  {
+    "stt": 80,
+    "query": "vai trò của internet trong học tập và đời sống",
+    "searchTimeMs": 3677.97,
+    "total": 47
+  },
+  {
+    "stt": 81,
+    "query": "cách hoạt động của mạng máy tính là gì",
+    "searchTimeMs": 2811.15,
+    "total": 16
+  },
+  {
+    "stt": 82,
+    "query": "cho tôi tài liệu về an toàn khi sử dụng internet",
+    "searchTimeMs": 2296.76,
+    "total": 14
+  },
+  {
+    "stt": 83,
+    "query": "các thành phần của hệ thống máy tính gồm những gì",
+    "searchTimeMs": 2830.97,
+    "total": 25
+  },
+  {
+    "stt": 84,
+    "query": "địa chỉ ip có vai trò gì trong mạng máy tính",
+    "searchTimeMs": 2809.78,
+    "total": 14
+  },
+  {
+    "stt": 85,
+    "query": "hệ điều hành giúp máy tính hoạt động như thế nào",
+    "searchTimeMs": 2833.06,
+    "total": 25
+  },
+  {
+    "stt": 86,
+    "query": "cách lưu trữ và quản lý dữ liệu trong máy tính",
+    "searchTimeMs": 3380.45,
+    "total": 36
+  },
+  {
+    "stt": 87,
+    "query": "bảng tính được sử dụng trong những trường hợp nào",
+    "searchTimeMs": 2838.43,
+    "total": 17
+  },
+  {
+    "stt": 88,
+    "query": "virus máy tính ảnh hưởng đến hệ thống ra sao",
+    "searchTimeMs": 3065.29,
+    "total": 19
+  },
+  {
+    "stt": 89,
+    "query": "cho tôi tài liệu về thiết bị vào và thiết bị ra",
+    "searchTimeMs": 3223.88,
+    "total": 17
+  },
+  {
+    "stt": 90,
+    "query": "sự khác nhau giữa dữ liệu và thông tin là gì",
+    "searchTimeMs": 3493.48,
+    "total": 32
+  },
+  {
+    "stt": 91,
+    "query": "tìm tài liệu về các loại phần mềm máy tính",
+    "searchTimeMs": 2865.68,
+    "total": 22
+  },
+  {
+    "stt": 92,
+    "query": "máy tính xử lý dữ liệu đầu vào như thế nào",
+    "searchTimeMs": 2897.69,
+    "total": 31
+  },
+  {
+    "stt": 93,
+    "query": "mạng internet mang lại những lợi ích gì",
+    "searchTimeMs": 2445.71,
+    "total": 10
+  },
+  {
+    "stt": 94,
+    "query": "cách tổ chức tệp và thư mục trên máy tính",
+    "searchTimeMs": 3409.07,
+    "total": 23
+  },
+  {
+    "stt": 95,
+    "query": "vì sao cần đảm bảo an toàn thông tin mạng",
+    "searchTimeMs": 2150.14,
+    "total": 12
+  },
+  {
+    "stt": 96,
+    "query": "cho tôi tài liệu nói về hệ điều hành và phần mềm",
+    "searchTimeMs": 3443.09,
+    "total": 38
+  },
+  {
+    "stt": 97,
+    "query": "sự khác nhau giữa mạng internet và mạng máy tính",
+    "searchTimeMs": 3714.29,
+    "total": 21
+  },
+  {
+    "stt": 98,
+    "query": "dữ liệu số có vai trò gì trong máy tính",
+    "searchTimeMs": 2875.46,
+    "total": 32
+  },
+  {
+    "stt": 99,
+    "query": "cho tôi tài liệu về thiết bị mạng cơ bản",
+    "searchTimeMs": 2738.1,
+    "total": 20
+  },
+  {
+    "stt": 100,
+    "query": "thuật toán được ứng dụng trong tin học như thế nào",
+    "searchTimeMs": 2693.46,
+    "total": 21
+  }
+]

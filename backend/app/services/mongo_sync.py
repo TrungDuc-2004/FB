@@ -320,13 +320,7 @@ def _active_docs(docs):
     return out
 
 
-def _refresh_lesson_keywords_from_chunks(db, *, lesson_map: str, category: str, now: datetime) -> Dict[str, Any] | None:
-    """
-    Giữ nguyên keywordLesson hiện có của lesson, chỉ đồng bộ timestamp sau khi chunk thay đổi.
-
-    keyword của chunk chỉ thuộc chunk; lesson/topic/subject sẽ được tổng hợp theo các hàm cha-con
-    bên dưới. Hàm này tồn tại để tránh NameError và để luồng sync chunk không bị vỡ.
-    """
+def _refresh_lesson_keywords_from_chunks(db, *, lesson_map: str, category: str, now: datetime):
     lesson_map = _clean_str(lesson_map)
     if not lesson_map:
         return None
@@ -342,7 +336,20 @@ def _refresh_lesson_keywords_from_chunks(db, *, lesson_map: str, category: str, 
     if not lesson_doc:
         return None
 
-    keywords = _uniq_keep_order(_parse_keywords(lesson_doc.get("keywordLesson")), limit=None)
+    chunk_filter = {"lessonID": lesson_map}
+    if _clean_str(category):
+        chunk_filter["chunkCategory"] = _clean_str(category)
+
+    chunks = _active_docs(list(db["chunks"].find(chunk_filter).sort("chunkNumber", 1)))
+    if not chunks and "chunkCategory" in chunk_filter:
+        chunk_filter.pop("chunkCategory", None)
+        chunks = _active_docs(list(db["chunks"].find(chunk_filter).sort("chunkNumber", 1)))
+
+    keywords = []
+    for chunk in chunks:
+        keywords.extend(_parse_keywords(chunk.get("keywords")))
+    keywords = _uniq_keep_order(keywords, limit=None)
+
     db["lessons"].update_one(
         {"_id": lesson_doc["_id"]},
         {"$set": {"keywordLesson": keywords, "searchUpdatedAt": now, "updatedAt": now}},

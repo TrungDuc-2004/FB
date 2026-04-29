@@ -220,7 +220,7 @@ def list_labels(session: Annotated[NeoSession, Depends(get_neo4j_session)]):
 @router.get("/nodes", summary="List nodes by label (view-only)")
 def list_nodes(
     label: str = Query(...),
-    limit: int = Query(200, ge=1, le=2000),
+    limit: int = Query(5000, ge=1, le=5000),
     skip: int = Query(0, ge=0),
     session: Annotated[NeoSession, Depends(get_neo4j_session)] = None,
 ):

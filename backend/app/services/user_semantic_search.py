@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 import re
 import unicodedata
 from collections import defaultdict
@@ -1672,6 +1673,8 @@ def semantic_search(
     mongo_db,
     debug: bool = False,
 ) -> dict:
+    request_started = time.perf_counter()
+
     query = _norm_spaces(q)
     if not query:
         return {"total": 0, "items": []}
@@ -1683,6 +1686,20 @@ def semantic_search(
         "raw_query": query,
         "query_context": "disabled",
     }
+
+    def _finalize_result(res: dict, reason: Optional[str] = None) -> dict:
+        elapsed_ms = round((time.perf_counter() - request_started) * 1000.0, 2)
+        res["searchTimeMs"] = elapsed_ms
+        if reason:
+            dbg["reason"] = reason
+        dbg["timing"] = {"total_search_ms": elapsed_ms}
+        print(
+            f"[SEARCH_TIME] query='{query}' total_ms={elapsed_ms}",
+            flush=True,
+        )
+        if debug:
+            res["debug"] = dbg
+        return res
 
     class_scope = (classID or "").strip()
 
@@ -1709,7 +1726,7 @@ def semantic_search(
         if debug:
             dbg["reason"] = "topic_scope_no_match"
             res["debug"] = dbg
-        return res
+        return _finalize_result(res)
 
     lessons_rows, lesson_rows_neo_error = _load_lesson_rows_neo(
         neo=neo,
@@ -1735,7 +1752,7 @@ def semantic_search(
         if debug:
             dbg["reason"] = "lesson_scope_no_match"
             res["debug"] = dbg
-        return res
+        return _finalize_result(res)
 
     chunk_rows, chunk_rows_neo_error = _load_chunk_rows_neo(
         neo=neo,
@@ -1790,21 +1807,16 @@ def semantic_search(
             res = {"total": len(items), "items": items}
             if debug:
                 dbg["items_built"] = len(items)
-                res["debug"] = dbg
-            return res
+            return _finalize_result(res)
 
         if return_mode == "lesson":
             items = _build_lesson_items(lessons_rows[offset : offset + limit])
             res = {"total": len(lessons_rows), "items": items}
-            if debug:
-                res["debug"] = dbg
-            return res
+            return _finalize_result(res)
 
         items = _build_topic_items(topic_rows[offset : offset + limit])
         res = {"total": len(topic_rows), "items": items}
-        if debug:
-            res["debug"] = dbg
-        return res
+        return _finalize_result(res)
 
     try:
         dbg["query_embedding_dim"] = len(embed_keyword_cached(keyword_query or query))
@@ -1835,14 +1847,14 @@ def semantic_search(
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
             dbg["reason"] = "subject_candidates_empty"
             res["debug"] = dbg
-        return res
+        return _finalize_result(res)
     if not subject_keyword_rows:
         res = {"total": 0, "items": []}
         if debug:
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
             dbg["reason"] = "subject_keywords_not_found_in_neo4j"
             res["debug"] = dbg
-        return res
+        return _finalize_result(res)
     matched_subject_aliases, subject_scores, subject_kw, subject_match_dbg = _score_entity_keyword_rows_multi(
         query_parts or [keyword_query or query],
         subject_keyword_rows,
@@ -1858,7 +1870,7 @@ def semantic_search(
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
             dbg["reason"] = "subject_gate_no_match"
             res["debug"] = dbg
-        return res
+        return _finalize_result(res)
     subject_alias_set = set(matched_subject_aliases)
     filtered_chunk_rows = _filter_rows_by_alias(
         filtered_chunk_rows,
@@ -1879,7 +1891,7 @@ def semantic_search(
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
             dbg["reason"] = "topic_candidates_empty_after_subject_gate"
             res["debug"] = dbg
-        return res
+        return _finalize_result(res)
     topic_keyword_rows, topic_neo_error = _load_entity_keyword_rows_from_neo(
         neo,
         owner_label="Topic",
@@ -1895,7 +1907,7 @@ def semantic_search(
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
             dbg["reason"] = "topic_keywords_not_found_in_neo4j"
             res["debug"] = dbg
-        return res
+        return _finalize_result(res)
     matched_topic_aliases, topic_scores, topic_kw, topic_match_dbg = _score_entity_keyword_rows_multi(
         query_parts or [keyword_query or query],
         topic_keyword_rows,
@@ -1911,7 +1923,7 @@ def semantic_search(
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
             dbg["reason"] = "topic_gate_no_match"
             res["debug"] = dbg
-        return res
+        return _finalize_result(res)
     topic_alias_set = set(matched_topic_aliases)
     filtered_chunk_rows = _filter_rows_by_alias(
         filtered_chunk_rows,
@@ -1932,7 +1944,7 @@ def semantic_search(
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
             dbg["reason"] = "lesson_candidates_empty_after_topic_gate"
             res["debug"] = dbg
-        return res
+        return _finalize_result(res)
     lesson_keyword_rows, lesson_neo_error = _load_entity_keyword_rows_from_neo(
         neo,
         owner_label="Lesson",
@@ -1948,7 +1960,7 @@ def semantic_search(
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
             dbg["reason"] = "lesson_keywords_not_found_in_neo4j"
             res["debug"] = dbg
-        return res
+        return _finalize_result(res)
     matched_lesson_aliases, lesson_scores, lesson_kw, lesson_match_dbg = _score_entity_keyword_rows_multi(
         query_parts or [keyword_query or query],
         lesson_keyword_rows,
@@ -1964,7 +1976,7 @@ def semantic_search(
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
             dbg["reason"] = "lesson_gate_no_match"
             res["debug"] = dbg
-        return res
+        return _finalize_result(res)
     lesson_alias_set = set(matched_lesson_aliases)
     filtered_chunk_rows = _filter_rows_by_alias(
         filtered_chunk_rows,
@@ -1984,7 +1996,7 @@ def semantic_search(
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
             dbg["reason"] = "chunk_candidates_empty_after_lesson_gate"
             res["debug"] = dbg
-        return res
+        return _finalize_result(res)
     chunk_keyword_rows, chunk_neo_error = _load_entity_keyword_rows_from_neo(
         neo,
         owner_label="Chunk",
@@ -2000,7 +2012,7 @@ def semantic_search(
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
             dbg["reason"] = "chunk_keywords_not_found_in_neo4j"
             res["debug"] = dbg
-        return res
+        return _finalize_result(res)
 
     matched_chunk_aliases, chunk_scores, chunk_kw, chunk_match_dbg = _score_entity_keyword_rows_multi(
         query_parts or [keyword_query or query],
@@ -2017,7 +2029,7 @@ def semantic_search(
         if debug:
             dbg["reason"] = "chunk_gate_no_match"
             res["debug"] = dbg
-        return res
+        return _finalize_result(res)
 
     ranked_chunks = sorted(
         [
@@ -2037,7 +2049,7 @@ def semantic_search(
         if debug:
             dbg["reason"] = "ranked_chunk_count_zero"
             res["debug"] = dbg
-        return res
+        return _finalize_result(res)
 
     all_ranked_chunk_ids = _dedupe_keep_order_ids([chunk_id for chunk_id, _score in ranked_chunks])
     score_by_chunk = {chunk_id: float(score) for chunk_id, score in ranked_chunks}
@@ -2061,6 +2073,7 @@ def semantic_search(
         dbg=dbg,
     )
 
+
     items = all_items[offset : offset + limit]
     res = {"total": len(all_items), "items": items}
     if debug:
@@ -2071,5 +2084,4 @@ def semantic_search(
                 "matchedKeywords": items[0].get("matchedKeywords"),
                 "score": items[0].get("score"),
             }
-        res["debug"] = dbg
-    return res
+    return _finalize_result(res)
