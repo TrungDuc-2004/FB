@@ -233,7 +233,9 @@ export default function Search() {
           q,
           classID,
           category: "all",
-          limit: 100,
+          // Fetch fewer results per search request; the backend does expensive hierarchical
+          // keyword gating, so asking for 100 items makes multi-keyword queries much slower.
+          limit: 30,
           offset: 0,
         });
 

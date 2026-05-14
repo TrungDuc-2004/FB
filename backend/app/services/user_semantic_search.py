@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 import re
 import unicodedata
@@ -17,7 +18,32 @@ from .gemini_topic_expander import expand_topic_keywords_debug
 from .keyword_embedding import embed_keyword_cached
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
-_SERVICE_VERSION = "search_hierarchical_keyword_neo4j_branch_gate_v7_exact_pg_id"
+_SERVICE_VERSION = "search_hierarchical_keyword_neo4j_branch_gate_v8_lazy_branch_cache"
+_ALLOWED_KEYWORD_OWNER_LABELS = {"Subject", "Topic", "Lesson", "Chunk"}
+_BRANCH_KEYWORD_CACHE: Dict[str, Dict[str, List[Tuple[str, str, str, List[float]]]]] = defaultdict(dict)
+_BRANCH_KEYWORD_CACHE_TS: Dict[str, Dict[str, float]] = defaultdict(dict)
+_BRANCH_KEYWORD_CACHE_TTL_SECONDS = 300.0
+_ASSUME_NORMALIZED_EMBEDDINGS = (os.getenv("SEARCH_ASSUME_NORMALIZED_EMBEDDINGS", "1").strip().lower() not in {"0", "false", "no", "off"})
+_SUBJECT_BRANCH_LIMIT = int(os.getenv("SEARCH_SUBJECT_BRANCH_LIMIT", "8"))
+_TOPIC_BRANCH_LIMIT = int(os.getenv("SEARCH_TOPIC_BRANCH_LIMIT", "10"))
+_LESSON_BRANCH_LIMIT = int(os.getenv("SEARCH_LESSON_BRANCH_LIMIT", "14"))
+_CHUNK_MATCH_MULTIPLIER = int(os.getenv("SEARCH_CHUNK_MATCH_MULTIPLIER", "3"))
+_CHUNK_MATCH_MIN_LIMIT = int(os.getenv("SEARCH_CHUNK_MATCH_MIN_LIMIT", "30"))
+
+
+def _cap_ids(ids: List[str], limit: int) -> List[str]:
+    clean = _dedupe_keep_order([str(x).strip() for x in (ids or []) if str(x).strip()])
+    if limit and limit > 0:
+        return clean[:limit]
+    return clean
+
+
+def clear_search_keyword_cache() -> None:
+    """Clear cached Neo4j keyword rows after approve/sync/rebuild operations."""
+    _BRANCH_KEYWORD_CACHE.clear()
+    _BRANCH_KEYWORD_CACHE_TS.clear()
+
+
 _LABEL_RE = re.compile(
     r"(?P<class>\b(?:lớp|lop|class)\b)|"
     r"(?P<topic>\b(?:chủ\s*đề|chu\s*de|topic)\b)|"
@@ -189,6 +215,15 @@ def _cosine(a: List[float], b: List[float]) -> float:
         return 0.0
     n = min(len(a), len(b))
     dot = 0.0
+    if _ASSUME_NORMALIZED_EMBEDDINGS:
+        # All embeddings produced by app/services/keyword_embedding.py are L2-normalized.
+        # Stored keyword vectors should therefore only need a dot product. This removes
+        # the per-keyword sqrt/norm work from the hottest loop in search. Set
+        # SEARCH_ASSUME_NORMALIZED_EMBEDDINGS=0 to use the defensive cosine path.
+        for i in range(n):
+            dot += float(a[i]) * float(b[i])
+        return float(dot)
+
     na = 0.0
     nb = 0.0
     for i in range(n):
@@ -413,6 +448,166 @@ def _load_media_map_for_targets(*, pg: Session, mongo_db, targets: List[tuple[st
         bucket["videos"].sort(key=_media_sort_key)
     return out
 
+
+
+def _load_subject_rows_neo(
+    *,
+    neo,
+    class_id: str,
+    subject_id: str,
+    topic_id: str = "",
+    lesson_id: str = "",
+) -> Tuple[List[dict], Optional[str]]:
+    """Load only Subject candidates for the first branch gate.
+
+    This avoids loading the full Topic/Lesson/Chunk tree before the Subject
+    keyword gate has selected the correct branch.
+    """
+    if neo is None:
+        return [], "neo_session_unavailable"
+    try:
+        records = neo.run(
+            """
+            MATCH (class:Class)-[:HAS_SUBJECT]->(subject:Subject)
+            OPTIONAL MATCH (subject)-[:HAS_TOPIC]->(topic:Topic)
+            OPTIONAL MATCH (topic)-[:HAS_LESSON]->(lesson:Lesson)
+            WHERE ($class_id = '' OR class.pg_id = $class_id)
+              AND ($subject_id = '' OR subject.pg_id = $subject_id)
+              AND ($topic_id = '' OR topic.pg_id = $topic_id)
+              AND ($lesson_id = '' OR lesson.pg_id = $lesson_id)
+            RETURN DISTINCT subject.pg_id AS subject_id,
+                   coalesce(subject.name, subject.pg_id) AS subject_name,
+                   class.pg_id AS class_id,
+                   coalesce(class.name, class.pg_id) AS class_name
+            ORDER BY class.pg_id, subject.pg_id
+            """,
+            class_id=(class_id or "").strip(),
+            subject_id=(subject_id or "").strip(),
+            topic_id=(topic_id or "").strip(),
+            lesson_id=(lesson_id or "").strip(),
+        )
+        rows: List[dict] = []
+        for r in records:
+            subject_pg_id = str(r.get("subject_id") or "").strip()
+            if not subject_pg_id:
+                continue
+            rows.append({
+                "subjectID": subject_pg_id,
+                "subjectName": str(r.get("subject_name") or subject_pg_id).strip(),
+                "classID": str(r.get("class_id") or "").strip(),
+                "className": str(r.get("class_name") or "").strip(),
+            })
+        return rows, None
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _load_topic_rows_for_subjects_neo(
+    *,
+    neo,
+    class_id: str,
+    subject_ids: List[str],
+    topic_id: str,
+) -> Tuple[List[dict], Optional[str]]:
+    if neo is None:
+        return [], "neo_session_unavailable"
+    clean_subject_ids = _dedupe_keep_order_ids(subject_ids)
+    if not clean_subject_ids:
+        return [], None
+    try:
+        records = neo.run(
+            """
+            UNWIND $subject_ids AS subject_id
+            MATCH (class:Class)-[:HAS_SUBJECT]->(subject:Subject {pg_id: subject_id})-[:HAS_TOPIC]->(topic:Topic)
+            WHERE ($class_id = '' OR class.pg_id = $class_id)
+              AND ($topic_id = '' OR topic.pg_id = $topic_id)
+            RETURN DISTINCT topic.pg_id AS topic_id,
+                   coalesce(topic.topic_name, topic.name, topic.pg_id) AS topic_name,
+                   topic.topic_number AS topic_number,
+                   subject.pg_id AS subject_id,
+                   coalesce(subject.name, subject.pg_id) AS subject_name,
+                   class.pg_id AS class_id,
+                   coalesce(class.name, class.pg_id) AS class_name
+            ORDER BY class.pg_id, subject.pg_id, topic.topic_number, topic.pg_id
+            """,
+            class_id=(class_id or "").strip(),
+            subject_ids=clean_subject_ids,
+            topic_id=(topic_id or "").strip(),
+        )
+        rows: List[dict] = []
+        for r in records:
+            topic_pg_id = str(r.get("topic_id") or "").strip()
+            if not topic_pg_id:
+                continue
+            rows.append({
+                "topicID": topic_pg_id,
+                "topicName": str(r.get("topic_name") or topic_pg_id).strip(),
+                "topicNumber": r.get("topic_number"),
+                "subjectID": str(r.get("subject_id") or "").strip(),
+                "subjectName": str(r.get("subject_name") or "").strip(),
+                "classID": str(r.get("class_id") or "").strip(),
+                "className": str(r.get("class_name") or "").strip(),
+            })
+        return rows, None
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _load_lesson_rows_for_topics_neo(
+    *,
+    neo,
+    class_id: str,
+    topic_ids: List[str],
+    lesson_id: str,
+) -> Tuple[List[dict], Optional[str]]:
+    if neo is None:
+        return [], "neo_session_unavailable"
+    clean_topic_ids = _dedupe_keep_order_ids(topic_ids)
+    if not clean_topic_ids:
+        return [], None
+    try:
+        records = neo.run(
+            """
+            UNWIND $topic_ids AS topic_id
+            MATCH (class:Class)-[:HAS_SUBJECT]->(subject:Subject)-[:HAS_TOPIC]->(topic:Topic {pg_id: topic_id})-[:HAS_LESSON]->(lesson:Lesson)
+            WHERE ($class_id = '' OR class.pg_id = $class_id)
+              AND ($lesson_id = '' OR lesson.pg_id = $lesson_id)
+            RETURN DISTINCT lesson.pg_id AS lesson_id,
+                   coalesce(lesson.lesson_name, lesson.name, lesson.pg_id) AS lesson_name,
+                   lesson.lesson_number AS lesson_number,
+                   topic.pg_id AS topic_id,
+                   coalesce(topic.topic_name, topic.name, topic.pg_id) AS topic_name,
+                   topic.topic_number AS topic_number,
+                   subject.pg_id AS subject_id,
+                   coalesce(subject.name, subject.pg_id) AS subject_name,
+                   class.pg_id AS class_id,
+                   coalesce(class.name, class.pg_id) AS class_name
+            ORDER BY class.pg_id, subject.pg_id, topic.topic_number, topic.pg_id, lesson.lesson_number, lesson.pg_id
+            """,
+            class_id=(class_id or "").strip(),
+            topic_ids=clean_topic_ids,
+            lesson_id=(lesson_id or "").strip(),
+        )
+        rows: List[dict] = []
+        for r in records:
+            lesson_pg_id = str(r.get("lesson_id") or "").strip()
+            if not lesson_pg_id:
+                continue
+            rows.append({
+                "lessonID": lesson_pg_id,
+                "lessonName": str(r.get("lesson_name") or lesson_pg_id).strip(),
+                "lessonNumber": r.get("lesson_number"),
+                "topicID": str(r.get("topic_id") or "").strip(),
+                "topicName": str(r.get("topic_name") or "").strip(),
+                "topicNumber": r.get("topic_number"),
+                "subjectID": str(r.get("subject_id") or "").strip(),
+                "subjectName": str(r.get("subject_name") or "").strip(),
+                "classID": str(r.get("class_id") or "").strip(),
+                "className": str(r.get("class_name") or "").strip(),
+            })
+        return rows, None
+    except Exception as exc:
+        return [], str(exc)
 
 def _load_topic_rows_neo(*, neo, class_id: str, subject_id: str, topic_id: str) -> Tuple[List[dict], Optional[str]]:
     if neo is None:
@@ -750,6 +945,60 @@ def _load_entity_keyword_rows_from_neo(
         return rows, None
     except Exception as exc:
         return [], str(exc)
+
+
+def _load_entity_keyword_rows_cached(
+    neo,
+    *,
+    owner_label: str,
+    owner_ids: List[str],
+) -> Tuple[List[Tuple[str, str, str, List[float]]], Optional[str]]:
+    """Load Neo4j keyword rows with a per-process cache keyed by owner label/id.
+
+    The branch tree is searched repeatedly while the graph rarely changes between
+    approve/sync operations, so this removes repeated Neo4j calls for identical
+    Subject/Topic/Lesson/Chunk keyword sets.
+    """
+    if owner_label not in _ALLOWED_KEYWORD_OWNER_LABELS:
+        return [], f"invalid_owner_label:{owner_label}"
+    clean_owner_ids = _dedupe_keep_order_ids(owner_ids)
+    if not clean_owner_ids:
+        return [], None
+
+    label_cache = _BRANCH_KEYWORD_CACHE.setdefault(owner_label, {})
+    label_cache_ts = _BRANCH_KEYWORD_CACHE_TS.setdefault(owner_label, {})
+    now = time.monotonic()
+    rows: List[Tuple[str, str, str, List[float]]] = []
+    missing_ids: List[str] = []
+
+    for owner_id in clean_owner_ids:
+        cached_rows = label_cache.get(owner_id)
+        cached_at = float(label_cache_ts.get(owner_id) or 0.0)
+        cache_alive = cached_rows is not None and (now - cached_at) <= _BRANCH_KEYWORD_CACHE_TTL_SECONDS
+        if not cache_alive:
+            missing_ids.append(owner_id)
+        else:
+            rows.extend(cached_rows)
+
+    neo_error: Optional[str] = None
+    if missing_ids:
+        loaded_rows, neo_error = _load_entity_keyword_rows_from_neo(
+            neo,
+            owner_label=owner_label,
+            owner_ids=missing_ids,
+        )
+        grouped: Dict[str, List[Tuple[str, str, str, List[float]]]] = defaultdict(list)
+        for row in loaded_rows:
+            owner_id = str(row[1] or "").strip()
+            if owner_id:
+                grouped[owner_id].append(row)
+        for owner_id in missing_ids:
+            owner_rows = grouped.get(owner_id, [])
+            label_cache[owner_id] = owner_rows
+            label_cache_ts[owner_id] = now
+            rows.extend(owner_rows)
+
+    return rows, neo_error
 
 
 # --------------------------- keyword search helpers ---------------------------
@@ -1537,6 +1786,17 @@ def _build_chunk_items(
 
     dbg["media_hit_groups"] = sum(1 for payload in neo_map.values() if (payload.get("images") or payload.get("videos")))
 
+    saved_chunk_ids: set[str] = set()
+    try:
+        if mongo_db is not None and username and page_chunk_ids:
+            saved_docs = mongo_db["user_saved_chunks"].find(
+                {"username": username, "chunkID": {"$in": page_chunk_ids}},
+                {"chunkID": 1},
+            )
+            saved_chunk_ids = {str(doc.get("chunkID") or "").strip() for doc in saved_docs if str(doc.get("chunkID") or "").strip()}
+    except Exception:
+        saved_chunk_ids = set()
+
     items: List[dict] = []
     for chunk_id in page_chunk_ids:
         neo_base = neo_map.get(chunk_id) or {}
@@ -1633,12 +1893,7 @@ def _build_chunk_items(
             },
             "category": (chunk_doc.get("chunkCategory") if chunk_doc else None) or category or "document",
         }
-        try:
-            if mongo_db is not None:
-                saved = mongo_db["user_saved_chunks"].find_one({"username": username, "chunkID": chunk_id})
-                item["isSaved"] = bool(saved)
-        except Exception:
-            pass
+        item["isSaved"] = chunk_id in saved_chunk_ids
         items.append(item)
     return items
 
@@ -1674,6 +1929,14 @@ def semantic_search(
     debug: bool = False,
 ) -> dict:
     request_started = time.perf_counter()
+    timing_steps: Dict[str, float] = {}
+
+    def _time_step(name: str, fn):
+        started = time.perf_counter()
+        try:
+            return fn()
+        finally:
+            timing_steps[name] = round((time.perf_counter() - started) * 1000.0, 2)
 
     query = _norm_spaces(q)
     if not query:
@@ -1682,7 +1945,7 @@ def semantic_search(
     dbg: Dict[str, object] = {
         "service_version": _SERVICE_VERSION,
         "category": category,
-        "search_mode": "neo4j_graph_hierarchical_keyword_branch_gate_exact_pg_id",
+        "search_mode": "neo4j_graph_hierarchical_keyword_branch_gate_lazy_load",
         "raw_query": query,
         "query_context": "disabled",
     }
@@ -1692,7 +1955,9 @@ def semantic_search(
         res["searchTimeMs"] = elapsed_ms
         if reason:
             dbg["reason"] = reason
-        dbg["timing"] = {"total_search_ms": elapsed_ms}
+        timing_payload = dict(timing_steps)
+        timing_payload["total_search_ms"] = elapsed_ms
+        dbg["timing"] = timing_payload
         print(
             f"[SEARCH_TIME] query='{query}' total_ms={elapsed_ms}",
             flush=True,
@@ -1702,68 +1967,9 @@ def semantic_search(
         return res
 
     class_scope = (classID or "").strip()
-
-    topic_rows, topic_neo_error = _load_topic_rows_neo(
-        neo=neo,
-        class_id=class_scope,
-        subject_id=subjectID,
-        topic_id=topicID,
-    )
-    dbg["topic_rows"] = len(topic_rows)
-    if topic_neo_error:
-        dbg["topic_rows_neo_error"] = topic_neo_error
-
-    topic_scope_active = bool(topicID)
-    topic_ids = _collect_ids_keep_case(topic_rows, "topicID")
-    dbg["topic_scope"] = {
-        "active": topic_scope_active,
-        "input_topic_id": (topicID or "").strip(),
-        "matched_count": len(topic_ids),
-        "matched_ids": topic_ids[:10],
-    }
-    if topic_scope_active and not topic_ids:
-        res = {"total": 0, "items": []}
-        if debug:
-            dbg["reason"] = "topic_scope_no_match"
-            res["debug"] = dbg
-        return _finalize_result(res)
-
-    lessons_rows, lesson_rows_neo_error = _load_lesson_rows_neo(
-        neo=neo,
-        class_id=class_scope,
-        subject_id=subjectID,
-        topic_ids=topic_ids if topic_scope_active else None,
-        lesson_id=lessonID,
-    )
-    dbg["lesson_rows"] = len(lessons_rows)
-    if lesson_rows_neo_error:
-        dbg["lesson_rows_neo_error"] = lesson_rows_neo_error
-
-    lesson_scope_active = bool(lessonID)
-    lesson_ids = _collect_ids_keep_case(lessons_rows, "lessonID")
-    dbg["lesson_scope"] = {
-        "active": lesson_scope_active,
-        "input_lesson_id": (lessonID or "").strip(),
-        "matched_count": len(lesson_ids),
-        "matched_ids": lesson_ids[:10],
-    }
-    if lesson_scope_active and not lesson_ids:
-        res = {"total": 0, "items": []}
-        if debug:
-            dbg["reason"] = "lesson_scope_no_match"
-            res["debug"] = dbg
-        return _finalize_result(res)
-
-    chunk_rows, chunk_rows_neo_error = _load_chunk_rows_neo(
-        neo=neo,
-        class_id=class_scope,
-        subject_id=subjectID,
-        topic_ids=topic_ids if topic_scope_active else None,
-        lesson_ids=lesson_ids if lesson_scope_active else None,
-    )
-    dbg["chunk_rows"] = len(chunk_rows)
-    if chunk_rows_neo_error:
-        dbg["chunk_rows_neo_error"] = chunk_rows_neo_error
+    subject_scope = (subjectID or "").strip()
+    topic_scope = (topicID or "").strip()
+    lesson_scope = (lessonID or "").strip()
 
     keyword_query = _strip_keyword_filler(query)
     if not keyword_query:
@@ -1772,12 +1978,77 @@ def semantic_search(
 
     query_parts = _split_keyword_query_parts(query, keyword_query)
     dbg["query_parts"] = query_parts
-    dbg["branch_mode"] = "keep_enough_correct_branches"
+    dbg["branch_mode"] = "lazy_subject_to_topic_to_lesson_to_chunk"
 
+    # Browse/structured mode: preserve the previous behavior when the query has
+    # no searchable keyword content. This path is not the expensive semantic path.
     if not keyword_query:
-        if lessonID:
+        topic_rows, topic_neo_error = _time_step(
+            "browse_load_topic_rows_neo_ms",
+            lambda: _load_topic_rows_neo(
+                neo=neo,
+                class_id=class_scope,
+                subject_id=subject_scope,
+                topic_id=topic_scope,
+            ),
+        )
+        dbg["topic_rows"] = len(topic_rows)
+        if topic_neo_error:
+            dbg["topic_rows_neo_error"] = topic_neo_error
+
+        topic_scope_active = bool(topic_scope)
+        topic_ids = _collect_ids_keep_case(topic_rows, "topicID")
+        dbg["topic_scope"] = {
+            "active": topic_scope_active,
+            "input_topic_id": topic_scope,
+            "matched_count": len(topic_ids),
+            "matched_ids": topic_ids[:10],
+        }
+        if topic_scope_active and not topic_ids:
+            return _finalize_result({"total": 0, "items": []}, "topic_scope_no_match")
+
+        lessons_rows, lesson_rows_neo_error = _time_step(
+            "browse_load_lesson_rows_neo_ms",
+            lambda: _load_lesson_rows_neo(
+                neo=neo,
+                class_id=class_scope,
+                subject_id=subject_scope,
+                topic_ids=topic_ids if topic_scope_active else None,
+                lesson_id=lesson_scope,
+            ),
+        )
+        dbg["lesson_rows"] = len(lessons_rows)
+        if lesson_rows_neo_error:
+            dbg["lesson_rows_neo_error"] = lesson_rows_neo_error
+
+        lesson_scope_active = bool(lesson_scope)
+        lesson_ids = _collect_ids_keep_case(lessons_rows, "lessonID")
+        dbg["lesson_scope"] = {
+            "active": lesson_scope_active,
+            "input_lesson_id": lesson_scope,
+            "matched_count": len(lesson_ids),
+            "matched_ids": lesson_ids[:10],
+        }
+        if lesson_scope_active and not lesson_ids:
+            return _finalize_result({"total": 0, "items": []}, "lesson_scope_no_match")
+
+        chunk_rows, chunk_rows_neo_error = _time_step(
+            "browse_load_chunk_rows_neo_ms",
+            lambda: _load_chunk_rows_neo(
+                neo=neo,
+                class_id=class_scope,
+                subject_id=subject_scope,
+                topic_ids=topic_ids if topic_scope_active else None,
+                lesson_ids=lesson_ids if lesson_scope_active else None,
+            ),
+        )
+        dbg["chunk_rows"] = len(chunk_rows)
+        if chunk_rows_neo_error:
+            dbg["chunk_rows_neo_error"] = chunk_rows_neo_error
+
+        if lesson_scope:
             return_mode = "chunk"
-        elif topicID:
+        elif topic_scope:
             return_mode = "lesson"
         else:
             return_mode = "topic"
@@ -1788,296 +2059,344 @@ def semantic_search(
             page_chunk_ids = [str(row.get("chunkID") or "") for row in page_rows]
             score_by_chunk = {cid: 1.0 for cid in page_chunk_ids}
             chunk_top_kw: Dict[str, List[Tuple[float, str]]] = {}
-            neo_map, neo_error = _neo_hierarchy_for_chunks(neo, page_chunk_ids)
+            neo_map, neo_error = _time_step(
+                "browse_page_neo_hierarchy_ms",
+                lambda: _neo_hierarchy_for_chunks(neo, page_chunk_ids),
+            )
             if neo_error:
                 dbg["neo_error"] = neo_error
-            pg_map = _load_pg_page_rows(pg, page_chunk_ids)
-            items = _build_chunk_items(
-                page_chunk_ids=page_chunk_ids,
-                score_by_chunk=score_by_chunk,
-                chunk_top_kw=chunk_top_kw,
-                pg_map=pg_map,
-                neo_map=neo_map,
-                mongo_db=mongo_db,
-                category=category,
-                username=username,
-                pg=pg,
-                dbg=dbg,
+            pg_map = _time_step("browse_page_pg_rows_ms", lambda: _load_pg_page_rows(pg, page_chunk_ids))
+            items = _time_step(
+                "browse_build_items_ms",
+                lambda: _build_chunk_items(
+                    page_chunk_ids=page_chunk_ids,
+                    score_by_chunk=score_by_chunk,
+                    chunk_top_kw=chunk_top_kw,
+                    pg_map=pg_map,
+                    neo_map=neo_map,
+                    mongo_db=mongo_db,
+                    category=category,
+                    username=username,
+                    pg=pg,
+                    dbg=dbg,
+                ),
             )
-            res = {"total": len(items), "items": items}
+            res = {"total": len(chunk_rows), "items": items}
             if debug:
                 dbg["items_built"] = len(items)
             return _finalize_result(res)
 
         if return_mode == "lesson":
             items = _build_lesson_items(lessons_rows[offset : offset + limit])
-            res = {"total": len(lessons_rows), "items": items}
-            return _finalize_result(res)
+            return _finalize_result({"total": len(lessons_rows), "items": items})
 
         items = _build_topic_items(topic_rows[offset : offset + limit])
-        res = {"total": len(topic_rows), "items": items}
-        return _finalize_result(res)
+        return _finalize_result({"total": len(topic_rows), "items": items})
 
-    try:
-        dbg["query_embedding_dim"] = len(embed_keyword_cached(keyword_query or query))
-    except Exception:
-        dbg["query_embedding_dim"] = 0
+    if debug:
+        try:
+            dbg["query_embedding_dim"] = len(embed_keyword_cached(keyword_query or query))
+        except Exception:
+            dbg["query_embedding_dim"] = 0
 
-    filtered_chunk_rows = list(chunk_rows)
-    hierarchy_dbg: Dict[str, object] = {}
+    hierarchy_dbg: Dict[str, object] = {
+        "branch_limits": {
+            "subject": _SUBJECT_BRANCH_LIMIT,
+            "topic": _TOPIC_BRANCH_LIMIT,
+            "lesson": _LESSON_BRANCH_LIMIT,
+            "chunk_match_multiplier": _CHUNK_MATCH_MULTIPLIER,
+            "chunk_match_min_limit": _CHUNK_MATCH_MIN_LIMIT,
+        },
+        "assume_normalized_embeddings": _ASSUME_NORMALIZED_EMBEDDINGS,
+    }
 
-    # Subject gate
-    current_subject_ids = _collect_ids_keep_case(filtered_chunk_rows, "subjectID")
-    subject_alias_by_id, subject_ids_by_alias = _alias_map_for_rows(filtered_chunk_rows, id_key="subjectID", name_key="subjectName")
+    # 1) Subject gate: load only Subject candidates first.
+    subject_rows, subject_rows_neo_error = _time_step(
+        "load_subject_rows_neo_ms",
+        lambda: _load_subject_rows_neo(
+            neo=neo,
+            class_id=class_scope,
+            subject_id=subject_scope,
+            topic_id=topic_scope,
+            lesson_id=lesson_scope,
+        ),
+    )
+    if subject_rows_neo_error:
+        hierarchy_dbg["subject_rows_neo_error"] = subject_rows_neo_error
+    current_subject_ids = _collect_ids_keep_case(subject_rows, "subjectID")
+    subject_alias_by_id, subject_ids_by_alias = _alias_map_for_rows(subject_rows, id_key="subjectID", name_key="subjectName")
     hierarchy_dbg["subject_candidates"] = len(current_subject_ids)
     hierarchy_dbg["subject_candidate_ids"] = current_subject_ids[:10]
     hierarchy_dbg["subject_alias_candidates"] = list(subject_ids_by_alias.keys())[:10]
-    subject_keyword_rows, subject_neo_error = _load_entity_keyword_rows_from_neo(
-        neo,
-        owner_label="Subject",
-        owner_ids=current_subject_ids,
+    if not current_subject_ids:
+        if debug:
+            dbg["hierarchy_keyword_filter"] = hierarchy_dbg
+        return _finalize_result({"total": 0, "items": []}, "subject_candidates_empty")
+
+    subject_keyword_rows, subject_neo_error = _time_step(
+        "load_subject_keywords_neo_cached_ms",
+        lambda: _load_entity_keyword_rows_cached(
+            neo,
+            owner_label="Subject",
+            owner_ids=current_subject_ids,
+        ),
     )
     hierarchy_dbg["subject_keyword_rows"] = len(subject_keyword_rows)
-    hierarchy_dbg["subject_keyword_source"] = "neo4j"
+    hierarchy_dbg["subject_keyword_source"] = "neo4j_cached"
     if subject_neo_error:
         hierarchy_dbg["subject_neo_error"] = subject_neo_error
-    if not current_subject_ids:
-        res = {"total": 0, "items": []}
-        if debug:
-            dbg["hierarchy_keyword_filter"] = hierarchy_dbg
-            dbg["reason"] = "subject_candidates_empty"
-            res["debug"] = dbg
-        return _finalize_result(res)
     if not subject_keyword_rows:
-        res = {"total": 0, "items": []}
         if debug:
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
-            dbg["reason"] = "subject_keywords_not_found_in_neo4j"
-            res["debug"] = dbg
-        return _finalize_result(res)
-    matched_subject_aliases, subject_scores, subject_kw, subject_match_dbg = _score_entity_keyword_rows_multi(
-        query_parts or [keyword_query or query],
-        subject_keyword_rows,
-        owner_alias_by_id=subject_alias_by_id,
-        keep_limit=12,
+        return _finalize_result({"total": 0, "items": []}, "subject_keywords_not_found_in_neo4j")
+
+    matched_subject_aliases, subject_scores, subject_kw, subject_match_dbg = _time_step(
+        "score_subject_keywords_ms",
+        lambda: _score_entity_keyword_rows_multi(
+            query_parts or [keyword_query or query],
+            subject_keyword_rows,
+            owner_alias_by_id=subject_alias_by_id,
+            keep_limit=12,
+        ),
     )
     hierarchy_dbg["subject_match"] = subject_match_dbg
     hierarchy_dbg["subject_matched_aliases"] = matched_subject_aliases
-    hierarchy_dbg["subject_matched_ids"] = _expand_ids_for_aliases(subject_ids_by_alias, matched_subject_aliases)
-    if not matched_subject_aliases:
-        res = {"total": 0, "items": []}
+    matched_subject_ids = _cap_ids(_expand_ids_for_aliases(subject_ids_by_alias, matched_subject_aliases), _SUBJECT_BRANCH_LIMIT)
+    hierarchy_dbg["subject_matched_ids"] = matched_subject_ids
+    hierarchy_dbg["subject_matched_count_after_cap"] = len(matched_subject_ids)
+    if not matched_subject_aliases or not matched_subject_ids:
         if debug:
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
-            dbg["reason"] = "subject_gate_no_match"
-            res["debug"] = dbg
-        return _finalize_result(res)
-    subject_alias_set = set(matched_subject_aliases)
-    filtered_chunk_rows = _filter_rows_by_alias(
-        filtered_chunk_rows,
-        id_key="subjectID",
-        name_key="subjectName",
-        allowed_aliases=subject_alias_set,
-    )
+        return _finalize_result({"total": 0, "items": []}, "subject_gate_no_match")
 
-    # Topic gate
-    current_topic_ids = _collect_ids_keep_case(filtered_chunk_rows, "topicID")
-    topic_alias_by_id, topic_ids_by_alias = _alias_map_for_rows(filtered_chunk_rows, id_key="topicID", name_key="topicName")
+    # 2) Topic gate: now load only Topic nodes inside matched Subjects.
+    topic_rows, topic_rows_neo_error = _time_step(
+        "load_topic_rows_after_subject_gate_neo_ms",
+        lambda: _load_topic_rows_for_subjects_neo(
+            neo=neo,
+            class_id=class_scope,
+            subject_ids=matched_subject_ids,
+            topic_id=topic_scope,
+        ),
+    )
+    if topic_rows_neo_error:
+        hierarchy_dbg["topic_rows_neo_error"] = topic_rows_neo_error
+    current_topic_ids = _collect_ids_keep_case(topic_rows, "topicID")
+    topic_alias_by_id, topic_ids_by_alias = _alias_map_for_rows(topic_rows, id_key="topicID", name_key="topicName")
     hierarchy_dbg["topic_candidates"] = len(current_topic_ids)
     hierarchy_dbg["topic_candidate_ids"] = current_topic_ids[:10]
     hierarchy_dbg["topic_alias_candidates"] = list(topic_ids_by_alias.keys())[:10]
     if not current_topic_ids:
-        res = {"total": 0, "items": []}
         if debug:
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
-            dbg["reason"] = "topic_candidates_empty_after_subject_gate"
-            res["debug"] = dbg
-        return _finalize_result(res)
-    topic_keyword_rows, topic_neo_error = _load_entity_keyword_rows_from_neo(
-        neo,
-        owner_label="Topic",
-        owner_ids=current_topic_ids,
+        return _finalize_result({"total": 0, "items": []}, "topic_candidates_empty_after_subject_gate")
+
+    topic_keyword_rows, topic_neo_error = _time_step(
+        "load_topic_keywords_neo_cached_ms",
+        lambda: _load_entity_keyword_rows_cached(
+            neo,
+            owner_label="Topic",
+            owner_ids=current_topic_ids,
+        ),
     )
     hierarchy_dbg["topic_keyword_rows"] = len(topic_keyword_rows)
-    hierarchy_dbg["topic_keyword_source"] = "neo4j"
+    hierarchy_dbg["topic_keyword_source"] = "neo4j_cached"
     if topic_neo_error:
         hierarchy_dbg["topic_neo_error"] = topic_neo_error
     if not topic_keyword_rows:
-        res = {"total": 0, "items": []}
         if debug:
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
-            dbg["reason"] = "topic_keywords_not_found_in_neo4j"
-            res["debug"] = dbg
-        return _finalize_result(res)
-    matched_topic_aliases, topic_scores, topic_kw, topic_match_dbg = _score_entity_keyword_rows_multi(
-        query_parts or [keyword_query or query],
-        topic_keyword_rows,
-        owner_alias_by_id=topic_alias_by_id,
-        keep_limit=16,
+        return _finalize_result({"total": 0, "items": []}, "topic_keywords_not_found_in_neo4j")
+
+    matched_topic_aliases, topic_scores, topic_kw, topic_match_dbg = _time_step(
+        "score_topic_keywords_ms",
+        lambda: _score_entity_keyword_rows_multi(
+            query_parts or [keyword_query or query],
+            topic_keyword_rows,
+            owner_alias_by_id=topic_alias_by_id,
+            keep_limit=16,
+        ),
     )
     hierarchy_dbg["topic_match"] = topic_match_dbg
     hierarchy_dbg["topic_matched_aliases"] = matched_topic_aliases
-    hierarchy_dbg["topic_matched_ids"] = _expand_ids_for_aliases(topic_ids_by_alias, matched_topic_aliases)
-    if not matched_topic_aliases:
-        res = {"total": 0, "items": []}
+    matched_topic_ids = _cap_ids(_expand_ids_for_aliases(topic_ids_by_alias, matched_topic_aliases), _TOPIC_BRANCH_LIMIT)
+    hierarchy_dbg["topic_matched_ids"] = matched_topic_ids
+    hierarchy_dbg["topic_matched_count_after_cap"] = len(matched_topic_ids)
+    if not matched_topic_aliases or not matched_topic_ids:
         if debug:
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
-            dbg["reason"] = "topic_gate_no_match"
-            res["debug"] = dbg
-        return _finalize_result(res)
-    topic_alias_set = set(matched_topic_aliases)
-    filtered_chunk_rows = _filter_rows_by_alias(
-        filtered_chunk_rows,
-        id_key="topicID",
-        name_key="topicName",
-        allowed_aliases=topic_alias_set,
-    )
+        return _finalize_result({"total": 0, "items": []}, "topic_gate_no_match")
 
-    # Lesson gate
-    current_lesson_ids = _collect_ids_keep_case(filtered_chunk_rows, "lessonID")
-    lesson_alias_by_id, lesson_ids_by_alias = _alias_map_for_rows(filtered_chunk_rows, id_key="lessonID", name_key="lessonName")
+    # 3) Lesson gate: load only Lesson nodes inside matched Topics.
+    lessons_rows, lesson_rows_neo_error = _time_step(
+        "load_lesson_rows_after_topic_gate_neo_ms",
+        lambda: _load_lesson_rows_for_topics_neo(
+            neo=neo,
+            class_id=class_scope,
+            topic_ids=matched_topic_ids,
+            lesson_id=lesson_scope,
+        ),
+    )
+    if lesson_rows_neo_error:
+        hierarchy_dbg["lesson_rows_neo_error"] = lesson_rows_neo_error
+    current_lesson_ids = _collect_ids_keep_case(lessons_rows, "lessonID")
+    lesson_alias_by_id, lesson_ids_by_alias = _alias_map_for_rows(lessons_rows, id_key="lessonID", name_key="lessonName")
     hierarchy_dbg["lesson_candidates"] = len(current_lesson_ids)
     hierarchy_dbg["lesson_candidate_ids"] = current_lesson_ids[:10]
     hierarchy_dbg["lesson_alias_candidates"] = list(lesson_ids_by_alias.keys())[:10]
     if not current_lesson_ids:
-        res = {"total": 0, "items": []}
         if debug:
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
-            dbg["reason"] = "lesson_candidates_empty_after_topic_gate"
-            res["debug"] = dbg
-        return _finalize_result(res)
-    lesson_keyword_rows, lesson_neo_error = _load_entity_keyword_rows_from_neo(
-        neo,
-        owner_label="Lesson",
-        owner_ids=current_lesson_ids,
+        return _finalize_result({"total": 0, "items": []}, "lesson_candidates_empty_after_topic_gate")
+
+    lesson_keyword_rows, lesson_neo_error = _time_step(
+        "load_lesson_keywords_neo_cached_ms",
+        lambda: _load_entity_keyword_rows_cached(
+            neo,
+            owner_label="Lesson",
+            owner_ids=current_lesson_ids,
+        ),
     )
     hierarchy_dbg["lesson_keyword_rows"] = len(lesson_keyword_rows)
-    hierarchy_dbg["lesson_keyword_source"] = "neo4j"
+    hierarchy_dbg["lesson_keyword_source"] = "neo4j_cached"
     if lesson_neo_error:
         hierarchy_dbg["lesson_neo_error"] = lesson_neo_error
     if not lesson_keyword_rows:
-        res = {"total": 0, "items": []}
         if debug:
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
-            dbg["reason"] = "lesson_keywords_not_found_in_neo4j"
-            res["debug"] = dbg
-        return _finalize_result(res)
-    matched_lesson_aliases, lesson_scores, lesson_kw, lesson_match_dbg = _score_entity_keyword_rows_multi(
-        query_parts or [keyword_query or query],
-        lesson_keyword_rows,
-        owner_alias_by_id=lesson_alias_by_id,
-        keep_limit=20,
+        return _finalize_result({"total": 0, "items": []}, "lesson_keywords_not_found_in_neo4j")
+
+    matched_lesson_aliases, lesson_scores, lesson_kw, lesson_match_dbg = _time_step(
+        "score_lesson_keywords_ms",
+        lambda: _score_entity_keyword_rows_multi(
+            query_parts or [keyword_query or query],
+            lesson_keyword_rows,
+            owner_alias_by_id=lesson_alias_by_id,
+            keep_limit=20,
+        ),
     )
     hierarchy_dbg["lesson_match"] = lesson_match_dbg
     hierarchy_dbg["lesson_matched_aliases"] = matched_lesson_aliases
-    hierarchy_dbg["lesson_matched_ids"] = _expand_ids_for_aliases(lesson_ids_by_alias, matched_lesson_aliases)
-    if not matched_lesson_aliases:
-        res = {"total": 0, "items": []}
+    matched_lesson_ids = _cap_ids(_expand_ids_for_aliases(lesson_ids_by_alias, matched_lesson_aliases), _LESSON_BRANCH_LIMIT)
+    hierarchy_dbg["lesson_matched_ids"] = matched_lesson_ids
+    hierarchy_dbg["lesson_matched_count_after_cap"] = len(matched_lesson_ids)
+    if not matched_lesson_aliases or not matched_lesson_ids:
         if debug:
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
-            dbg["reason"] = "lesson_gate_no_match"
-            res["debug"] = dbg
-        return _finalize_result(res)
-    lesson_alias_set = set(matched_lesson_aliases)
-    filtered_chunk_rows = _filter_rows_by_alias(
-        filtered_chunk_rows,
-        id_key="lessonID",
-        name_key="lessonName",
-        allowed_aliases=lesson_alias_set,
-    )
+        return _finalize_result({"total": 0, "items": []}, "lesson_gate_no_match")
 
-    # Chunk gate
-    chunk_ids = _collect_ids_keep_case(filtered_chunk_rows, "chunkID")
-    chunk_alias_by_id, chunk_ids_by_alias = _alias_map_for_rows(filtered_chunk_rows, id_key="chunkID", name_key="chunkName")
+    # 4) Chunk gate: load chunks only after Subject/Topic/Lesson branches are fixed.
+    chunk_rows, chunk_rows_neo_error = _time_step(
+        "load_chunk_rows_after_lesson_gate_neo_ms",
+        lambda: _load_chunk_rows_neo(
+            neo=neo,
+            class_id=class_scope,
+            subject_id="",
+            topic_ids=matched_topic_ids,
+            lesson_ids=matched_lesson_ids,
+        ),
+    )
+    if chunk_rows_neo_error:
+        hierarchy_dbg["chunk_rows_neo_error"] = chunk_rows_neo_error
+    chunk_ids = _collect_ids_keep_case(chunk_rows, "chunkID")
+    chunk_alias_by_id, chunk_ids_by_alias = _alias_map_for_rows(chunk_rows, id_key="chunkID", name_key="chunkName")
     dbg["candidate_chunk_scope"] = len(chunk_ids)
     dbg["candidate_chunk_aliases"] = list(chunk_ids_by_alias.keys())[:20]
     if not chunk_ids:
-        res = {"total": 0, "items": []}
         if debug:
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
-            dbg["reason"] = "chunk_candidates_empty_after_lesson_gate"
-            res["debug"] = dbg
-        return _finalize_result(res)
-    chunk_keyword_rows, chunk_neo_error = _load_entity_keyword_rows_from_neo(
-        neo,
-        owner_label="Chunk",
-        owner_ids=chunk_ids,
+        return _finalize_result({"total": 0, "items": []}, "chunk_candidates_empty_after_lesson_gate")
+
+    chunk_keyword_rows, chunk_neo_error = _time_step(
+        "load_chunk_keywords_neo_cached_ms",
+        lambda: _load_entity_keyword_rows_cached(
+            neo,
+            owner_label="Chunk",
+            owner_ids=chunk_ids,
+        ),
     )
     dbg["keyword_rows"] = len(chunk_keyword_rows)
-    dbg["keyword_embedding_source"] = "neo4j_map_id"
+    dbg["keyword_embedding_source"] = "neo4j_map_id_cached"
     if chunk_neo_error:
         dbg["chunk_neo_error"] = chunk_neo_error
     if not chunk_keyword_rows:
-        res = {"total": 0, "items": []}
         if debug:
             dbg["hierarchy_keyword_filter"] = hierarchy_dbg
-            dbg["reason"] = "chunk_keywords_not_found_in_neo4j"
-            res["debug"] = dbg
-        return _finalize_result(res)
+        return _finalize_result({"total": 0, "items": []}, "chunk_keywords_not_found_in_neo4j")
 
-    matched_chunk_aliases, chunk_scores, chunk_kw, chunk_match_dbg = _score_entity_keyword_rows_multi(
-        query_parts or [keyword_query or query],
-        chunk_keyword_rows,
-        owner_alias_by_id=chunk_alias_by_id,
-        keep_limit=max(limit * 5, 30),
+    matched_chunk_aliases, chunk_scores, chunk_kw, chunk_match_dbg = _time_step(
+        "score_chunk_keywords_ms",
+        lambda: _score_entity_keyword_rows_multi(
+            query_parts or [keyword_query or query],
+            chunk_keyword_rows,
+            owner_alias_by_id=chunk_alias_by_id,
+            keep_limit=max(limit * _CHUNK_MATCH_MULTIPLIER, _CHUNK_MATCH_MIN_LIMIT),
+        ),
     )
     hierarchy_dbg["chunk_match"] = chunk_match_dbg
     hierarchy_dbg["chunk_matched_aliases"] = matched_chunk_aliases[:20]
-    hierarchy_dbg["chunk_matched_ids"] = _expand_ids_for_aliases(chunk_ids_by_alias, matched_chunk_aliases)[:20]
+    matched_chunk_ids = _expand_ids_for_aliases(chunk_ids_by_alias, matched_chunk_aliases)
+    hierarchy_dbg["chunk_matched_ids"] = matched_chunk_ids[:20]
     dbg["hierarchy_keyword_filter"] = hierarchy_dbg
-    if not matched_chunk_aliases:
-        res = {"total": 0, "items": []}
-        if debug:
-            dbg["reason"] = "chunk_gate_no_match"
-            res["debug"] = dbg
-        return _finalize_result(res)
+    if not matched_chunk_aliases or not matched_chunk_ids:
+        return _finalize_result({"total": 0, "items": []}, "chunk_gate_no_match")
 
     ranked_chunks = sorted(
         [
             (
                 chunk_id,
                 float(chunk_scores.get(chunk_alias_by_id.get(chunk_id) or chunk_id, 0.0))
-                + 0.035 * len(chunk_kw.get(chunk_alias_by_id.get(chunk_id) or chunk_id, []))
+                + 0.035 * len(chunk_kw.get(chunk_alias_by_id.get(chunk_id) or chunk_id, [])),
             )
-            for chunk_id in _expand_ids_for_aliases(chunk_ids_by_alias, matched_chunk_aliases)
+            for chunk_id in matched_chunk_ids
         ],
         key=lambda item: item[1],
         reverse=True,
     )
     dbg["ranked_chunk_count"] = len(ranked_chunks)
     if not ranked_chunks:
-        res = {"total": 0, "items": []}
-        if debug:
-            dbg["reason"] = "ranked_chunk_count_zero"
-            res["debug"] = dbg
-        return _finalize_result(res)
+        return _finalize_result({"total": 0, "items": []}, "ranked_chunk_count_zero")
 
     all_ranked_chunk_ids = _dedupe_keep_order_ids([chunk_id for chunk_id, _score in ranked_chunks])
-    score_by_chunk = {chunk_id: float(score) for chunk_id, score in ranked_chunks}
-    neo_map, neo_error = _neo_hierarchy_for_chunks(neo, all_ranked_chunk_ids)
+    page_chunk_ids = all_ranked_chunk_ids[offset : offset + limit]
+    page_chunk_set = set(page_chunk_ids)
+    score_by_chunk = {chunk_id: float(score) for chunk_id, score in ranked_chunks if chunk_id in page_chunk_set}
+    chunk_top_kw_by_chunk = {
+        chunk_id: list(chunk_kw.get(chunk_alias_by_id.get(chunk_id) or chunk_id, []))
+        for chunk_id in page_chunk_ids
+    }
+
+    neo_map, neo_error = _time_step(
+        "page_neo_hierarchy_ms",
+        lambda: _neo_hierarchy_for_chunks(neo, page_chunk_ids),
+    )
     if neo_error:
         dbg["neo_error"] = neo_error
     dbg["hierarchy_source"] = "neo4j" if neo_map else "postgresql"
-    pg_map = _load_pg_page_rows(pg, all_ranked_chunk_ids)
+
+    pg_map = _time_step("page_pg_rows_ms", lambda: _load_pg_page_rows(pg, page_chunk_ids))
     dbg["pg_chunk_rows"] = len(pg_map)
 
-    all_items = _build_chunk_items(
-        page_chunk_ids=all_ranked_chunk_ids,
-        score_by_chunk=score_by_chunk,
-        chunk_top_kw=chunk_kw,
-        pg_map=pg_map,
-        neo_map=neo_map,
-        mongo_db=mongo_db,
-        category=category,
-        username=username,
-        pg=pg,
-        dbg=dbg,
+    items = _time_step(
+        "page_build_items_ms",
+        lambda: _build_chunk_items(
+            page_chunk_ids=page_chunk_ids,
+            score_by_chunk=score_by_chunk,
+            chunk_top_kw=chunk_top_kw_by_chunk,
+            pg_map=pg_map,
+            neo_map=neo_map,
+            mongo_db=mongo_db,
+            category=category,
+            username=username,
+            pg=pg,
+            dbg=dbg,
+        ),
     )
 
-
-    items = all_items[offset : offset + limit]
-    res = {"total": len(all_items), "items": items}
+    res = {"total": len(all_ranked_chunk_ids), "items": items}
     if debug:
-        dbg["items_built"] = len(all_items)
+        dbg["items_built"] = len(items)
+        dbg["page_chunk_count"] = len(page_chunk_ids)
         if items:
             dbg["sample_item_match"] = {
                 "chunkID": items[0].get("chunkID"),
