@@ -18,7 +18,7 @@ from .gemini_topic_expander import expand_topic_keywords_debug
 from .keyword_embedding import embed_keyword_cached
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", flags=re.UNICODE)
-_SERVICE_VERSION = "search_hierarchical_keyword_neo4j_branch_gate_v8_lazy_branch_cache"
+_SERVICE_VERSION = "search_hierarchical_keyword_neo4j_branch_gate_v10_case_preserve_ids"
 _ALLOWED_KEYWORD_OWNER_LABELS = {"Subject", "Topic", "Lesson", "Chunk"}
 _BRANCH_KEYWORD_CACHE: Dict[str, Dict[str, List[Tuple[str, str, str, List[float]]]]] = defaultdict(dict)
 _BRANCH_KEYWORD_CACHE_TS: Dict[str, Dict[str, float]] = defaultdict(dict)
@@ -32,7 +32,9 @@ _CHUNK_MATCH_MIN_LIMIT = int(os.getenv("SEARCH_CHUNK_MATCH_MIN_LIMIT", "30"))
 
 
 def _cap_ids(ids: List[str], limit: int) -> List[str]:
-    clean = _dedupe_keep_order([str(x).strip() for x in (ids or []) if str(x).strip()])
+    # IMPORTANT: Neo4j pg_id is case-sensitive (e.g. TH10 != th10).
+    # Do not use _dedupe_keep_order() here because that helper normalizes/lowercases text.
+    clean = _dedupe_keep_order_ids([str(x).strip() for x in (ids or []) if str(x).strip()])
     if limit and limit > 0:
         return clean[:limit]
     return clean
@@ -921,7 +923,7 @@ def _load_entity_keyword_rows_from_neo(
         WHERE keyword.embedding IS NOT NULL
         RETURN DISTINCT owner.pg_id AS owner_id,
                keyword.pg_id AS keyword_id,
-               coalesce(keyword.name, keyword.pg_id) AS keyword_name,
+               coalesce(keyword.name, keyword.keyword_name, keyword.pg_id) AS keyword_name,
                keyword.embedding AS keyword_embedding
         """
 
@@ -1048,14 +1050,35 @@ def _filter_gemini_terms_strict(base_query: str, gemini_terms: List[str]) -> Lis
 
 
 def _split_keyword_query_parts(raw_query: str, core_query: str) -> List[str]:
+    """Return compact query parts for hierarchical keyword scoring.
+
+    The branch search scores Neo4j keywords at every level. User queries often contain
+    request filler ("cho tôi tài liệu về ...") or combine concepts with "và".
+    We keep phrase parts for contextual concepts, and also add individual tokens so
+    short DB keywords such as "byte", "gpu", "ip", or "internet" can exact-match
+    even when the user typed a longer phrase like "mạng internet".
+    """
     raw = _strip_query_filler_phrases(raw_query or "")
     pieces = re.split(r"\s*(?:[,;\n/]+|\b(?:va|và|hoặc|hay|and|or)\b)\s*", raw, flags=re.IGNORECASE)
-    parts = [_strip_keyword_filler(piece) for piece in pieces]
-    parts = [part for part in parts if part]
-    if len(parts) >= 2:
-        return _dedupe_keep_order(parts)
+
+    parts: List[str] = []
+    for piece in pieces:
+        clean_piece = _strip_keyword_filler(piece)
+        if clean_piece:
+            parts.append(clean_piece)
+
     core = _strip_keyword_filler(core_query or raw_query or "")
-    return [core] if core else []
+    if core:
+        parts.append(core)
+
+    # Add token-level parts after phrase parts. This does not change the Neo4j-only
+    # branch architecture; it only makes the scorer recognize exact keyword tokens.
+    for part in list(parts):
+        for token in _tokens_no_stop(part):
+            if len(token) >= 2:
+                parts.append(token)
+
+    return _dedupe_keep_order(parts)[:8]
 
 
 def _query_embedding_text(raw_query: str, core_query: str, gemini_terms: List[str]) -> str:
@@ -1085,7 +1108,16 @@ def _score_keywords_for_query_part(
     for keyword_id, chunk_id, keyword_name, keyword_embedding in rows:
         cosine = _cosine(query_embedding, keyword_embedding)
         overlap = _token_overlap_ratio(query_text, keyword_name)
-        adjusted = float(cosine + 0.06 * overlap)
+        norm_q = _norm_keyword_text(query_text)
+        norm_kw = _norm_keyword_text(keyword_name)
+        q_norm_tokens = {_norm_keyword_text(t) for t in _tokens_no_stop(query_text)}
+        kw_norm_tokens = {_norm_keyword_text(t) for t in _tokens_no_stop(keyword_name)}
+        token_exact = bool((q_norm_tokens & kw_norm_tokens) or (norm_kw and norm_kw in q_norm_tokens) or (norm_q and norm_q in kw_norm_tokens))
+        phrase_exact = bool(norm_q and norm_kw and (norm_q == norm_kw or norm_q in norm_kw or norm_kw in norm_q))
+        exact_boost = 0.22 if token_exact or phrase_exact else 0.0
+        adjusted = float(cosine + 0.08 * overlap + exact_boost)
+        if token_exact or phrase_exact:
+            adjusted = max(adjusted, 1.08)
         matches.append({
             "keywordID": keyword_id,
             "chunkID": chunk_id,
@@ -1121,7 +1153,7 @@ def _load_keyword_rows_from_neo(neo, cand_chunks: Optional[List[str]]) -> Tuple[
               AND ($cand_chunks IS NULL OR chunk.pg_id IN $cand_chunks)
             RETURN keyword.pg_id AS keyword_id,
                    chunk.pg_id AS chunk_id,
-                   coalesce(keyword.name, keyword.pg_id) AS keyword_name,
+                   coalesce(keyword.name, keyword.keyword_name, keyword.pg_id) AS keyword_name,
                    keyword.embedding AS keyword_embedding
             """,
             cand_chunks=cand_chunks,
@@ -1230,24 +1262,38 @@ def _score_entity_keyword_rows(
         norm_kw = _norm_keyword_text(keyword_name)
         kw_tokens = set(_tokens_no_stop(keyword_name or ""))
         shared_tokens = q_token_set & kw_tokens
+        q_norm_tokens = {_norm_keyword_text(t) for t in q_tokens if _norm_keyword_text(t)}
+        kw_norm_tokens = {_norm_keyword_text(t) for t in kw_tokens if _norm_keyword_text(t)}
+        normalized_shared = q_norm_tokens & kw_norm_tokens
 
         exact_bonus = 0.0
         phrase_hit = False
         partial_phrase_hit = False
+        token_exact_hit = False
         shared_ratio = float(len(shared_tokens) / token_count) if token_count > 0 else 0.0
         if norm_kw and norm_q:
             if norm_kw == norm_q:
-                exact_bonus = 0.16
+                exact_bonus = max(exact_bonus, 0.28)
                 phrase_hit = True
+            elif norm_kw in q_norm_tokens or norm_q in kw_norm_tokens:
+                # Example: query part "mạng internet" vs keyword "internet",
+                # or query part "internet" vs keyword "mạng internet".
+                exact_bonus = max(exact_bonus, 0.24)
+                phrase_hit = True
+                token_exact_hit = True
+            elif normalized_shared:
+                exact_bonus = max(exact_bonus, 0.18)
+                phrase_hit = True
+                token_exact_hit = True
             elif norm_q in norm_kw:
-                exact_bonus = 0.12
+                exact_bonus = max(exact_bonus, 0.18)
                 phrase_hit = True
             elif norm_kw in norm_q:
-                if shared_ratio >= 0.75:
-                    exact_bonus = 0.08
+                if shared_ratio >= 0.50:
+                    exact_bonus = max(exact_bonus, 0.16)
                     phrase_hit = True
                 else:
-                    exact_bonus = 0.02
+                    exact_bonus = max(exact_bonus, 0.04)
                     partial_phrase_hit = True
 
         if token_count >= 2:
@@ -1257,6 +1303,10 @@ def _score_entity_keyword_rows(
                 exact_bonus += 0.04
 
         score = float(cosine + 0.10 * overlap + exact_bonus)
+        if phrase_hit or token_exact_hit:
+            # Exact keyword evidence must outrank pure semantic similarity. This keeps
+            # the hierarchical branch path when a propagated keyword exists in Neo4j.
+            score = max(score, 1.08 + 0.02 * min(3, len(normalized_shared) or len(shared_tokens)))
         current_best = best_score_by_owner.get(owner_key)
         if current_best is None or score > current_best:
             best_score_by_owner[owner_key] = score
